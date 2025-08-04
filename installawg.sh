@@ -37,7 +37,7 @@ wget -O awgcreate.py https://raw.githubusercontent.com/ShiffGray/awg-create/refs
 python3 awgcreate.py --make /etc/amnezia/amneziawg/awg0.conf -i 10.1.0.0/23 -p 443 -l 44 --mtu 1388 --warp 3
 
 # Генерируем шаблон конфигурации
-python3 awgcreate.py --create
+#python3 awgcreate.py --create
 
 # Добавляем клиентов в конфиг
 for ip in $(seq 1 27); do
@@ -45,7 +45,7 @@ for ip in $(seq 1 27); do
 done
 
 # Генерируем клиентские конфигурации
-python3 awgcreate.py -c -q -z
+python3 awgcreate.py -z
 
 # Добавляем в автозагрузку и запускаем сервис
 systemctl enable --now awg-quick@awg0
