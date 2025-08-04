@@ -8,7 +8,7 @@ import datetime
 import requests
 import zipfile
 
-# === ДОБАВЛЕНО: директория для всех клиентских файлов ===
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONF_DIR = os.path.join(SCRIPT_DIR, "conf")
 os.makedirs(CONF_DIR, exist_ok=True)
