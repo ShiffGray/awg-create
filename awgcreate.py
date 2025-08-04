@@ -6,34 +6,139 @@ import argparse
 import random
 import datetime
 import requests
+import zipfile
+
+
+# === ДОБАВЛЕНО: директория для всех клиентских файлов ===
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONF_DIR = os.path.join(SCRIPT_DIR, "conf")
+os.makedirs(CONF_DIR, exist_ok=True)
+
+
+def clean_confdir_types(keep_conf=False, keep_qr=False, keep_zip=False, allowed_names=None):
+    """
+    Оставляет только нужные типы файлов в conf.
+    allowed_names — если не None, то оставляет только файлы клиентов из этого списка.
+    """
+    suffixes = {
+        "conf": ['All.conf', 'DsYt.conf'],
+        "qr": ['All.png', 'DsYt.png'],
+        "zip": ['.zip']
+    }
+
+    # Составляем список файлов, которые нужно оставить
+    keep_files = set()
+    if allowed_names:
+        for name in allowed_names:
+            if keep_conf:
+                for suf in suffixes["conf"]:
+                    keep_files.add(f"{name}{suf}")
+            if keep_qr:
+                for suf in suffixes["qr"]:
+                    keep_files.add(f"{name}{suf}")
+            if keep_zip:
+                for suf in suffixes["zip"]:
+                    keep_files.add(f"{name}{suf}")
+    else:
+        for f in os.listdir(CONF_DIR):
+            if keep_conf and (f.endswith('All.conf') or f.endswith('DsYt.conf')):
+                keep_files.add(f)
+            if keep_qr and (f.endswith('All.png') or f.endswith('DsYt.png')):
+                keep_files.add(f)
+            if keep_zip and f.endswith('.zip'):
+                keep_files.add(f)
+
+    # Теперь удаляем всё лишнее
+    for f in os.listdir(CONF_DIR):
+        if f not in keep_files and (f.endswith('.conf') or f.endswith('.png') or f.endswith('.zip')):
+            try:
+                os.remove(os.path.join(CONF_DIR, f))
+            except Exception:
+                pass
+
+def clean_confdir_except(allowed_names):
+    """
+    allowed_names - список базовых имён клиентов (без суффикса All/DsYt и расширения)
+    Удаляет из CONF_DIR все .conf/.png/.zip, которые не относятся к этим именам
+    """
+    suffixes = ['All.conf', 'DsYt.conf', 'All.png', '.zip']
+    for f in os.listdir(CONF_DIR):
+        to_keep = False
+        for name in allowed_names:
+            for suf in suffixes:
+                if f == f"{name}{suf}":
+                    to_keep = True
+        if not to_keep and (f.endswith('.conf') or f.endswith('.png') or f.endswith('.zip')):
+            try:
+                os.remove(os.path.join(CONF_DIR, f))
+            except Exception:
+                pass
+
+def get_only_list():
+    """
+    Возвращает список имён клиентов, если указан --only, иначе []
+    """
+    if not opt.only:
+        return []
+    # Разбиваем по запятым, убираем пробелы
+    return [x.strip() for x in opt.only.split(",") if x.strip()]
 
 def main():
     # Проверка MTU перенесена сюда, чтобы выполнялась всегда
     if not (1280 <= opt.mtu <= 1420):
         raise ValueError("MTU должен быть в диапазоне от 1280 до 1420.")
 
+    want_conf = opt.confgen
+    want_qr = opt.qrcode
+    want_zip = opt.zip
+
+    need_conf = want_conf or want_qr or want_zip
+    need_qr = want_qr or want_zip
+
     if opt.makecfg:
         handle_makecfg()
-        return  # Выход после создания, чтобы ничего ниже не выполнялось
-        
-    # Всё, что ниже — только если конфиг уже есть
+        return
+
     get_main_config_path(check=True)
 
     if opt.create:
         handle_create()
-    elif opt.addcl:
+        return
+    if opt.addcl:
         handle_add()
-    elif opt.update:
+        return
+    if opt.update:
         handle_update()
-    elif opt.delete:
+        return
+    if opt.delete:
         handle_delete()
-    elif opt.confgen:
+        return
+
+    if need_conf:
         handle_confgen()
-    if opt.qrcode:
+    if need_qr:
         generate_qr_codes()
-    if opt.zip:
+    if want_zip:
         zip_all()
+
+    # Универсальная очистка по выбранным флагам (работает с --only и без)
+    only_list = get_only_list()
+    allowed_names = None
+    # Определяем имена клиентов для очистки, если --only используется
+    if only_list:
+        # Нам нужно получить точный набор имён, которые реально были сгенерированы
+        # Это те же имена, что использовались в handle_confgen — то есть список clients_for_zip
+        allowed_names = clients_for_zip if clients_for_zip else only_list
+
+    clean_confdir_types(
+        keep_conf=want_conf,
+        keep_qr=want_qr,
+        keep_zip=want_zip,
+        allowed_names=allowed_names
+    )
+
     print('===== OK =====')
+
 
 g_main_config_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.main.config')
 g_main_config_fn = None
@@ -1116,10 +1221,11 @@ def handle_makecfg():
     sys.exit(0)
 
 def handle_create():
-    if os.path.exists(opt.tmpcfg):
-        raise RuntimeError(f'ERROR: file "{opt.tmpcfg}" already exists!')
+    tmpcfg_path = os.path.join(SCRIPT_DIR, opt.tmpcfg)
+    if os.path.exists(tmpcfg_path):
+        raise RuntimeError(f'ERROR: file "{tmpcfg_path}" already exists!')
 
-    print(f'Create template for client configs: "{opt.tmpcfg}"...')
+    print(f'Create template for client configs: "{tmpcfg_path}"...')
     if opt.ipaddr:
         ipaddr = opt.ipaddr
     else:
@@ -1147,10 +1253,10 @@ def handle_create():
         out = out.replace('\nH3 = <', '\n# ')
         out = out.replace('\nH4 = <', '\n# ')
 
-    with open(opt.tmpcfg, 'w', newline='\n') as file:
+    with open(tmpcfg_path, 'w', newline='\n') as file:
         file.write(out)
 
-    print(f'Template client config file "{opt.tmpcfg}" created!')
+    print(f'Template client config file "{tmpcfg_path}" created!')
     sys.exit(0)
 
 xopt = [opt.addcl, opt.update, opt.delete]
@@ -1268,25 +1374,27 @@ def fetch_allowed_dsyt():
 
     return ", ".join(sorted(ip_set))
 
-def handle_confgen():        
+def handle_confgen():
     cfg = WGConfig(g_main_config_fn)
     srv = cfg.iface
     print('Generate client configs...')
-    
-    if not os.path.exists(opt.tmpcfg):
-        raise RuntimeError(f'ERROR: file "{opt.tmpcfg}" not found!')
 
-    with open(opt.tmpcfg, 'r') as file:
+    tmpcfg_path = os.path.join(SCRIPT_DIR, opt.tmpcfg)
+    if not os.path.exists(tmpcfg_path):
+        raise RuntimeError(f'ERROR: file "{tmpcfg_path}" not found!')
+
+    with open(tmpcfg_path, 'r') as file:
         tmpcfg = file.read()
 
-    flst = glob.glob("*.conf")
+    # Чистим только в conf-папке!
+    flst = glob.glob(os.path.join(CONF_DIR, "*.conf"))
     for fn in flst:
         if fn.endswith('awg0.conf'):
             continue
         if os.path.exists(fn):
             os.remove(fn)
 
-    flst = glob.glob("*.png")
+    flst = glob.glob(os.path.join(CONF_DIR, "*.png"))
     for fn in flst:
         if os.path.exists(fn):
             os.remove(fn)
@@ -1294,14 +1402,15 @@ def handle_confgen():
     random.seed()
 
     fetched_dsyt_ips = fetch_allowed_dsyt()
-    
+
+    only_list = get_only_list()
     peers = cfg.peer.items()
-    if opt.only:
-        peer_item = next(((name, peer) for name, peer in peers if name.lower() == opt.only.lower()), None)
-        if not peer_item:
-            raise RuntimeError(f'ERROR: peer "{opt.only}" not found!')
-        peers = [peer_item]
-    
+    if only_list:
+        # Фильтруем только указанные имена (без учета регистра)
+        peers = [(name, peer) for name, peer in peers if name.lower() in [x.lower() for x in only_list]]
+        if not peers:
+            raise RuntimeError(f'ERROR: ни одного указанного клиента из --only не найдено!')
+
     for peer_name, peer in peers:
         if 'Name' not in peer or 'PrivateKey' not in peer:
             print(f'Skip peer with pubkey "{peer["PublicKey"]}"')
@@ -1332,29 +1441,35 @@ def handle_confgen():
         out = out.replace('<PRESHARED_KEY>', psk)
 
         out_all = out.replace('<ALLOWED_IPS>', '0.0.0.0/0, ::/0')
-        with open(f'{peer_name}All.conf', 'w', newline='\n') as file:
+        with open(os.path.join(CONF_DIR, f'{peer_name}All.conf'), 'w', newline='\n') as file:
             file.write(out_all)
 
         out_dsyt = out.replace('<ALLOWED_IPS>', fetched_dsyt_ips)
-        with open(f'{peer_name}DsYt.conf', 'w', newline='\n') as file:
+        with open(os.path.join(CONF_DIR, f'{peer_name}DsYt.conf'), 'w', newline='\n') as file:
             file.write(out_dsyt)
-            
+
         clients_for_zip.append(peer_name)
+    
+    # После генерации: если работаем с --only, удаляем всё лишнее из папки conf
+    if only_list:
+        # peers — это список кортежей (name, peer), нам нужны только name
+        clean_confdir_except([name for name, _ in peers])
 
 def generate_qr_codes():
     print('Generate QR codes...')
-    flst = glob.glob("*.png")
+    # Удаляем png только в conf-папке
+    flst = glob.glob(os.path.join(CONF_DIR, "*.png"))
     for fn in flst:
         if os.path.exists(fn):
             os.remove(fn)
 
-    flst = [f for f in glob.glob("*All.conf")]
+    flst = [f for f in glob.glob(os.path.join(CONF_DIR, "*All.conf"))]
     if not flst:
         raise RuntimeError(f'ERROR: All-конфиги не найдены для генерации QR-кодов!')
 
     import qrcode
 
-    def generate_qr(conf):
+    def generate_qr(conf, fn):
         if os.path.getsize(fn) > 2048:
             print(f'⚠️ Конфигурация {fn} превышает 2KB, возможно, QR не сгенерируется!')
 
@@ -1381,22 +1496,21 @@ def generate_qr_codes():
             continue
         with open(fn, 'r', encoding='utf-8') as file:
             conf = file.read()
-        name = os.path.splitext(fn)[0]
+        name = os.path.splitext(os.path.basename(fn))[0]
+        png_path = os.path.join(CONF_DIR, f"{name}.png")
         try:
-            img = generate_qr(conf)
-            img.save(f'{name}.png')
+            img = generate_qr(conf, fn)
+            img.save(png_path)
         except ValueError as e:
             print(f'Ошибка при генерации QR для {fn}: {e}')
 
-import zipfile
-
 def zip_client_files(client_name):
-    zip_filename = f"{client_name}.zip"
+    zip_filename = os.path.join(CONF_DIR, f"{client_name}.zip")
     with zipfile.ZipFile(zip_filename, 'w') as zipf:
         for suffix in ['All.conf', 'DsYt.conf', 'All.png']:
-            file = f"{client_name}{suffix}"
+            file = os.path.join(CONF_DIR, f"{client_name}{suffix}")
             if os.path.exists(file):
-                zipf.write(file)
+                zipf.write(file, arcname=os.path.basename(file))
 
 def zip_all():
     print('Упаковка конфигов в ZIP-архивы...')
