@@ -8,12 +8,10 @@ import datetime
 import requests
 import zipfile
 
-
 # === ДОБАВЛЕНО: директория для всех клиентских файлов ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONF_DIR = os.path.join(SCRIPT_DIR, "conf")
 os.makedirs(CONF_DIR, exist_ok=True)
-
 
 def clean_confdir_types(keep_conf=False, keep_qr=False, keep_zip=False, allowed_names=None):
     """
@@ -68,7 +66,7 @@ def get_only_list():
 def main():
     # Проверка MTU перенесена сюда, чтобы выполнялась всегда
     if not (1280 <= opt.mtu <= 1420):
-        raise ValueError("MTU должен быть в диапазоне от 1280 до 1420.")
+        raise ValueError("Ошибка: MTU должен быть в диапазоне от 1280 до 1420.")
 
     want_conf = opt.confgen
     want_qr = opt.qrcode
@@ -119,8 +117,7 @@ def main():
         allowed_names=allowed_names
     )
 
-    print('===== OK =====')
-
+    print('===== Готово! =====')
 
 g_main_config_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.main.config')
 g_main_config_fn = None
@@ -215,8 +212,6 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = 188.114.99.224:1002
 """
 
-
-
 class IPAddr():
     def __init__(self, ipaddr=None):
         self.ip = [0, 0, 0, 0]
@@ -227,15 +222,15 @@ class IPAddr():
     def init(self, ipaddr):
         _ipaddr = ipaddr
         if not ipaddr:
-            raise RuntimeError(f'ERROR: Incorrect IP-Addr: "{_ipaddr}"')
+            raise RuntimeError(f'Ошибка: некорректный IP-адрес: "{_ipaddr}"')
         if ' ' in ipaddr or ',' in ipaddr:
-            raise RuntimeError(f'ERROR: Incorrect IP-Addr: "{_ipaddr}"')
+            raise RuntimeError(f'Ошибка: некорректный IP-адрес: "{_ipaddr}"')
         if '/' in ipaddr:
             self.mask = int(ipaddr.split('/')[1])
             ipaddr = ipaddr.split('/')[0]
         nlist = ipaddr.split('.')
         if len(nlist) != 4:
-            raise RuntimeError(f'ERROR: Incorrect IP-addr: "{_ipaddr}"')
+            raise RuntimeError(f'Ошибка: некорректный IP-адрес: "{_ipaddr}"')
         for n, num in enumerate(nlist):
             self.ip[n] = int(num)
         
@@ -278,22 +273,22 @@ class WGConfig():
                 continue
 
             if line.startswith(' ') and not line.strip().startswith('#'):
-                raise RuntimeError(f'ERROR_CFG: Incorrect line #{n} into config "{filename}"')
+                raise RuntimeError(f'Ошибка: некорректная строка #{n} в конфиге "{filename}"')
 
             if line.startswith('[') and line.endswith(']'):
                 section_name = line[1:-1]
                 if not section_name:
-                    raise RuntimeError(f'ERROR_CFG: Incorrect section name: "{section_name}" (#{n+1})')
+                    raise RuntimeError(f'Ошибка: некорректное имя секции: "{section_name}" (#{n+1})')
                 secdata_item = {"_section_name": section_name.lower()}
                 secline_item = {"_section_name": n}
                 if section_name.lower() == 'interface':
                     if iface:
-                        raise RuntimeError(f'ERROR_CFG: Found second section Interface in line #{n+1}')
+                        raise RuntimeError(f'Ошибка: найдена вторая секция Interface в строке #{n+1}')
                     iface = secdata_item
                 elif section_name.lower() == 'peer':
                     pass
                 else:
-                    raise RuntimeError(f'ERROR_CFG: Found incorrect section "{section_name}" in line #{n+1}')
+                    raise RuntimeError(f'Ошибка: найдена некорректная секция "{section_name}" в строке #{n+1}')
                 secdata.append(secdata_item)
                 secline.append(secline_item)
                 continue
@@ -305,26 +300,26 @@ class WGConfig():
                 continue
             
             if '=' not in line:
-                raise RuntimeError(f'ERROR_CFG: Incorrect line into config: "{line}"  (#{n+1})')
+                raise RuntimeError(f'Ошибка: некорректная строка в конфиге: "{line}"  (#{n+1})')
             
             xv = line.find('=')
             if xv <= 0:
-                raise RuntimeError(f'ERROR_CFG: Incorrect line into config: "{line}"  (#{n+1})')
+                raise RuntimeError(f'Ошибка: некорректная строка в конфиге: "{line}"  (#{n+1})')
             
             vname = line[:xv].strip()
             value = line[xv+1:].strip()
             if not secdata_item:
-                raise RuntimeError(f'ERROR_CFG: Parameter "{vname}" have unknown section! (#{n+1})')
+                raise RuntimeError(f'Ошибка: параметр "{vname}" не имеет секции! (#{n+1})')
             
             section_name = secdata_item['_section_name']
             if vname in secdata_item:
-                raise RuntimeError(f'ERROR_CFG: Found duplicate of param "{vname}" into section "{section_name}" (#{n+1})')
+                raise RuntimeError(f'Ошибка: дублирование параметра "{vname}" в секции "{section_name}" (#{n+1})')
             
             secdata_item[vname] = value
             secline_item[vname] = n
         
         if not iface:
-            raise RuntimeError(f'ERROR_CFG: Cannot found section Interface!')
+            raise RuntimeError(f'Ошибка: не найдена секция Interface!')
         
         for i, item in enumerate(secdata):
             line = secline[i]
@@ -333,29 +328,29 @@ class WGConfig():
                 self.iface = item
                 peer_name = "__this_server__"
                 if 'PrivateKey' not in item:
-                    raise RuntimeError(f'ERROR_CFG: Cannot found PrivateKey in Interface')
+                    raise RuntimeError(f'Ошибка: не найден PrivateKey в Interface')
             else:    
                 if 'Name' in item:
                     peer_name = item['Name']
                     if not peer_name:
-                        raise RuntimeError(f'ERROR_CFG: Invalid peer Name in line #{line["Name"]}')
+                        raise RuntimeError(f'Ошибка: некорректное имя peer в строке #{line["Name"]}')
                 elif 'PublicKey' in item:
                     peer_name = item['PublicKey']
                     if not peer_name:
-                        raise RuntimeError(f'ERROR_CFG: Invalid peer PublicKey in line #{line["PublicKey"]}')
+                        raise RuntimeError(f'Ошибка: некорректный PublicKey peer в строке #{line["PublicKey"]}')
                 else:
-                    raise RuntimeError(f'ERROR_CFG: Invalid peer data in line #{line["_section_name"]}')
+                    raise RuntimeError(f'Ошибка: некорректные данные peer в строке #{line["_section_name"]}')
                 
                 if 'AllowedIPs' not in item:
-                    raise RuntimeError(f'ERROR_CFG: Cannot found "AllowedIPs" into peer "{peer_name}"')
+                    raise RuntimeError(f'Ошибка: не найден параметр "AllowedIPs" в peer "{peer_name}"')
                     
                 if peer_name in self.peer:
-                    raise RuntimeError(f'ERROR_CFG: Found duplicate peer with name "{peer_name}"')
+                    raise RuntimeError(f'Ошибка: дублирование peer с именем "{peer_name}"')
                 
                 self.peer[peer_name] = item
                 
             if peer_name in self.idsline:
-                raise RuntimeError(f'ERROR_CFG: Found duplicate peer with name "{peer_name}"')
+                raise RuntimeError(f'Ошибка: дублирование peer с именем "{peer_name}"')
             
             min_line = line['_section_name']
             max_line = min_line
@@ -375,7 +370,7 @@ class WGConfig():
             filename = self.cfg_fn
 
         if not self.lines:
-            raise RuntimeError(f'ERROR: no data')
+            raise RuntimeError(f'Ошибка: нет данных для сохранения')
         
         with open(filename, 'w', newline='\n') as file:
             for line in self.lines:
@@ -383,7 +378,7 @@ class WGConfig():
     
     def del_client(self, c_name):
         if c_name not in self.peer:
-            raise RuntimeError(f'ERROR: Not found client "{c_name}" in peer list!')
+            raise RuntimeError(f'Ошибка: не найден клиент "{c_name}" в списке peer!')
 
         client = self.peer[c_name]
         ipaddr = client['AllowedIPs']
@@ -403,7 +398,7 @@ class WGConfig():
         
     def set_param(self, c_name, param_name, param_value, force=False, offset=0):
         if c_name not in self.peer:
-            raise RuntimeError(f'ERROR: Not found client "{c_name}" in peer list!')
+            raise RuntimeError(f'Ошибка: не найден клиент "{c_name}" в списке peer!')
 
         line_prefix = "" if not param_name.startswith('_') else "#_"
         param_name = param_name[1:] if param_name.startswith('_') else param_name
@@ -419,7 +414,7 @@ class WGConfig():
             return
         
         if not force:
-            raise RuntimeError(f'ERROR: Param "{param_name}" not found for client "{c_name}"')
+            raise RuntimeError(f'Ошибка: параметр "{param_name}" не найден у клиента "{c_name}"')
         
         new_line = f'{line_prefix}{param_name} = {param_value}'
         client[param_name] = param_value
@@ -447,7 +442,7 @@ def exec_cmd(cmd, input=None, shell=True, check=True, timeout=None):
 def get_main_iface():
     rc, out = exec_cmd('ip link show')
     if rc:
-        raise RuntimeError(f'ERROR: Cannot get net interfaces')
+        raise RuntimeError(f'Ошибка: невозможно получить список сетевых интерфейсов')
     
     for line in out.split('\n'):
         if '<BROADCAST' in line and 'state UP' in line:
@@ -459,7 +454,7 @@ def get_main_iface():
 def get_ext_ipaddr():
     rc, out = exec_cmd('curl -4 -s icanhazip.com')
     if rc:
-        raise RuntimeError(f'ERROR: Cannot get ext IP-Addr')
+        raise RuntimeError(f'Ошибка: невозможно получить внешний IP-адрес')
     
     lines = out.split('\n')
     ipaddr = lines[-1] if lines[-1] else lines[-2]
@@ -475,37 +470,37 @@ def gen_pair_keys(cfg_type=None):
         cfg_type = g_main_config_type
         
     if not cfg_type:
-        raise RuntimeError("ERROR: Unknown config type for key generation")
+        raise RuntimeError("Ошибка: неизвестный тип конфига для генерации ключей")
    
     wgtool = cfg_type.lower()
     rc, out = exec_cmd(f'{wgtool} genkey')
     if rc:
-        raise RuntimeError(f'ERROR: Cannot generate private key')
+        raise RuntimeError(f'Ошибка: не удалось сгенерировать приватный ключ')
 
     priv_key = out.strip()
     if not priv_key:
-        raise RuntimeError(f'ERROR: Cannot generate private Key')
+        raise RuntimeError(f'Ошибка: не удалось сгенерировать приватный ключ')
 
     rc, out = exec_cmd(f'{wgtool} pubkey', input=priv_key + '\n')
     if rc:
-        raise RuntimeError(f'ERROR: Cannot generate public key')
+        raise RuntimeError(f'Ошибка: не удалось сгенерировать публичный ключ')
 
     pub_key = out.strip()
     if not pub_key:
-        raise RuntimeError(f'ERROR: Cannot generate public Key')
+        raise RuntimeError(f'Ошибка: не удалось сгенерировать публичный ключ')
 
     return priv_key, pub_key
 
 def gen_preshared_key():
     rc, out = exec_cmd('openssl rand -base64 32', shell=True)
     if rc:
-        raise RuntimeError(f'ERROR: Cannot generate preshared key')
+        raise RuntimeError(f'Ошибка: не удалось сгенерировать pre-shared key')
     return out.strip()
 
 def get_main_config_path(check=True):
     global g_main_config_fn, g_main_config_type
     if not os.path.exists(g_main_config_src):
-        raise RuntimeError(f'ERROR: file "{g_main_config_src}" not found!')
+        raise RuntimeError(f'Ошибка: файл "{g_main_config_src}" не найден!')
     
     with open(g_main_config_src, 'r') as file:
         lines = file.readlines()
@@ -517,7 +512,7 @@ def get_main_config_path(check=True):
         g_main_config_type = 'AWG'
 
     if check and not cfg_exists:
-        raise RuntimeError(f'ERROR: Main {g_main_config_type} config file "{g_main_config_fn}" not found!')
+        raise RuntimeError(f'Ошибка: основной {g_main_config_type} конфиг "{g_main_config_fn}" не найден!')
         
     return g_main_config_fn
 
@@ -1079,28 +1074,28 @@ def handle_makecfg():
     global g_main_config_fn
     g_main_config_fn = opt.makecfg
     if os.path.exists(g_main_config_fn):
-        raise RuntimeError(f'ERROR: file "{g_main_config_fn}" already exists!')
+        raise RuntimeError(f'Ошибка: файл "{g_main_config_fn}" уже существует!')
 
     m_cfg_type = 'WG'
     if os.path.basename(g_main_config_fn).startswith('a'):
         m_cfg_type = 'AWG'
 
-    print(f'Make {m_cfg_type} server config: "{g_main_config_fn}"...')
+    print(f'Создание {m_cfg_type} серверного конфига: "{g_main_config_fn}"...')
     main_iface = get_main_iface()
     if not main_iface:
-        raise RuntimeError(f'ERROR: Cannot get main network interface!')
+        raise RuntimeError(f'Ошибка: невозможно получить основной сетевой интерфейс!')
 
-    print(f'Main network iface: "{main_iface}"')
+    print(f'Основная сеть: "{main_iface}"')
 
     if not (1 <= opt.port <= 65535):
-        raise RuntimeError(f'ERROR: Incorrect port = {opt.port}. Use port between 1 and 65535')
+        raise RuntimeError(f'Ошибка: неправильный порт = {opt.port}. Используйте порт от 1 до 65535')
 
     if not opt.ipaddr:
-        raise RuntimeError(f'ERROR: Incorrect argument ipaddr = "{opt.ipaddr}"')
+        raise RuntimeError(f'Ошибка: неверный аргумент ipaddr = "{opt.ipaddr}"')
     
     ipaddr = IPAddr(opt.ipaddr)
     if not ipaddr.mask:
-        raise RuntimeError(f'ERROR: Incorrect argument ipaddr = "{opt.ipaddr}"')
+        raise RuntimeError(f'Ошибка: неверный аргумент ipaddr = "{opt.ipaddr}"')
 
     if opt.tun:
         tun_name = opt.tun
@@ -1108,7 +1103,7 @@ def handle_makecfg():
         cfg_name = os.path.basename(g_main_config_fn)
         tun_name = os.path.splitext(cfg_name)[0].strip()
 
-    print(f'Tunnel iface: "{tun_name}"')
+    print(f'Туннельный интерфейс: "{tun_name}"')
 
     priv_key, pub_key = gen_pair_keys(m_cfg_type)
 
@@ -1156,15 +1151,15 @@ def handle_makecfg():
     with open(g_main_config_fn, 'w', newline='\n') as file:
         file.write(out)
 
-    print(f'{m_cfg_type} server config file "{g_main_config_fn}" created!')
+    print(f'{m_cfg_type} Серверный конфиг "{g_main_config_fn}" создан!')
 
     warp_configs = []
     if opt.warp > 0:
-        print(f"Generating {opt.warp} WARP configs...")
+        print(f"Генерация {opt.warp} WARP конфигов...")
         try:
             warp_configs = generate_warp_configs(tun_name, opt.warp, opt.mtu)
             for config in warp_configs:
-                print(f"Generated WARP config: {config}")
+                print(f"WARP конфиг создан: {config}")
         except Exception as e:
             raise RuntimeError(f"Ошибка при генерации WARP-конфигов: {e}")
 
@@ -1195,7 +1190,7 @@ def handle_makecfg():
     os.chmod(up_script_path, 0o755)
     os.chmod(down_script_path, 0o755)
 
-    print(f"Helper scripts generated:\n  {up_script_path}\n  {down_script_path}")
+    print(f"PostUp и PostDown скрипты созданы:\n  {up_script_path}\n  {down_script_path}")
 
     with open(g_main_config_src, 'w', newline='\n') as file:
         file.write(g_main_config_fn)
@@ -1205,21 +1200,21 @@ def handle_makecfg():
 def handle_create():
     tmpcfg_path = os.path.join(SCRIPT_DIR, opt.tmpcfg)
     if os.path.exists(tmpcfg_path):
-        raise RuntimeError(f'ERROR: file "{tmpcfg_path}" already exists!')
+        raise RuntimeError(f'Ошибка: файл "{tmpcfg_path}" уже существует!')
 
-    print(f'Create template for client configs: "{tmpcfg_path}"...')
+    print(f'Создание шаблона для клиентских конфигов: "{tmpcfg_path}"...')
     if opt.ipaddr:
         ipaddr = opt.ipaddr
     else:
         ext_ipaddr = get_ext_ipaddr()
-        print(f'External IP-Addr: "{ext_ipaddr}"')
+        print(f'Внешний IP-адрес: "{ext_ipaddr}"')
         ipaddr = ext_ipaddr
 
     if '/' not in ipaddr:
         ipaddr += '/32'
     ipaddr = IPAddr(ipaddr)
 
-    print(f'Server IP-Addr: "{ipaddr}"')
+    print(f'Серверный IP-адрес: "{ipaddr}"')
 
     raw_ip = f"{ipaddr.ip[0]}.{ipaddr.ip[1]}.{ipaddr.ip[2]}.{ipaddr.ip[3]}"
     out = g_defclient_config
@@ -1238,22 +1233,22 @@ def handle_create():
     with open(tmpcfg_path, 'w', newline='\n') as file:
         file.write(out)
 
-    print(f'Template client config file "{tmpcfg_path}" created!')
+    print(f'Шаблон клиентских конфигов "{tmpcfg_path}" создан!')
     sys.exit(0)
 
 xopt = [opt.addcl, opt.update, opt.delete]
 copt = [x for x in xopt if len(x) > 0]
 if copt and len(copt) >= 2:
-    raise RuntimeError(f'ERROR: Incorrect arguments! Too many actions!')
+    raise RuntimeError(f'Ошибка: неверные аргументы! Слишком много действий!')
 
 def handle_add():
     cfg = WGConfig(g_main_config_fn)
     srv = cfg.iface
     c_name = opt.addcl
-    print(f'Add new client config "{c_name}"...')
+    print(f'Создание нового пользователя "{c_name}"...')
 
     if c_name.lower() in (x.lower() for x in cfg.peer.keys()):
-        raise RuntimeError(f'ERROR: peer with name "{c_name}" already exists!')
+        raise RuntimeError(f'Ошибка: peer с именем "{c_name}" уже существует!')
 
     network = IPAddr(srv['Address'])
     net_mask = network.mask
@@ -1274,7 +1269,7 @@ def handle_add():
         manual_ip = IPAddr(opt.ipaddr)
         ip_int = int.from_bytes(manual_ip.ip, byteorder='big')
         if ip_int in used_ips:
-            raise RuntimeError(f'ERROR: IP-addr "{opt.ipaddr}" already used!')
+            raise RuntimeError(f'Ошибка: IP-адрес "{opt.ipaddr}" уже используется!')
         ipaddr = str(manual_ip)
     else:
         for ip_int in range(first_ip_int, last_ip_int + 1):
@@ -1283,7 +1278,7 @@ def handle_add():
                 ipaddr = '.'.join(map(str, ip_bytes)) + '/32'
                 break
         else:
-            raise RuntimeError('ERROR: There are no more free IP-addresses')
+            raise RuntimeError('Ошибка: больше нет свободных IP-адресов!')
 
     priv_key, pub_key = gen_pair_keys()
     psk = gen_preshared_key()
@@ -1303,12 +1298,12 @@ def handle_add():
     with open(g_main_config_fn, 'w', newline='\n') as file:
         file.write(srvcfg)
 
-    print(f'New client "{c_name}" added! IP-Addr: "{ipaddr}"')
+    print(f'Новый пользователь "{c_name}" создан! IP-адрес: "{ipaddr}"')
 
 def handle_update():
     cfg = WGConfig(g_main_config_fn)
     p_name = opt.update
-    print(f'Update keys for client "{p_name}"...')
+    print(f'Сброс ключей пользователя "{p_name}"...')
     priv_key, pub_key = gen_pair_keys()
     psk = gen_preshared_key()
     cfg.set_param(p_name, '_PrivateKey', priv_key, force=True, offset=2)
@@ -1318,15 +1313,15 @@ def handle_update():
     cfg.set_param(p_name, '_GenKeyTime', gentime, force=True, offset=2)
     ipaddr = cfg.peer[p_name]['AllowedIPs']
     cfg.save()
-    print(f'Keys for client "{p_name}" updated! IP-Addr: "{ipaddr}"')
+    print(f'Ключи пользователя "{p_name}" сброшены! IP-адрес: "{ipaddr}"')
 
 def handle_delete():
     cfg = WGConfig(g_main_config_fn)
     p_name = opt.delete
-    print(f'Delete client "{p_name}"...')
+    print(f'Удаление пользователя "{p_name}"...')
     ipaddr = cfg.del_client(p_name)
     cfg.save()
-    print(f'Client "{p_name}" deleted! IP-Addr: "{ipaddr}"')
+    print(f'Пользователь "{p_name}" удалён! IP-адрес: "{ipaddr}"')
 
 def fetch_allowed_dsyt():
     import urllib.request
@@ -1352,18 +1347,40 @@ def fetch_allowed_dsyt():
                     if data:
                         ip_set.update(map(str.strip, data.split(",")))
             except Exception as e:
-                print(f"[!] Failed to fetch IPs for {site} ({proto}): {e}")
+                print(f"[!] Не удалось получить IP-адреса для {site} ({proto}): {e}")
 
     return ", ".join(sorted(ip_set))
 
 def handle_confgen():
     cfg = WGConfig(g_main_config_fn)
     srv = cfg.iface
-    print('Generate client configs...')
+    print('Генерация клиентских конфигов...')
 
     tmpcfg_path = os.path.join(SCRIPT_DIR, opt.tmpcfg)
     if not os.path.exists(tmpcfg_path):
-        raise RuntimeError(f'ERROR: file "{tmpcfg_path}" not found!')
+        print(f'Внимание: файл "{tmpcfg_path}" не найден, создаю стандартный шаблон клиента...')
+        # Вызов handle_create создаст файл и завершит программу, что нам не подходит.
+        # Поэтому вставляем логику создания шаблона прямо здесь:
+        ipaddr = opt.ipaddr or get_ext_ipaddr()
+        if '/' not in ipaddr:
+            ipaddr += '/32'
+        ipaddr_obj = IPAddr(ipaddr)
+        raw_ip = f"{ipaddr_obj.ip[0]}.{ipaddr_obj.ip[1]}.{ipaddr_obj.ip[2]}.{ipaddr_obj.ip[3]}"
+        out = g_defclient_config
+        out = out.replace('<SERVER_ADDR>', raw_ip)
+        if g_main_config_type != 'AWG':
+            out = out.replace('\nJc = <', '\n# ')
+            out = out.replace('\nJmin = <', '\n# ')
+            out = out.replace('\nJmax = <', '\n# ')
+            out = out.replace('\nS1 = <', '\n# ')
+            out = out.replace('\nS2 = <', '\n# ')
+            out = out.replace('\nH1 = <', '\n# ')
+            out = out.replace('\nH2 = <', '\n# ')
+            out = out.replace('\nH3 = <', '\n# ')
+            out = out.replace('\nH4 = <', '\n# ')
+        with open(tmpcfg_path, 'w', newline='\n') as file:
+            file.write(out)
+        print(f'Шаблон клиентских конфигов "{tmpcfg_path}" автоматически создан!')
 
     with open(tmpcfg_path, 'r') as file:
         tmpcfg = file.read()
@@ -1391,11 +1408,11 @@ def handle_confgen():
         # Фильтруем только указанные имена (без учета регистра)
         peers = [(name, peer) for name, peer in peers if name.lower() in [x.lower() for x in only_list]]
         if not peers:
-            raise RuntimeError(f'ERROR: ни одного указанного клиента из --only не найдено!')
+            raise RuntimeError(f'Ошибка: ни одного клиента из --only не найдено!')
 
     for peer_name, peer in peers:
         if 'Name' not in peer or 'PrivateKey' not in peer:
-            print(f'Skip peer with pubkey "{peer["PublicKey"]}"')
+            print(f'Пропуск peer с публичным ключом "{peer["PublicKey"]}"')
             continue
         psk = peer.get('PresharedKey', gen_preshared_key())
         if 'PresharedKey' not in peer:
@@ -1421,7 +1438,7 @@ def handle_confgen():
         out = out.replace('<SERVER_PORT>', srv['ListenPort'])
         out = out.replace('<SERVER_PUBLIC_KEY>', srv['PublicKey'])
         out = out.replace('<PRESHARED_KEY>', psk)
-        out = out.replace('<SERVER_ADDR>', srv['Address']) # Нужно для того чтобы указать этот плейс холдер в _defclient.config и дать пользователя возможность пользоватся локальной сетью указав её диапазон в AllowedIPs. 
+        out = out.replace('<SERVER_ADDR>', srv['Address'])
 
         out_all = out.replace('<ALLOWED_IPS>', '0.0.0.0/0, ::/0')
         with open(os.path.join(CONF_DIR, f'{peer_name}All.conf'), 'w', newline='\n') as file:
@@ -1434,7 +1451,7 @@ def handle_confgen():
         clients_for_zip.append(peer_name)
 
 def generate_qr_codes():
-    print('Generate QR codes...')
+    print('Генерация QR-кодов...')
     # Удаляем png только в conf-папке
     flst = glob.glob(os.path.join(CONF_DIR, "*.png"))
     for fn in flst:
@@ -1443,7 +1460,7 @@ def generate_qr_codes():
 
     flst = [f for f in glob.glob(os.path.join(CONF_DIR, "*All.conf"))]
     if not flst:
-        raise RuntimeError(f'ERROR: All-конфиги не найдены для генерации QR-кодов!')
+        raise RuntimeError(f'Ошибка: не найдены All-конфиги для генерации QR-кодов!')
 
     import qrcode
 
