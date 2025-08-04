@@ -1420,6 +1420,7 @@ def handle_confgen():
         out = out.replace('<SERVER_PORT>', srv['ListenPort'])
         out = out.replace('<SERVER_PUBLIC_KEY>', srv['PublicKey'])
         out = out.replace('<PRESHARED_KEY>', psk)
+        out = out.replace('<SERVER_ADDR>', srv['Address']) # Нужно для того чтобы указать этот плейс холдер в _defclient.config и дать пользователя возможность пользоватся локальной сетью указав её диапазон в AllowedIPs. 
 
         out_all = out.replace('<ALLOWED_IPS>', '0.0.0.0/0, ::/0')
         with open(os.path.join(CONF_DIR, f'{peer_name}All.conf'), 'w', newline='\n') as file:
