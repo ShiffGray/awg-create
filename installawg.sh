@@ -40,7 +40,7 @@ python3 awgcreate.py --make /etc/amnezia/amneziawg/awg0.conf -i 10.1.0.0/23 -p 4
 python3 awgcreate.py --create
 
 # Добавляем клиентов в конфиг
-for ip in $(seq 1 258); do
+for ip in $(seq 1 27); do
   python3 awgcreate.py -a "$ip"
 done
 
