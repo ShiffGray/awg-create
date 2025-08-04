@@ -1,5 +1,4 @@
 import os
-import sys
 import glob
 import subprocess
 import argparse
@@ -22,7 +21,7 @@ def clean_confdir_types(keep_conf=False, keep_qr=False, keep_zip=False, allowed_
     """
     suffixes = {
         "conf": ['All.conf', 'DsYt.conf'],
-        "qr": ['All.png', 'DsYt.png'],
+        "qr": ['All.png'],
         "zip": ['.zip']
     }
 
@@ -43,7 +42,7 @@ def clean_confdir_types(keep_conf=False, keep_qr=False, keep_zip=False, allowed_
         for f in os.listdir(CONF_DIR):
             if keep_conf and (f.endswith('All.conf') or f.endswith('DsYt.conf')):
                 keep_files.add(f)
-            if keep_qr and (f.endswith('All.png') or f.endswith('DsYt.png')):
+            if keep_qr and f.endswith('All.png'):
                 keep_files.add(f)
             if keep_zip and f.endswith('.zip'):
                 keep_files.add(f)
@@ -51,24 +50,6 @@ def clean_confdir_types(keep_conf=False, keep_qr=False, keep_zip=False, allowed_
     # Теперь удаляем всё лишнее
     for f in os.listdir(CONF_DIR):
         if f not in keep_files and (f.endswith('.conf') or f.endswith('.png') or f.endswith('.zip')):
-            try:
-                os.remove(os.path.join(CONF_DIR, f))
-            except Exception:
-                pass
-
-def clean_confdir_except(allowed_names):
-    """
-    allowed_names - список базовых имён клиентов (без суффикса All/DsYt и расширения)
-    Удаляет из CONF_DIR все .conf/.png/.zip, которые не относятся к этим именам
-    """
-    suffixes = ['All.conf', 'DsYt.conf', 'All.png', '.zip']
-    for f in os.listdir(CONF_DIR):
-        to_keep = False
-        for name in allowed_names:
-            for suf in suffixes:
-                if f == f"{name}{suf}":
-                    to_keep = True
-        if not to_keep and (f.endswith('.conf') or f.endswith('.png') or f.endswith('.zip')):
             try:
                 os.remove(os.path.join(CONF_DIR, f))
             except Exception:
@@ -1449,11 +1430,6 @@ def handle_confgen():
             file.write(out_dsyt)
 
         clients_for_zip.append(peer_name)
-    
-    # После генерации: если работаем с --only, удаляем всё лишнее из папки conf
-    if only_list:
-        # peers — это список кортежей (name, peer), нам нужны только name
-        clean_confdir_except([name for name, _ in peers])
 
 def generate_qr_codes():
     print('Generate QR codes...')
