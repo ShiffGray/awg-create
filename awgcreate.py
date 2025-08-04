@@ -7,8 +7,11 @@ import random
 import datetime
 import requests
 import zipfile
+import qrcode
+import urllib.request
 
 
+# === ДОБАВЛЕНО: директория для всех клиентских файлов ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONF_DIR = os.path.join(SCRIPT_DIR, "conf")
 os.makedirs(CONF_DIR, exist_ok=True)
@@ -1324,7 +1327,6 @@ def handle_delete():
     print(f'Пользователь "{p_name}" удалён! IP-адрес: "{ipaddr}"')
 
 def fetch_allowed_dsyt():
-    import urllib.request
 
     sites = [
         "youtube.com",
@@ -1462,7 +1464,6 @@ def generate_qr_codes():
     if not flst:
         raise RuntimeError(f'Ошибка: не найдены All-конфиги для генерации QR-кодов!')
 
-    import qrcode
 
     def generate_qr(conf, fn):
         if os.path.getsize(fn) > 2048:
