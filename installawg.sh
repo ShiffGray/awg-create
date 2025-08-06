@@ -34,7 +34,7 @@ mkdir -p ~/awg && cd ~/awg
 wget -O awgcreate.py https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/awgcreate.py
 
 # Генерируем основной конфиг AWG
-python3 awgcreate.py --make /etc/amnezia/amneziawg/awg0.conf -i 10.1.0.0/23 -p 443 -l 44 --mtu 1388 --warp 3
+python3 awgcreate.py --make /etc/amnezia/amneziawg/awg0.conf -i 10.1.0.0/23 -p 443 -l 44 --mtu 1368 --warp 3
 
 # Генерируем шаблон конфигурации
 #python3 awgcreate.py --create
