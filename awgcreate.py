@@ -980,15 +980,15 @@ for ip in net:
 done
 
 # --- Проверка внешних IP WARP-интерфейсов (для диагностики) ---
-echo "Проверка внешних IP WARP"
-for warp in "${WARP_LIST[@]}"; do
-  ip=$(curl --interface "$warp" https://api.ipify.org 2>/dev/null)
-  if [ $? -eq 0 ]; then
-    echo "$warp -> $ip"
-  else
-    echo "Ошибка: Не удалось получить IP для $warp"
-  fi
-done
+#echo "Проверка внешних IP WARP"
+#for warp in "${WARP_LIST[@]}"; do
+#  ip=$(curl --interface "$warp" https://api.ipify.org 2>/dev/null)
+#  if [ $? -eq 0 ]; then
+#    echo "$warp -> $ip"
+#  else
+#    echo "Ошибка: Не удалось получить IP для $warp"
+#  fi
+#done
 echo "————————————————————————————————"
 '''
 
