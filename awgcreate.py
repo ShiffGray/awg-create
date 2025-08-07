@@ -212,7 +212,7 @@ Table = off
 [Peer]
 PublicKey = <WARP_PEER_PUBLIC_KEY>
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = 188.114.99.224:1002
+Endpoint = engage.cloudflareclient.com:2408
 """
 
 class IPAddr():
