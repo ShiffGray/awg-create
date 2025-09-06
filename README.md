@@ -53,7 +53,10 @@ awgcreate помогает:
 ---
 
 ## CLI: опции и команды
-
+Скопировать и скачать скрипт на сервер:
+```bash
+wget -O awgcreate.py https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/awgcreate.py
+```
 Запуск:
 ```bash
 python3 awgcreate.py [опции]
