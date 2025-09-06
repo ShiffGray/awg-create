@@ -82,7 +82,7 @@ python3 awgcreate.py [опции]
 - -t, --tmpcfg STRING  
   Имя шаблона клиентского конфига (по умолчанию `_defclient.config`).
 - -i, --ipaddr STRING  
-  IP-адрес сервера / вручную задаваемый IP при создании шаблонов / добавлении клиента. Поддерживается CIDR (например `10.0.0.1/24`).
+  IP-адрес сервера / вручную задаваемый IP при создании шаблонов / добавлении клиента. Поддерживается CIDR (например `10.1.0.0/24`).
 - -p, --port INT  
   Порт сервера (при создании серверного конфига).
 - -l, --limit INT  
@@ -157,7 +157,7 @@ A: `DsYt` — вариант клиентского конфига с AllowedIPs
 
 1) Создать серверный конфиг:
 ```bash
-sudo python3 awgcreate.py --make /etc/amnezia/amneziawg/awg0.conf --ipaddr 10.1.0.0/23 --port 44567 --mtu 1388 --warp 3 --limit 99
+sudo python3 awgcreate.py --make /etc/amnezia/amneziawg/awg0.conf --ipaddr 10.1.0.0/24 --port 44567 --mtu 1388 --warp 3 --limit 99
 ```
 - Скрипт:
   - Создаст интерфейс `/etc/amnezia/amneziawg/awg0.conf` с локальной подсетью для клиентов 10.1.0.0/23, портом 44567, MTU 1388 (у WARP будит такой же) и лимитом скорости для пользователей 99 мегабит/секунду;
