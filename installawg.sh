@@ -10,7 +10,7 @@ apt install -y software-properties-common
 #устанавливаем iptables:
 apt install -y iptables
 # Устанавливаем Python и утилиты
-apt install -y curl wget python3 python3-pip python3-qrcode
+apt install -y curl wget python3 python3-pip python3-qrcode python3-requests
 
 # Добавить исходники
 echo "deb-src http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse" | tee -a /etc/apt/sources.list
