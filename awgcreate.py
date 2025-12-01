@@ -160,7 +160,7 @@ parser.add_argument("-o", "--only", help="Генерировать конфиг 
 parser.add_argument("-t", "--tmpcfg", default=g_defclient_config_fn)
 parser.add_argument("-i", "--ipaddr", default="")
 parser.add_argument("-p", "--port", type=int, default=44567)
-parser.add_argument("-l", "--limit", type=int, default=999)
+parser.add_argument("-l", "--limit", type=int, default=99)
 parser.add_argument("--make", dest="makecfg", default="")
 parser.add_argument("--tun", default="")
 parser.add_argument("--create", action="store_true")
@@ -232,7 +232,7 @@ Table = off
 [Peer]
 PublicKey = <WARP_PEER_PUBLIC_KEY>
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = <WARP_ENDPOINT>
+Endpoint = engage.cloudflareclient.com:2408
 """
 
 # Класс IPAddr:
@@ -682,63 +682,17 @@ def generate_warp_config(tun_name, index, mtu):
     # Регистрация устройства
     response = requests.post(f"{api}/reg", headers=headers, json=data)
     response.raise_for_status()
-    result = response.json().get('result', {})
-    id = result.get('id')
-    token = result.get('token')
-
+    result = response.json()['result']
+    id = result['id']
+    token = result['token']
     # Активация WARP
     response = requests.patch(f"{api}/reg/{id}", headers={**headers, 'authorization': f'Bearer {token}'}, json={"warp_enabled": True})
     response.raise_for_status()
-    config = response.json().get('result', {}).get('config', {})
-
-    # Публичный ключ пира
-    peer_pub = None
-    peers = config.get('peers') or []
-    if peers and isinstance(peers, list):
-        peer_pub = peers[0].get('public_key') if isinstance(peers[0], dict) else None
-
-    # Извлечение IP-адресов из ответа API (если есть)
-    client_ipv4 = None
-    client_ipv6 = None
-    interface = config.get('interface') or {}
-    addrs = interface.get('addresses') or {}
-    # Иногда API возвращает словарь либо строки
-    client_ipv4 = addrs.get('v4') or (addrs.get('ipv4') if isinstance(addrs.get('ipv4'), str) else None)
-    client_ipv6 = addrs.get('v6') or (addrs.get('ipv6') if isinstance(addrs.get('ipv6'), str) else None)
-
-    # attempt to extract endpoint from peers[0], trying multiple shapes
-    warp_endpoint = None
-    if peers and isinstance(peers[0], dict):
-        p = peers[0]
-        # common string field
-        warp_endpoint = p.get('endpoint') or p.get('Endpoint') or p.get('endpoint_addr') or p.get('endpoint_address')
-        # sometimes endpoint may be presented as host/port fields or nested dict
-        if not warp_endpoint:
-            # case: endpoint object {'host': '...', 'port': 2408}
-            ep_obj = p.get('endpoint_obj') or p.get('endpoint_info') or p.get('endpoint_details') or p.get('endpoint_data')
-            if isinstance(ep_obj, dict):
-                host = ep_obj.get('host') or ep_obj.get('address') or ep_obj.get('addr')
-                port = ep_obj.get('port') or ep_obj.get('p') or ep_obj.get('port_number')
-                if host:
-                    warp_endpoint = f"{host}:{port if port else 2408}"
-        # another possible layout: p['endpoint'] == {'host':..., 'port':...}
-        if not warp_endpoint:
-            ep = p.get('endpoint')
-            if isinstance(ep, dict):
-                host = ep.get('host') or ep.get('address') or ep.get('addr')
-                port = ep.get('port') or 2408
-                if host:
-                    warp_endpoint = f"{host}:{port}"
-
-    # Fallback to known default if nothing found
-    if not warp_endpoint:
-        warp_endpoint = "engage.cloudflareclient.com:2408"
-
-    # sanitize: ensure it's host:port string
-    if isinstance(warp_endpoint, (list, dict)):
-        # defensively convert to string fallback
-        warp_endpoint = "engage.cloudflareclient.com:2408"
-    warp_endpoint = str(warp_endpoint).strip()
+    config = response.json()['result']['config']
+    peer_pub = config['peers'][0]['public_key']
+    # Извлечение IP-адресов из ответа API
+    client_ipv4 = config['interface']['addresses']['v4']
+    client_ipv6 = config['interface']['addresses']['v6']
 
     jc = random.randint(80, 120)
     jmin = random.randint(48, 64)
@@ -750,14 +704,9 @@ def generate_warp_config(tun_name, index, mtu):
     out = out.replace('<JMIN>', str(jmin))
     out = out.replace('<JMAX>', str(jmax))
     out = out.replace('<MTU>', str(mtu))
-    # Использование IP-адресов от Cloudflare (если доступны)
-    if client_ipv4:
-        out = out.replace('<WARP_ADDRESS>', client_ipv4 + (f", {client_ipv6}" if client_ipv6 else ""))
-    else:
-        # fallback: leave empty or use peer address if available
-        out = out.replace('<WARP_ADDRESS>', (client_ipv4 or "") + (f", {client_ipv6}" if client_ipv6 else ""))
-    out = out.replace('<WARP_PEER_PUBLIC_KEY>', peer_pub if peer_pub else "")
-    out = out.replace('<WARP_ENDPOINT>', warp_endpoint)
+    # Использование IP-адресов от Cloudflare
+    out = out.replace('<WARP_ADDRESS>', f"{client_ipv4}, {client_ipv6}")
+    out = out.replace('<WARP_PEER_PUBLIC_KEY>', peer_pub)
 
     filename = f"{tun_name}warp{index}.conf"
     return out, filename
@@ -786,9 +735,11 @@ def generate_warp_configs(tun_name, num_warps, mtu):
         warp_configs.append(warp_filename)
     return warp_configs
 
-# Шаблон скриптов PostUp/PostDown с поддержкой списка WARP-интерфейсов.
-# Этот шаблон рассчитан на корректное поведение, даже если список WARP_LIST пустой.
-up_script_template = '''
+# Шаблоны скриптов PostUp/PostDown без WARP (up_script_template_no_warp и down_script_template_no_warp)
+# и с поддержкой WARP (up_script_template_warp и down_script_template_warp).
+# Эти шаблоны используются при создании серверных скриптов для запуска/останова туннелей,
+# настройки iptables, tc, ifb, портфорвардинга и WARP-интерфейсов.
+up_script_template_no_warp = '''
 #!/bin/bash
 #set -x
 
@@ -806,17 +757,12 @@ LOCAL_SERVER_IP="$(echo "$LOCAL_SUBNETS" | cut -d'/' -f1)"     # Первый IP
 SUBNETS_LIMITS=(
   "<SERVER_ADDR>:<RATE_LIMIT>"
 )
-# --- Список WARP-интерфейсов ---
-WARP_LIST=(
-<WARP_LIST>
-)
-# --- Подсети исключения (ходят мимо WARP) ---
-EXCLUDE_SUBNETS=(
-  "<SERVER_ADDR>"
-)
+
 # --- Пробросы портов ---
 PORT_FORWARDING_RULES=(
+  # Формат: "VPN_IP:ВнешнийПорт[>ВнутреннийПорт]:TCP/UDP:Список_разрешённых_подсетей[:SNAT]"
   # Пример: "10.66.66.2:25565>25555:TCP:0.0.0.0/0"
+  # Пример со SNAT: "10.66.66.2:25565>25555:TCP:0.0.0.0/0:SNAT"
 )
 
 # "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
@@ -825,85 +771,20 @@ TUN_SAFE="$(echo "$TUN" | sed 's/[^a-zA-Z0-9]/_/g')"
 PF_CHAIN_NAT="PORT_FORWARD_NAT_${TUN_SAFE}"
 PF_CHAIN_FILTER="PORT_FORWARD_FILTER_${TUN_SAFE}"
 PF_CHAIN_SNAT="PORT_FORWARD_SNAT_${TUN_SAFE}"
-RANDOM_WARP_CHAIN="RANDOM_WARP_${TUN_SAFE}"
 IFB_IN="ifb_${TUN_SAFE}_in"
 IFB_OUT="ifb_${TUN_SAFE}_out"
 
 echo "————————————————————————————————"
 
-# MARK специфичен для туннеля — берем небольшой оффсет от имени туннеля
-TUN_HASH=$(echo -n "$TUN" | od -An -t u1 2>/dev/null | tr -s ' ' '\n' | awk '{s+=$1} END{print s}')
-MARK_BASE=$((1000 + (TUN_HASH % 100) * 10))
+# --- Базовые iptables для работы туннеля и NAT (проверяем, чтобы не добавлять дубликаты) ---
+iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT --wait 10 2>/dev/null || iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT --wait 10
+iptables -C FORWARD -i "$IFACE" -o "$TUN" -j ACCEPT --wait 10 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -j ACCEPT --wait 10
+iptables -C FORWARD -i "$TUN" -j ACCEPT --wait 10 2>/dev/null || iptables -A FORWARD -i "$TUN" -j ACCEPT --wait 10
+iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE --wait 10 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE --wait 10
+ip6tables -C FORWARD -i "$TUN" -j ACCEPT --wait 10 2>/dev/null || ip6tables -A FORWARD -i "$TUN" -j ACCEPT --wait 10
+ip6tables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE --wait 10 2>/dev/null || ip6tables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE --wait 10
 
-# Функция: найти или зарезервировать TABLE_ID для данного TABLE_NAME (201..400)
-find_table_id() {
-  local tname="$1"
-  local tid
-  tid=$(awk -v name="$tname" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
-  if [ -n "$tid" ]; then
-    echo "$tid"
-    return
-  fi
-  for id in $(seq 201 400); do
-    if ! grep -q "^${id}[[:space:]]" /etc/iproute2/rt_tables 2>/dev/null; then
-      echo "$id"
-      return
-    fi
-  done
-  echo "0"
-}
-
-# --- Запуск WARP-интерфейсов (дополнительные WireGuard-интерфейсы для мульти-WARP) ---
-for warp in "${WARP_LIST[@]}"; do
-  echo "Запуск WARP-туннеля: $warp"
-  awg-quick up "$warp" || echo "Ошибка запуска $warp: $?"
-done
-
-# --- WARP-маршрутизация и балансировка трафика через WARP интерфейсы ---
-for i in "${!WARP_LIST[@]}"; do
-  TABLE_NAME="${WARP_LIST[$i]}"
-  TABLE_ID=$(find_table_id "$TABLE_NAME")
-  if [ "$TABLE_ID" = "0" ]; then
-    echo "Ошибка: не удалось найти свободный TABLE_ID для $TABLE_NAME"
-  else
-    grep -q "^$TABLE_ID[[:space:]]$TABLE_NAME$" /etc/iproute2/rt_tables || echo "$TABLE_ID $TABLE_NAME" >> /etc/iproute2/rt_tables
-    ip route replace default dev "$TABLE_NAME" table "$TABLE_NAME"
-    ip rule add fwmark $((MARK_BASE+i)) table "$TABLE_NAME" 2>/dev/null || true
-  fi
-done
-
-# --- iptables для балансировки WARP (случайное распределение новых соединений) ---
-iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -N "$RANDOM_WARP_CHAIN"
-iptables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN"
-
-# --- Исключение подсетей из маркировки (будут идти напрямую через основной интерфейс) ---
-for subnet in "${EXCLUDE_SUBNETS[@]}"; do
-  iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d $subnet -j RETURN
-done
-
-CNT=${#WARP_LIST[@]}
-if [ "$CNT" -gt 0 ]; then
-  for i in $(seq 0 $((CNT-1))); do
-    MARK=$((MARK_BASE+i))
-    iptables -t mangle -A "$RANDOM_WARP_CHAIN" -m conntrack --ctstate NEW -m statistic --mode nth --every $CNT --packet $i -j CONNMARK --set-mark $MARK
-  done
-fi
-iptables -t mangle -A "$RANDOM_WARP_CHAIN" -j CONNMARK --restore-mark
-
-# --- Настройка FORWARD и NAT для трафика через WARP ---
-for warp in "${WARP_LIST[@]}"; do
-  iptables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-  iptables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  iptables -t nat -C POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
-done
-
-# --- Настройка FORWARD и NAT для трафика напрямую через внешний интерфейс (EXCLUDE_SUBNETS) ---
-iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT
-iptables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
-iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-
-# --- Hairpin NAT ---
+# --- Hairpin NAT: позволяет клиентам VPN общаться между собой через внешний IP ---
 iptables -t nat -C POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE
 
 # --- Проброс портов через отдельные цепочки (DNAT + SNAT + ACCEPT) ---
@@ -911,6 +792,7 @@ echo "Проброс портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_FILT
 iptables -t nat -N "$PF_CHAIN_NAT" 2>/dev/null || true
 iptables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
 iptables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
+# Привязываем специфичные цепочки
 iptables -t nat -C PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || iptables -t nat -A PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT"
 iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER"
 iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT"
@@ -1057,7 +939,346 @@ done
 echo "————————————————————————————————"
 '''
 
-down_script_template = '''
+down_script_template_no_warp = '''
+#!/bin/bash
+#set -x
+
+# --- Основные переменные ---
+PORT="<SERVER_PORT>"
+IFACE="<SERVER_IFACE>"
+TUN="<SERVER_TUN>"
+
+LOCAL_SUBNETS="<SERVER_ADDR>"
+LOCAL_SERVER_IP="$(echo "$LOCAL_SUBNETS" | cut -d'/' -f1)"
+
+# "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
+TUN_SAFE="$(echo "$TUN" | sed 's/[^a-zA-Z0-9]/_/g')"
+# Суффиксированные/уникальные имена цепочек/ресурсов
+PF_CHAIN_NAT="PORT_FORWARD_NAT_${TUN_SAFE}"
+PF_CHAIN_FILTER="PORT_FORWARD_FILTER_${TUN_SAFE}"
+PF_CHAIN_SNAT="PORT_FORWARD_SNAT_${TUN_SAFE}"
+IFB_IN="ifb_${TUN_SAFE}_in"
+IFB_OUT="ifb_${TUN_SAFE}_out"
+
+echo "————————————————————————————————"
+
+# --- Откатываем базовые iptables для туннеля и NAT (удаляем, если есть) ---
+iptables -D INPUT -p udp --dport "$PORT" -j ACCEPT --wait 10 2>/dev/null || true
+iptables -D FORWARD -i "$IFACE" -o "$TUN" -j ACCEPT --wait 10 2>/dev/null || true
+iptables -D FORWARD -i "$TUN" -j ACCEPT --wait 10 2>/dev/null || true
+iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE --wait 10 2>/dev/null || true
+ip6tables -D FORWARD -i "$TUN" -j ACCEPT --wait 10 2>/dev/null || true
+ip6tables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE --wait 10 2>/dev/null || true
+
+# --- Удаляем Hairpin NAT ---
+iptables -t nat -D POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE 2>/dev/null || true
+
+# --- Полное удаление цепочек проброса портов (специфично для туннеля) ---
+echo "Очистка проброса портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_SNAT, $PF_CHAIN_FILTER)"
+iptables -t nat -D PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || true
+iptables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
+iptables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
+
+iptables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
+iptables -t nat -F "$PF_CHAIN_SNAT" 2>/dev/null || true
+iptables -t nat -X "$PF_CHAIN_SNAT" 2>/dev/null || true
+
+iptables -t filter -D FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+iptables -t filter -F "$PF_CHAIN_FILTER" 2>/dev/null || true
+iptables -t filter -X "$PF_CHAIN_FILTER" 2>/dev/null || true
+
+# --- Откат лимитов скорости (tc и ifb) ---
+echo "Очистка лимитов"
+tc qdisc del dev "$TUN" root 2>/dev/null || true
+tc qdisc del dev "$TUN" ingress 2>/dev/null || true
+tc qdisc del dev "$IFB_IN" root 2>/dev/null || true
+ip link set "$IFB_IN" down 2>/dev/null || true
+ip link delete "$IFB_IN" 2>/dev/null || true
+tc qdisc del dev "$IFB_OUT" root 2>/dev/null || true
+ip link set "$IFB_OUT" down 2>/dev/null || true
+ip link delete "$IFB_OUT" 2>/dev/null || true
+echo "————————————————————————————————"
+'''
+
+up_script_template_warp = '''
+#!/bin/bash
+#set -x
+
+# --- Основные переменные ---
+PORT="<SERVER_PORT>"
+IFACE="<SERVER_IFACE>"
+TUN="<SERVER_TUN>"
+QUANT="4400"
+
+# --- Подсеть и локальный IP сервера в ней ---
+LOCAL_SUBNETS="<SERVER_ADDR>"
+LOCAL_SERVER_IP="$(echo "$LOCAL_SUBNETS" | cut -d'/' -f1)"
+
+# --- Ограничения скорости для подсетей ---
+SUBNETS_LIMITS=(
+  "<SERVER_ADDR>:<RATE_LIMIT>"
+)
+# --- Список WARP-интерфейсов ---
+WARP_LIST=(
+<WARP_LIST>
+)
+# --- Подсети исключения (ходят мимо WARP) ---
+EXCLUDE_SUBNETS=(
+  "<SERVER_ADDR>"
+)
+# --- Пробросы портов ---
+PORT_FORWARDING_RULES=(
+  # Пример: "10.66.66.2:25565>25555:TCP:0.0.0.0/0"
+)
+
+# "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
+TUN_SAFE="$(echo "$TUN" | sed 's/[^a-zA-Z0-9]/_/g')"
+# Суффиксированные/уникальные имена цепочек/ресурсов
+PF_CHAIN_NAT="PORT_FORWARD_NAT_${TUN_SAFE}"
+PF_CHAIN_FILTER="PORT_FORWARD_FILTER_${TUN_SAFE}"
+PF_CHAIN_SNAT="PORT_FORWARD_SNAT_${TUN_SAFE}"
+RANDOM_WARP_CHAIN="RANDOM_WARP_${TUN_SAFE}"
+IFB_IN="ifb_${TUN_SAFE}_in"
+IFB_OUT="ifb_${TUN_SAFE}_out"
+
+echo "————————————————————————————————"
+
+# MARK специфичен для туннеля — берем небольшой оффсет от имени туннеля
+TUN_HASH=$(echo -n "$TUN" | od -An -t u1 2>/dev/null | tr -s ' ' '\n' | awk '{s+=$1} END{print s}')
+MARK_BASE=$((1000 + (TUN_HASH % 100) * 10))
+
+# Функция: найти или зарезервировать TABLE_ID для данного TABLE_NAME (201..400)
+find_table_id() {
+  local tname="$1"
+  local tid
+  tid=$(awk -v name="$tname" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+  if [ -n "$tid" ]; then
+    echo "$tid"
+    return
+  fi
+  for id in $(seq 201 400); do
+    if ! grep -q "^${id}[[:space:]]" /etc/iproute2/rt_tables 2>/dev/null; then
+      echo "$id"
+      return
+    fi
+  done
+  echo "0"
+}
+
+# --- Запуск WARP-интерфейсов (дополнительные WireGuard-интерфейсы для мульти-WARP) ---
+for warp in "${WARP_LIST[@]}"; do
+  echo "Запуск WARP-туннеля: $warp"
+  awg-quick up "$warp" || echo "Ошибка запуска $warp: $?"
+done
+
+# --- WARP-маршрутизация и балансировка трафика через WARP интерфейсы ---
+for i in "${!WARP_LIST[@]}"; do
+  TABLE_NAME="${WARP_LIST[$i]}"
+  TABLE_ID=$(find_table_id "$TABLE_NAME")
+  if [ "$TABLE_ID" = "0" ]; then
+    echo "Ошибка: не удалось найти свободный TABLE_ID для $TABLE_NAME"
+  else
+    grep -q "^$TABLE_ID[[:space:]]$TABLE_NAME$" /etc/iproute2/rt_tables || echo "$TABLE_ID $TABLE_NAME" >> /etc/iproute2/rt_tables
+    ip route replace default dev "$TABLE_NAME" table "$TABLE_NAME"
+    ip rule add fwmark $((MARK_BASE+i)) table "$TABLE_NAME" 2>/dev/null || true
+  fi
+done
+
+# --- iptables для балансировки WARP (случайное распределение новых соединений) ---
+iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -N "$RANDOM_WARP_CHAIN"
+iptables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN"
+
+# --- Исключение подсетей из маркировки (будут идти напрямую через основной интерфейс) ---
+for subnet in "${EXCLUDE_SUBNETS[@]}"; do
+  iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d $subnet -j RETURN
+done
+
+CNT=${#WARP_LIST[@]}
+for i in $(seq 0 $((CNT-1))); do
+  MARK=$((MARK_BASE+i))
+  iptables -t mangle -A "$RANDOM_WARP_CHAIN" -m conntrack --ctstate NEW -m statistic --mode nth --every $CNT --packet $i -j CONNMARK --set-mark $MARK
+done
+iptables -t mangle -A "$RANDOM_WARP_CHAIN" -j CONNMARK --restore-mark
+
+# --- Настройка FORWARD и NAT для трафика через WARP ---
+for warp in "${WARP_LIST[@]}"; do
+  iptables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
+  iptables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  iptables -t nat -C POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
+done
+
+# --- Настройка FORWARD и NAT для трафика напрямую через внешний интерфейс (EXCLUDE_SUBNETS) ---
+iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT
+iptables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
+iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+
+# --- Hairpin NAT ---
+iptables -t nat -C POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE
+
+# --- Проброс портов через отдельные цепочки (DNAT + SNAT + ACCEPT) ---
+echo "Проброс портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_FILTER, $PF_CHAIN_SNAT)"
+iptables -t nat -N "$PF_CHAIN_NAT" 2>/dev/null || true
+iptables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
+iptables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
+iptables -t nat -C PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || iptables -t nat -A PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT"
+iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER"
+iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT"
+
+# --- Добавление правил для каждого проброса ---
+for rule in "${PORT_FORWARDING_RULES[@]}"; do
+  # Поддерживаем необязательное пятое поле: SNAT флаг
+  IFS=":" read -r CLIENT_IP PF_PORT_PROTO PF_PROTO ALLOWED_SUBNETS SNAT_FLAG <<< "$rule"
+  IFS='>' read -r PF_PORT_EXT PF_PORT_INT <<< "$PF_PORT_PROTO"
+  [ -z "$PF_PORT_INT" ] && PF_PORT_INT="$PF_PORT_EXT"
+  IFS=',' read -ra SUBNETS_ARRAY <<< "$ALLOWED_SUBNETS"
+
+  SNAT_EN=0
+  if [ -n "$SNAT_FLAG" ] && [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+    SNAT_EN=1
+  fi
+  # --- Диапазон портов (если указан) ---
+  if [[ "$PF_PORT_EXT" == *"-"* ]] && [[ "$PF_PORT_INT" == *"-"* ]]; then
+    PF_PORT_EXT_START="${PF_PORT_EXT%-*}"
+    PF_PORT_EXT_END="${PF_PORT_EXT#*-}"
+    PF_PORT_INT_START="${PF_PORT_INT%-*}"
+    PF_PORT_INT_END="${PF_PORT_INT#*-}"
+    RANGE_LEN=$((PF_PORT_EXT_END - PF_PORT_EXT_START))
+    [ $RANGE_LEN -ne $((PF_PORT_INT_END - PF_PORT_INT_START)) ] && { echo "Ошибка: диапазоны портов должны быть одинаковой длины"; continue; }
+    for ((i=0; i<=RANGE_LEN; i++)); do
+      EXT_PORT=$((PF_PORT_EXT_START + i))
+      INT_PORT=$((PF_PORT_INT_START + i))
+      for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
+        # DNAT
+        iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$INT_PORT"
+        # SNAT — только если указан флаг в правиле
+        if [ "$SNAT_EN" -eq 1 ]; then
+          iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$LOCAL_SERVER_IP"
+        fi
+        # FORWARD разрешения
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+      done
+      if [ "$SNAT_EN" -eq 1 ]; then
+        echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (SNAT)"
+      else
+        echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (no SNAT)"
+      fi
+    done
+  # --- Диапазон только на внешней стороне (или одиночный порт) ---
+  else
+    if [[ "$PF_PORT_EXT" == *"-"* ]]; then
+      PF_PORT_START="${PF_PORT_EXT%-*}"
+      PF_PORT_END="${PF_PORT_EXT#*-}"
+      for ((PORT=PF_PORT_START; PORT<=PF_PORT_END; PORT++)); do
+        for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
+          iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$PORT"
+          if [ "$SNAT_EN" -eq 1 ]; then
+            iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT" -j SNAT --to-source "$LOCAL_SERVER_IP"
+          fi
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+        done
+        if [ "$SNAT_EN" -eq 1 ]; then
+          echo "$PF_PROTO порт $PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (SNAT)"
+        else
+          echo "$PF_PROTO порт $PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (no SNAT)"
+        fi
+      done
+    else
+      for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
+        iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$PF_PORT_INT"
+        if [ "$SNAT_EN" -eq 1 ]; then
+          iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$LOCAL_SERVER_IP"
+        fi
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -s "$ALLOWED_SUBNET" -j ACCEPT
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+      done
+      if [ "$SNAT_EN" -eq 1 ]; then
+        echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (SNAT)"
+      else
+        echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (no SNAT)"
+      fi
+    fi
+  fi
+done
+
+# --- Traffic shaping (ограничение скорости) с помощью ifb и tc ---
+modprobe ifb
+
+# Удаляем и создаём IFB-устройства, специфичные для туннеля (чтобы не конфликтовать между интерфейсами)
+ip link set "$IFB_IN" down 2>/dev/null || true
+ip link delete "$IFB_IN" 2>/dev/null || true
+ip link set "$IFB_OUT" down 2>/dev/null || true
+ip link delete "$IFB_OUT" 2>/dev/null || true
+ip link add "$IFB_OUT" type ifb 2>/dev/null || true
+ip link set "$IFB_OUT" up
+ip link add "$IFB_IN" type ifb 2>/dev/null || true
+ip link set "$IFB_IN" up
+
+tc qdisc del dev "$TUN" root 2>/dev/null || true
+tc qdisc del dev "$TUN" ingress 2>/dev/null || true
+tc qdisc del dev "$IFB_OUT" root 2>/dev/null || true
+tc qdisc del dev "$IFB_IN" root 2>/dev/null || true
+
+tc qdisc add dev "$TUN" root handle 1: htb
+tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
+tc qdisc add dev "$IFB_OUT" root handle 1: htb default 2
+tc qdisc add dev "$TUN" handle ffff: ingress
+tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
+tc qdisc add dev "$IFB_IN" root handle 1: htb default 2
+
+# --- Применение лимитов скорости для каждой подсети из SUBNETS_LIMITS ---
+major_class=1
+minor_id=1000
+echo "Установка лимитов скорости для подсетей"
+for entry in "${SUBNETS_LIMITS[@]}"; do
+  SUBNET="${entry%%:*}"
+  LIM="${entry##*:}"
+  IPS=$(python3 -c "
+import ipaddress
+net = ipaddress.ip_network('$SUBNET', strict=False)
+for ip in net:
+    print(ip)
+")
+  for ip in $IPS; do
+    if [ "$minor_id" -gt 9999 ]; then
+      major_class=$((major_class + 1))
+      minor_id=1000
+      tc class add dev "$IFB_OUT" parent $((major_class - 1)): classid $((major_class - 1)):1 htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
+      tc class add dev "$IFB_OUT" parent $((major_class - 1)):1 classid $((major_class - 1)):${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
+      tc qdisc add dev "$IFB_OUT" parent $((major_class - 1)):${major_class} handle ${major_class}: htb default $((major_class + 1))
+      tc class add dev "$IFB_IN" parent $((major_class - 1)): classid $((major_class - 1)):1 htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
+      tc class add dev "$IFB_IN" parent $((major_class - 1)):1 classid $((major_class - 1)):${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
+      tc qdisc add dev "$IFB_IN" parent $((major_class - 1)):${major_class} handle ${major_class}: htb default $((major_class + 1))
+    fi
+    classid="${major_class}:${minor_id}"
+    major="${major_class}:"
+    tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
+    tc filter add dev "$IFB_OUT" protocol ip parent ${major_class}: prio 1 u32 match ip dst $ip flowid $classid
+    tc qdisc add dev "$IFB_OUT" parent $classid fq_codel
+    tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
+    tc filter add dev "$IFB_IN" protocol ip parent ${major_class}: prio 1 u32 match ip src $ip flowid $classid
+    tc qdisc add dev "$IFB_IN" parent $classid fq_codel
+    minor_id=$((minor_id + 1))
+  done
+  echo "$SUBNET -> ${LIM}mbit"
+done
+
+# --- Проверка внешних IP WARP-интерфейсов (для диагностики) ---
+#echo "Проверка внешних IP WARP"
+#for warp in "${WARP_LIST[@]}"; do
+#  ip=$(curl --interface "$warp" https://api.ipify.org 2>/dev/null)
+#  if [ $? -eq 0 ]; then
+#    echo "$warp -> $ip"
+#  else
+#    echo "Ошибка: Не удалось получить IP для $warp"
+#  fi
+#done
+echo "————————————————————————————————"
+'''
+
+down_script_template_warp = '''
 #!/bin/bash
 #set -x
 
@@ -1243,10 +1464,11 @@ def handle_makecfg():
         except Exception as e:
             raise RuntimeError(f"Ошибка при генерации WARP-конфигов: {e}")
 
-    # Всегда используем единый шаблон с поддержкой списка WARP интерфейсов.
-    # Шаблон корректно обрабатывает пустой список WARP_LIST.
+    up_script_template = up_script_template_warp if opt.warp > 0 else up_script_template_no_warp
+    down_script_template = down_script_template_warp if opt.warp > 0 else down_script_template_no_warp
+    
     # Формируем WARP_LIST с названиями интерфейсов без .conf
-    warp_list_str = "\n".join([f'  \"{os.path.splitext(cfg)[0]}\"' for cfg in warp_configs]) if warp_configs else ""
+    warp_list_str = "\n".join([f'  "{os.path.splitext(cfg)[0]}"' for cfg in warp_configs]) if opt.warp > 0 else ""
 
     replacements = {
         '<SERVER_PORT>': str(opt.port),
@@ -1257,18 +1479,14 @@ def handle_makecfg():
         '<WARP_LIST>': warp_list_str
     }
 
-    # Делать замены в локальных копиях шаблонов — чтобы не затереть глобальные шаблоны
-    local_up = up_script_template[:]
-    local_down = down_script_template[:]
-
     for key, value in replacements.items():
-        local_up = local_up.replace(key, value)
-        local_down = local_down.replace(key, value)
+        up_script_template = up_script_template.replace(key, value)
+        down_script_template = down_script_template.replace(key, value)
 
     with open(up_script_path, 'w', newline='\n') as f:
-        f.write(local_up)
+        f.write(up_script_template)
     with open(down_script_path, 'w', newline='\n') as f:
-        f.write(local_down)
+        f.write(down_script_template)
 
     os.chmod(up_script_path, 0o755)
     os.chmod(down_script_path, 0o755)
@@ -1321,7 +1539,7 @@ def handle_create():
     print(f'Шаблон клиентских конфигов "{tmpcfg_path}" создан!')
     sys.exit(0)
 
-# Проверяем, что не передано одновременно несколько операции add/update/delete
+# Проверяем, что не передано одновременно несколько операций add/update/delete
 xopt = [opt.addcl, opt.update, opt.delete]
 copt = [x for x in xopt if len(x) > 0]
 if copt and len(copt) >= 2:
