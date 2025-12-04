@@ -22,8 +22,8 @@ awgcreate помогает:
 
 ## Требования
 
-- Python 3.8+ (использование `subprocess.run` с `encoding='utf8'`).
-- На Linux (для генерации реальных ключей и сетевых операций):
+- Python 3.8+.
+- На Linux (для генерации ключей и сетевых операций):
   - `openssl` (для генерации preshared key).
   - `curl` (для получения внешнего IP).
   - `ip`, `iptables`, `ip6tables`, `tc`, `iproute2` и пр. — используются в сгенерированных PostUp/PostDown-скриптах.
