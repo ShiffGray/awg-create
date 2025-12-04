@@ -1,5 +1,5 @@
 # Скрипт для установки AmneziaWG и скрипта awgcreate
-- Скрипт создавался и тестировался под ОС Ubuntu22/24 и Debian12/13. На других ОС может работать некорректно.
+- Скрипт создавался и тестировался под ОС Ubuntu22/24 и Debian12/13. Не знаю что насчет других ОС.
 - Чтобы скачать AmneziaWG и скрипт, используйте эту команду:
 ```sh
 wget -qO- https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/installawg.sh | bash
