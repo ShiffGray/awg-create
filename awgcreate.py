@@ -40,8 +40,8 @@ g_defclient_config_fn = "_defclient.config"
 
 clients_for_zip: List[str] = []
 
-# ----------------- Утилиты -----------------
 
+# ----------------- Утилиты -----------------
 
 def atomic_write_text(path: pathlib.Path, text: str, encoding: str = "utf-8") -> None:
     """
@@ -585,8 +585,8 @@ ip link delete "$IFB_OUT" 2>/dev/null || true
 echo "————————————————————————————————"
 '''
 
-# ----------------- Вспомогательный класс IPAddr -----------------
 
+# ----------------- Вспомогательный класс IPAddr -----------------
 
 class IPAddr:
     def __init__(self, ipaddr: Optional[str] = None):
@@ -622,7 +622,6 @@ class IPAddr:
 
 
 # ----------------- WGConfig -----------------
-
 
 class WGConfig:
     def __init__(self, filename: Optional[str] = None):
@@ -895,7 +894,7 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
         priv_key, pub_key = gen_pair_keys("AWG")
         data = {
             "install_id": "",
-            "tos": datetime.datetime.utcnow().isoformat() + "Z",
+            "tos": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "key": pub_key,
             "fcm_token": "",
             "type": "ios",
@@ -1013,7 +1012,6 @@ def generate_warp_configs(tun_name: str, num_warps: int, mtu: int) -> List[str]:
 
 # ----------------- fetch DsYt с fallback -----------------
 
-
 def fetch_allowed_dsyt() -> str:
     """
     Загружает CIDR-листы для набора сайтов. Если не удалось получить ни одной записи —
@@ -1059,7 +1057,6 @@ def fetch_allowed_dsyt() -> str:
 
 
 # ----------------- Обработчики (make/create/add/update/delete/confgen и пр.) -----------------
-
 
 def handle_makecfg(opt) -> None:
     global g_main_config_fn, g_main_config_type
