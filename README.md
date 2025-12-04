@@ -5,14 +5,6 @@
 wget -qO- https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/installawg.sh | bash
 ```
 
-# awgcreate — утилита для управления конфигами AmneziaWG
-
-Это Python-скрипт для быстрой генерации и управления серверными и клиентскими конфигурациями AmneziaWG (форк WireGuard), автоматического создания Post Up/Down скриптов, генерации WARP-конфигов (Cloudflare WARP), QR-кодов и ZIP-архивов с конфигами клиентов.
-
-Файл скрипта: `awgcreate.py`
-
-Ниже — подробная документация по установке, требованиям, использованию и примерам.
-
 ---
 
 ## Краткий обзор
