@@ -50,7 +50,7 @@ wget -O awgcreate.py https://raw.githubusercontent.com/ShiffGray/awg-create/refs
 ```
 Примеры команд скрипта:
 ```bash
-python3 awgcreate.py [опции]
+## python3 awgcreate.py [опции]
 
 # Создать серверный интерфейс с именем awg0, подсетью 10.1.0.0/24, портом 44567, лимитом скорости для пользователей 99Мб/сек,
 # MTU 1388 и 3 WARP конфига между которыми будет балансироваться трафик пользователей
