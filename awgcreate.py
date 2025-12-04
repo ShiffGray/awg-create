@@ -204,12 +204,12 @@ H1 = <H1>
 H2 = <H2>
 H3 = <H3>
 H4 = <H4>
-PrivateKey = <CLIENT_PRIVATE_KEY>
 MTU = <MTU>
+PrivateKey = <CLIENT_PRIVATE_KEY>
 
 [Peer]
 Endpoint = <SERVER_ADDR>:<SERVER_PORT>
-PersistentKeepalive = 60
+PersistentKeepalive = 13
 PresharedKey = <PRESHARED_KEY>
 PublicKey = <SERVER_PUBLIC_KEY>
 AllowedIPs = <ALLOWED_IPS>
@@ -217,7 +217,7 @@ AllowedIPs = <ALLOWED_IPS>
 
 g_warp_config = """
 [Interface]
-PrivateKey = <WARP_PRIVATE_KEY>
+Address = <WARP_ADDRESS>
 Jc = <JC>
 Jmin = <JMIN>
 Jmax = <JMAX>
@@ -226,13 +226,14 @@ H2 = 2
 H3 = 3
 H4 = 4
 MTU = <MTU>
-Address = <WARP_ADDRESS>
+PrivateKey = <WARP_PRIVATE_KEY>
 Table = off
 
 [Peer]
+Endpoint = engage.cloudflareclient.com:2408
+PersistentKeepalive = 11
 PublicKey = <WARP_PEER_PUBLIC_KEY>
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = engage.cloudflareclient.com:2408
 """
 
 # Класс IPAddr:
