@@ -1024,6 +1024,7 @@ def fetch_allowed_dsyt() -> str:
         "discord.media",
         "chatgpt.com",
         "pornhub.com",
+        "roblox.com",
     ]
     protocols = ["cidr4", "cidr6"]
     ip_set = set()
