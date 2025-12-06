@@ -3,7 +3,7 @@ apt update
 apt install -y wget curl iptables gnupg2 dirmngr openresolv
 
 # 2. Добавление GPG ключа Amnezia PPA
-sudo wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | sudo gpg --dearmor -o /usr/share/keyrings/amnezia-ppa.gpg
+wget -qO- "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | sudo gpg --dearmor -o /usr/share/keyrings/amnezia-ppa.gpg
 # 3. Добавление PPA репозитория в отдельный файл
 echo "deb [signed-by=/usr/share/keyrings/amnezia-ppa.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" | sudo tee /etc/apt/sources.list.d/amnezia.list
 echo "deb-src [signed-by=/usr/share/keyrings/amnezia-ppa.gpg] https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu focal main" | sudo tee -a /etc/apt/sources.list.d/amnezia.list
