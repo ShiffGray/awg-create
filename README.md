@@ -54,14 +54,14 @@ wget -O awgcreate.py https://raw.githubusercontent.com/ShiffGray/awg-create/refs
 
 # Создать серверный интерфейс с именем awg0, подсетью 10.1.0.0/24, портом 44567, лимитом скорости для пользователей 99Мб/сек,
 # MTU 1388 и 3 WARP конфига между которыми будет балансироваться трафик пользователей
-python3 awgcreate.py --make /etc/amnezia/amneziawg/awg0.conf -i 10.1.0.0/24 -p 44567 -l 99 --mtu 1388 --warp 3
+python3 awgcreate.py --make /etc/amnezia/amneziawg/awg1.conf -i 10.1.0.0/24 -p 44567 -l 99 --mtu 1388 --warp 3
 
 # Создать пользователя с именем test на awg0
-python3 awgcreate.py -s awg0 -a test
+python3 awgcreate.py -s awg1 -a test
 # Удалить пользователя test на awg0
-python3 awgcreate.py -s awg0 -d test
+python3 awgcreate.py -s awg1 -d test
 # Пересгенерировать ключи пользователя test на awg0 (ну тоесть сбросить данные подключения пользователя/пересоздать его)
-python3 awgcreate.py -s awg0 -u test
+python3 awgcreate.py -s awg1 -u test
 
 # Сгенерировать zip архив с конфигами и qr-код для пользователя test, так же можно сгенерировать только qr-коды через флаг -q
 # и только конфиги через -c , а через флаг -o указываеться конкретный пользователь или список пользователей
@@ -72,16 +72,16 @@ python3 awgcreate.py -s awg0 -z -o test
 Команды для управления самим интерфейсом:
 ```bash
 # Запустить интерфейс
-awg-quick up awg0
+awg-quick up awg1
 # Остановить
-awg-quick down awg0
+awg-quick down awg1
 
 # Добавить интерфейс в автозагрузки
-systemctl enable awg-quick@awg0
+systemctl enable awg-quick@awg1
 # Удалить
-systemctl disable awg-quick@awg0
+systemctl disable awg-quick@awg1
 # Перезапустить
-systemctl restart awg-quick@awg0
+systemctl restart awg-quick@awg1
 
 # Вывести список запущенных интерфейсов и пользователей
 awg
@@ -89,7 +89,7 @@ awg
 
 Краткий список опций скрипта (см. полный набор в скрипте):
 - -s, --serv-cfg STRING  
-  Путь или имя серверного конфига (например `awg0`, `awg0.conf`, `/etc/amnezia/amneziawg/awg0.conf`). Если не указан — читается `.main.config`.
+  Путь или имя серверного конфига (например `awg1`, `awg1.conf`, `/etc/amnezia/amneziawg/awg1.conf`). Если не указан — читается `.main.config`.
 - -a, --add STRING  
   Добавить клиента с указанным именем (секция [Peer] добавляется в конец серверного конфига). Пример: `-a alice`.
 - -u, --update STRING  
@@ -150,7 +150,7 @@ awg
 
 - "Ошибка: основной WG конфиг не найден!"  
   Убедитесь, что вы:
-  - Либо указали `-s awg0`;
+  - Либо указали `-s awg1`;
   - Либо в `.main.config` записан корректный путь к конфигу (первая строка).
 - Проблемы с генерацией ключей (ошибка при вызове `awg genkey`):  
   Убедитесь, что `awg` доступен в PATH и запускаются от root.
