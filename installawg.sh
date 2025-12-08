@@ -25,3 +25,4 @@ apt install -y python3 python3-pip python3-qrcode python3-requests
 mkdir -p ~/awg && cd ~/awg
 # Скачиваем awgcreate для работы с конфигами AWG
 wget -O awgcreate.py https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/awgcreate.py
+
