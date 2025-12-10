@@ -43,9 +43,7 @@ g_endpoint_config_fn = SCRIPT_DIR.joinpath("_endpoint.config")
 
 clients_for_zip: List[str] = []
 
-
 # ----------------- Утилиты -----------------
-
 
 def atomic_write_text(path: pathlib.Path, text: str, encoding: str = "utf-8") -> None:
     """
@@ -63,7 +61,6 @@ def atomic_write_text(path: pathlib.Path, text: str, encoding: str = "utf-8") ->
                 os.remove(tmpname)
             except Exception:
                 pass
-
 
 def exec_cmd(cmd, input: Optional[str] = None, shell: bool = False, timeout: Optional[int] = None) -> Tuple[int, str]:
     """
@@ -113,10 +110,8 @@ def exec_cmd(cmd, input: Optional[str] = None, shell: bool = False, timeout: Opt
     except Exception as e:
         return 1, f"exec_cmd failed: {e}"
 
-
 def is_windows() -> bool:
     return sys.platform == "win32"
-
 
 def gen_pair_keys(cfg_type: Optional[str] = None) -> Tuple[str, str]:
     global g_main_config_type
@@ -137,7 +132,6 @@ def gen_pair_keys(cfg_type: Optional[str] = None) -> Tuple[str, str]:
     pub = out.strip()
     return priv, pub
 
-
 def gen_preshared_key() -> str:
     if is_windows():
         import base64, os as _os
@@ -146,7 +140,6 @@ def gen_preshared_key() -> str:
     if rc != 0:
         raise RuntimeError("Не удалось сгенерировать preshared key")
     return out.strip()
-
 
 def get_main_iface() -> Optional[str]:
     rc, out = exec_cmd(["ip", "link", "show"])
@@ -160,7 +153,6 @@ def get_main_iface() -> Optional[str]:
                 return parts[1].strip()
     return None
 
-
 def get_ext_ipaddr() -> str:
     try:
         r = requests.get("https://icanhazip.com", timeout=6)
@@ -170,7 +162,6 @@ def get_ext_ipaddr() -> str:
         return ip
     except Exception as e:
         raise RuntimeError(f"Не удалось получить внешний IP: {e}")
-
 
 # ----------------- Шаблоны -----------------
 
@@ -196,10 +187,6 @@ PostUp = bash <SERVER_UP_SCRIPT>
 PostDown = bash <SERVER_DOWN_SCRIPT>
 """
 
-# Обновлённый шаблон клиентского конфига:
-# - Endpoint = <ENDPOINT>:<SERVER_PORT>
-#   <ENDPOINT> будет подставляться из _endpoint.config (host без порта)
-#   <SERVER_PORT> будет либо из _endpoint.config (если указан порт), либо из ListenPort сервера
 g_defclient_config = """
 [Interface]
 Address = <CLIENT_TUNNEL_IP>
@@ -245,7 +232,7 @@ PublicKey = <WARP_PEER_PUBLIC_KEY>
 AllowedIPs = 0.0.0.0/0, ::/0
 """
 
-# Полные шаблоны up/down с поддержкой WARP (сохранены целиком)
+# Шаблоны up/down с поддержкой WARP
 up_script_template_warp = '''#!/bin/bash
 #set -x
 
@@ -593,7 +580,6 @@ ip link delete "$IFB_OUT" 2>/dev/null || true
 echo "————————————————————————————————"
 '''
 
-
 # ----------------- Вспомогательный класс IPAddr -----------------
 
 class IPAddr:
@@ -627,7 +613,6 @@ class IPAddr:
         if self.mask:
             out += '/' + str(self.mask)
         return out
-
 
 # ----------------- WGConfig -----------------
 
@@ -776,7 +761,6 @@ class WGConfig:
         self.lines.insert(pos, new_line)
         client['_lines_range'] = (min_line, max_line + 1)
 
-
 # ----------------- Проверка endpoint'ов WARP и генерация -----------------
 
 CANDIDATE_WARP_ENDPOINTS = [
@@ -803,7 +787,6 @@ FALLBACK_DSYT_ALLOWEDIPS = (
     "216.239.38.0/23, 216.239.40.0/22"
 )
 
-
 def check_endpoint(host_port: str, timeout: float = 1.5) -> bool:
     """
     Эвристическая проверка доступности endpoint'а:
@@ -816,7 +799,6 @@ def check_endpoint(host_port: str, timeout: float = 1.5) -> bool:
         port = int(sport)
     except Exception:
         return False
-
     # Попытка TCP
     try:
         for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM):
@@ -834,8 +816,7 @@ def check_endpoint(host_port: str, timeout: float = 1.5) -> bool:
                     pass
     except Exception:
         pass
-
-    # UDP probe
+    # Попытка UDP
     try:
         for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_DGRAM):
             af, socktype, proto, canonname, sa = res
@@ -853,9 +834,7 @@ def check_endpoint(host_port: str, timeout: float = 1.5) -> bool:
                     pass
     except Exception:
         pass
-
     return False
-
 
 def _select_endpoint_from_api_result(result: dict) -> Optional[str]:
     """
@@ -887,7 +866,6 @@ def _select_endpoint_from_api_result(result: dict) -> Optional[str]:
     except Exception:
         pass
     return None
-
 
 def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]:
     """
@@ -955,7 +933,6 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
     jmin = random.randint(48, 64)
     jmax = random.randint(jmin + 8, 80)
     persistent_keepalive = random.randint(3, 30)
-
     out = g_warp_config
     out = out.replace("<WARP_PRIVATE_KEY>", priv_key)
     out = out.replace("<JC>", str(jc))
@@ -968,7 +945,6 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
     out = out.replace("<WARP_ENDPOINT>", chosen)
     filename = f"{tun_name}warp{index}.conf"
     return out, filename
-
 
 def generate_warp_configs(tun_name: str, num_warps: int, mtu: int) -> List[str]:
     """
@@ -1011,9 +987,7 @@ def generate_warp_configs(tun_name: str, num_warps: int, mtu: int) -> List[str]:
             return []
     return warp_configs
 
-
 # ----------------- fetch DsYt с fallback -----------------
-
 
 def fetch_allowed_dsyt() -> str:
     """
@@ -1059,9 +1033,7 @@ def fetch_allowed_dsyt() -> str:
         return FALLBACK_DSYT_ALLOWEDIPS
     return ", ".join(sorted(ip_set))
 
-
 # ----------------- Парсер _endpoint.config -----------------
-
 
 def _sanitize_label(lbl: str) -> str:
     """
@@ -1072,19 +1044,14 @@ def _sanitize_label(lbl: str) -> str:
     lbl2 = re.sub(r'[^A-Za-z0-9_\-]', '_', lbl)
     return lbl2
 
-
 def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]:
     """
     Парсит содержимое _endpoint.config и возвращает список словарей:
-    {
       "host": "<host_or_ip>",
       "port": "<port_as_string>",
       "label": "<label_or_empty>"
-    }
-
     Формат записей через запятую или построчно:
         host[:port][-label]
-
     Поддерживает IPv6 в формате: [addr]:port-label или [addr]-label или [addr]
     Примеры:
         1.2.3.4
@@ -1094,15 +1061,6 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
         [2001:db8::1]:4444-direct
         [2001:db8::1]-direct
         2001:db8::1:4444-direct   (небрэкетированный IPv6 с портом — теперь распознаётся)
-
-    Поведение:
-    - Если порт не указан, вернётся default_port (строка).
-    - Игнорирует пустые строки и комментарии (# ...).
-    - Для не-брэкетированных записей метка выделяется по последнему '-' (rpartition) только если правая часть
-      соответствует допустимой метке и левая часть явно похожа на hostname/ipv4/ipv6 (содержит '.' или ':') — это предотвращает
-      разбиение hostname-with-dash.com на host + label.
-    - Для не-брэкетированных записей порт определяется по последнему ':' (rsplit) только если правая часть — цифры.
-    - Проверка диапазона порта 1..65535.
     """
     out = []
     if not text:
@@ -1130,7 +1088,7 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
         label = ""
         hostport = p
 
-        # Handle bracketed IPv6: [addr]:port-label or [addr]-label or [addr]
+        # Обработка IPv6 в скобках: [addr]:port-label или [addr]-label или [addr]
         if hostport.startswith('['):
             try:
                 close = hostport.index(']')
@@ -1221,9 +1179,7 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
             out.append({"host": h, "port": default_port, "label": lbl})
     return out
 
-
 # ----------------- Обработчики (make/create/add/update/delete/confgen и пр.) -----------------
-
 
 def _ensure_endpoint_file_exists(default_addr: str) -> None:
     """
@@ -1239,7 +1195,6 @@ def _ensure_endpoint_file_exists(default_addr: str) -> None:
                 logger.debug("_endpoint.config не создан: отсутствует default_addr")
     except Exception as e:
         logger.warning("Не удалось создать _endpoint.config: %s", e)
-
 
 def handle_makecfg(opt) -> None:
     global g_main_config_fn, g_main_config_type
@@ -1336,7 +1291,6 @@ def handle_makecfg(opt) -> None:
     atomic_write_text(g_main_config_src, str(g_main_config_fn))
     sys.exit(0)
 
-
 def handle_create(opt) -> None:
     tmpcfg_path = SCRIPT_DIR.joinpath(opt.tmpcfg)
     if tmpcfg_path.exists():
@@ -1367,7 +1321,6 @@ def handle_create(opt) -> None:
     except Exception as e:
         logger.warning("Не удалось создать/обновить _endpoint.config: %s", e)
     sys.exit(0)
-
 
 def handle_add(opt) -> None:
     if g_main_config_fn is None:
@@ -1420,7 +1373,6 @@ def handle_add(opt) -> None:
     atomic_write_text(srv_path, srvcfg)
     logger.info('Пользователь "%s" создан. IP=%s PersistentKeepalive=%s', c_name, ipaddr, persistent_keepalive)
 
-
 def handle_update(opt) -> None:
     if g_main_config_fn is None:
         get_main_config_path(check=True, override=opt.server_cfg)
@@ -1440,7 +1392,6 @@ def handle_update(opt) -> None:
     cfg.save()
     logger.info('Ключи сброшены для "%s". IP=%s NewPK=%s', p_name, ipaddr, new_pk)
 
-
 def handle_delete(opt) -> None:
     if g_main_config_fn is None:
         get_main_config_path(check=True, override=opt.server_cfg)
@@ -1450,7 +1401,6 @@ def handle_delete(opt) -> None:
     ipaddr = cfg.del_client(p_name)
     cfg.save()
     logger.info('Удалён "%s". Освобождён IP=%s', p_name, ipaddr)
-
 
 def handle_confgen(opt) -> None:
     global clients_for_zip
@@ -1644,7 +1594,6 @@ def handle_confgen(opt) -> None:
         except Exception as e:
             logger.warning("Не удалось сохранить server config после добавления PresharedKey: %s", e)
 
-
 def generate_qr_codes() -> None:
     logger.info('Генерация QR-кодов...')
     if qrcode is None:
@@ -1690,7 +1639,6 @@ def generate_qr_codes() -> None:
         except Exception as e:
             logger.error('Ошибка генерации QR для %s: %s', fn, e)
 
-
 def zip_client_files(client_name: str) -> None:
     """
     Создаёт zip для конкретного client_name.
@@ -1710,14 +1658,12 @@ def zip_client_files(client_name: str) -> None:
             if pattern_conf.match(fname) or pattern_png.match(fname):
                 zipf.write(str(file), arcname=file.name)
 
-
 def zip_all() -> None:
     logger.info('Упаковка конфигов в ZIP...')
     # Deduplicate while preserving order
     names = list(dict.fromkeys(clients_for_zip))
     for name in names:
         zip_client_files(name)
-
 
 def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip: bool = False,
                         allowed_names: Optional[List[str]] = None) -> None:
@@ -1753,7 +1699,6 @@ def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip
             except Exception:
                 logger.debug('Не удалось удалить %s', f)
 
-
 # ----------------- CLI -----------------
 
 parser = argparse.ArgumentParser(description="AmneziaWG инструмент для конфигов")
@@ -1776,19 +1721,16 @@ parser.add_argument("--mtu", type=int, default=1388, help="MTU (1280-1420)")
 parser.add_argument("--warp", type=int, default=0, help="Количество WARP конфигов для генерации")
 opt = parser.parse_args()
 
-
 def get_only_list() -> List[str]:
     if not opt.only:
         return []
     return [x.strip() for x in opt.only.split(",") if x.strip()]
-
 
 # проверка одновременных действий
 xopt = [opt.addcl, opt.update, opt.delete]
 copt = [x for x in xopt if len(x) > 0]
 if copt and len(copt) >= 2:
     raise RuntimeError('Слишком много действий одновременно')
-
 
 def resolve_server_config_candidate(name: Optional[str]) -> Optional[str]:
     if not name:
@@ -1817,7 +1759,6 @@ def resolve_server_config_candidate(name: Optional[str]) -> Optional[str]:
     if p4.exists():
         return str(p4.resolve())
     return None
-
 
 def get_main_config_path(check: bool = True, override: Optional[str] = None) -> Optional[str]:
     global g_main_config_fn, g_main_config_type
@@ -1852,7 +1793,6 @@ def get_main_config_path(check: bool = True, override: Optional[str] = None) -> 
     if check and not cfg_exists:
         raise RuntimeError(f'Основной {g_main_config_type} конфиг "{g_main_config_fn}" не найден')
     return str(g_main_config_fn)
-
 
 def main() -> None:
     if not (1280 <= opt.mtu <= 1420):
@@ -1896,7 +1836,6 @@ def main() -> None:
         allowed_names=allowed_names
     )
     logger.info('Готово')
-
 
 if __name__ == "__main__":
     try:
