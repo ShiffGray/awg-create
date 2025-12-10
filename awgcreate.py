@@ -261,7 +261,12 @@ EXCLUDE_SUBNETS=(
 )
 # --- Пробросы портов ---
 PORT_FORWARDING_RULES=(
-  # Формат: "ЛокальныйIP:ВнешнийПорт[-Диапазон][>ВнутреннийПорт[-Диапазон]]:TCP/UDP:Список_разрешённых_подсетей[:SNAT]"
+  #"ЛокальныйIP:ВнешнийПорт[-Диапазон][>ВнутреннийПорт[-Диапазон]]:TCP/UDP[:Список_разрешённых_подсетей][:SNAT]"
+  #"10.1.0.1:80:TCP"
+  #"10.1.0.2:443:TCP:SNAT"
+  #"10.1.0.3:8080:UDP:192.168.0.1:SNAT"
+  #"10.1.0.4:3000>3389:TCP:SNAT"
+  #"10.1.0.5:2000-2100>4000-4100:UDP"
 )
 
 # "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
@@ -319,12 +324,12 @@ for i in "${!WARP_LIST[@]}"; do
 done
 
 # --- iptables для балансировки WARP (случайное распределение новых соединений) ---
-iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -N "$RANDOM_WARP_CHAIN"
-iptables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN"
+iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -N "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+iptables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
 # --- Исключение подсетей из маркировки (будут идти напрямую через основной интерфейс) ---
 for subnet in "${EXCLUDE_SUBNETS[@]}"; do
-  iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d $subnet -j RETURN
+  iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d $subnet -j RETURN 2>/dev/null || true
 done
 
 CNT=${#WARP_LIST[@]}
@@ -337,95 +342,170 @@ iptables -t mangle -A "$RANDOM_WARP_CHAIN" -j CONNMARK --restore-mark
 # --- Настройка FORWARD и NAT для трафика через WARP ---
 for warp in "${WARP_LIST[@]}"; do
   iptables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-  iptables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/[...]
+  iptables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   iptables -t nat -C POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
 done
 
 # --- Настройка FORWARD и NAT для трафика напрямую через внешний интерфейс (EXCLUDE_SUBNETS) ---
-iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT
+iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
 iptables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
-iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/[...]
+iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
 
 # --- Hairpin NAT ---
-iptables -t nat -C POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE
+iptables -t nat -C POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$LOCAL_SUBNETS" -d "$LOCAL_SUBNETS" -j MASQUERADE 2>/dev/null || true
 
 # --- Проброс портов через отдельные цепочки (DNAT + SNAT + ACCEPT) ---
 echo "Проброс портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_FILTER, $PF_CHAIN_SNAT)"
 iptables -t nat -N "$PF_CHAIN_NAT" 2>/dev/null || true
 iptables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
 iptables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
-iptables -t nat -C PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || iptables -t nat -A PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT"
-iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER"
-iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT"
+iptables -t nat -C PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || iptables -t nat -A PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || true
+iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 
 # --- Добавление правил для каждого проброса ---
 for rule in "${PORT_FORWARDING_RULES[@]}"; do
-  IFS=":" read -r CLIENT_IP PF_PORT_PROTO PF_PROTO ALLOWED_SUBNETS SNAT_FLAG <<< "$rule"
+  # Разбор правила: используем split по ":" но допускаем опциональность полей.
+  # Ожидаемые позиции:
+  #   parts[0] = CLIENT_IP
+  #   parts[1] = PF_PORT_PROTO (например 1000-1005>2000-2005 или 8080)
+  #   parts[2] = PROTO (TCP/UDP)
+  #   parts[3] = OPTIONAL: Allowed_subnets (CSV) OR SNAT
+  #   parts[4] = OPTIONAL: SNAT (если parts[3] содержит allowed_subnets)
+  IFS=':' read -r -a parts <<< "$rule"
+
+  CLIENT_IP="${parts[0]}"
+  PF_PORT_PROTO="${parts[1]:-}"
+  PF_PROTO="${parts[2]:-}"
+  ALLOWED_SUBNETS=""
+  SNAT_FLAG=""
+
+  if [ "${#parts[@]}" -ge 4 ]; then
+    maybe="${parts[3]}"
+    if [ -n "$maybe" ]; then
+      # Если field содержит "SNAT" (в любом регистре) — это SNAT флаг
+      if [ "${maybe^^}" = "SNAT" ]; then
+        SNAT_FLAG="$maybe"
+      else
+        ALLOWED_SUBNETS="$maybe"
+      fi
+    fi
+  fi
+  if [ "${#parts[@]}" -ge 5 ]; then
+    maybe2="${parts[4]}"
+    if [ -n "$maybe2" ] && [ -z "$SNAT_FLAG" ]; then
+      SNAT_FLAG="$maybe2"
+    fi
+  fi
+
+  # Подготовка массива подсетей; если пусто — будем работать без фильтра -s/-d
+  if [ -z "$ALLOWED_SUBNETS" ]; then
+    USE_SUBNETS=0
+    ALLOWED_SUBNETS_DISPLAY="ALL"
+  else
+    USE_SUBNETS=1
+    IFS=',' read -ra SUBNETS_ARRAY <<< "$ALLOWED_SUBNETS"
+    ALLOWED_SUBNETS_DISPLAY="$ALLOWED_SUBNETS"
+  fi
+
+  # Разбор внешнего/внутреннего портов с опцией диапазонов
   IFS='>' read -r PF_PORT_EXT PF_PORT_INT <<< "$PF_PORT_PROTO"
   [ -z "$PF_PORT_INT" ] && PF_PORT_INT="$PF_PORT_EXT"
-  IFS=',' read -ra SUBNETS_ARRAY <<< "$ALLOWED_SUBNETS"
 
-  SNAT_EN=0
-  if [ -n "$SNAT_FLAG" ] && [ "${SNAT_FLAG^^}" = "SNAT" ]; then
-    SNAT_EN=1
-  fi
+  # Поддержка диапазонов портов: ext и int могут быть single или start-end
   if [[ "$PF_PORT_EXT" == *"-"* ]] && [[ "$PF_PORT_INT" == *"-"* ]]; then
     PF_PORT_EXT_START="${PF_PORT_EXT%-*}"
     PF_PORT_EXT_END="${PF_PORT_EXT#*-}"
     PF_PORT_INT_START="${PF_PORT_INT%-*}"
     PF_PORT_INT_END="${PF_PORT_INT#*-}"
     RANGE_LEN=$((PF_PORT_EXT_END - PF_PORT_EXT_START))
-    [ $RANGE_LEN -ne $((PF_PORT_INT_END - PF_PORT_INT_START)) ] && { echo "Ошибка: диапазоны портов должны быть одинаковой длины"; continue; }
+    if [ $RANGE_LEN -ne $((PF_PORT_INT_END - PF_PORT_INT_START)) ]; then
+      echo "Ошибка: диапазоны портов должны быть одинаковой длины для правила '$rule'"
+      continue
+    fi
     for ((i=0; i<=RANGE_LEN; i++)); do
       EXT_PORT=$((PF_PORT_EXT_START + i))
       INT_PORT=$((PF_PORT_INT_START + i))
-      for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
-        iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$INT_PORT"
-        if [ "$SNAT_EN" -eq 1 ]; then
+      if [ $USE_SUBNETS -eq 1 ]; then
+        for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
+          iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$INT_PORT"
+          if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+            iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$LOCAL_SERVER_IP"
+          fi
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+        done
+      else
+        # доступ всем — без -s / -d
+        iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP:$INT_PORT"
+        if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
           iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$LOCAL_SERVER_IP"
         fi
-        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
-        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
-      done
-      if [ "$SNAT_EN" -eq 1 ]; then
-        echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (SNAT)"
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -j ACCEPT
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -m state --state RELATED,ESTABLISHED -j ACCEPT
+      fi
+
+      if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+        echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
       else
-        echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (no SNAT)"
+        echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
       fi
     done
   else
+    # Если внешний порт — диапазон, но внутрен нет (или наоборот) — корректируем по логике ниже:
     if [[ "$PF_PORT_EXT" == *"-"* ]]; then
       PF_PORT_START="${PF_PORT_EXT%-*}"
       PF_PORT_END="${PF_PORT_EXT#*-}"
-      for ((PORT=PF_PORT_START; PORT<=PF_PORT_END; PORT++)); do
-        for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
-          iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$PORT"
-          if [ "$SNAT_EN" -eq 1 ]; then
-            iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT" -j SNAT --to-source "$LOCAL_SERVER_IP"
-          fi
-          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
-          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
-        done
-        if [ "$SNAT_EN" -eq 1 ]; then
-          echo "$PF_PROTO порт $PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (SNAT)"
+      for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
+        if [ $USE_SUBNETS -eq 1 ]; then
+          for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
+            iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$PORT_NUM"
+            if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+              iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$LOCAL_SERVER_IP"
+            fi
+            iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j ACCEPT
+            iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+          done
         else
-          echo "$PF_PROTO порт $PORT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (no SNAT)"
+          iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP:$PORT_NUM"
+          if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+            iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$LOCAL_SERVER_IP"
+          fi
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -j ACCEPT
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -m state --state RELATED,ESTABLISHED -j ACCEPT
+        fi
+
+        if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+          echo "$PF_PROTO порт $PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
+        else
+          echo "$PF_PROTO порт $PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
         fi
       done
     else
-      for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
-        iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$PF_PORT_INT"
-        if [ "$SNAT_EN" -eq 1 ]; then
+      # Обычный single-port case
+      if [ $USE_SUBNETS -eq 1 ]; then
+        for ALLOWED_SUBNET in "${SUBNETS_ARRAY[@]}"; do
+          iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP:$PF_PORT_INT"
+          if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+            iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$LOCAL_SERVER_IP"
+          fi
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -s "$ALLOWED_SUBNET" -j ACCEPT
+          iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+        done
+      else
+        iptables -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP:$PF_PORT_INT"
+        if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
           iptables -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$LOCAL_SERVER_IP"
         fi
-        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -s "$ALLOWED_SUBNET" -j ACCEPT
-        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
-      done
-      if [ "$SNAT_EN" -eq 1 ]; then
-        echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (SNAT)"
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -j ACCEPT
+        iptables -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -m state --state RELATED,ESTABLISHED -j ACCEPT
+      fi
+
+      if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+        echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
       else
-        echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${SUBNETS_ARRAY[*]} (no SNAT)"
+        echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
       fi
     fi
   fi
@@ -461,12 +541,16 @@ echo "Установка лимитов скорости для подсетей
 for entry in "${SUBNETS_LIMITS[@]}"; do
     SUBNET="${entry%%:*}"
     LIM="${entry##*:}"
-    IPS=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$SUBNET', strict=False)
-for ip in net:
-    print(ip)
-")
+    IPS=$(python3 - <<PY
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network('${SUBNET}', strict=False)
+    for ip in net:
+        print(ip)
+except Exception as e:
+    sys.exit(1)
+PY
+)
     for ip in $IPS; do
         if [ "$minor_id" -gt 9999 ]; then
             major_class=$((major_class + 1))
