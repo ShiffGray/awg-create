@@ -197,7 +197,6 @@ PostDown = bash <SERVER_DOWN_SCRIPT>
 g_defclient_config = """
 [Interface]
 Address = <CLIENT_TUNNEL_IP>
-ListenPort = <SERVER_PORT>
 DNS = 1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001
 Jc = <JC>
 Jmin = <JMIN>
