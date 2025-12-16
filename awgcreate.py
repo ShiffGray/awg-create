@@ -1023,7 +1023,7 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
     jc = random.randint(80, 120)
     jmin = random.randint(48, 64)
     jmax = random.randint(jmin + 8, 80)
-    persistent_keepalive = random.randint(3, 30)
+    persistent_keepalive = random.randint(1, 9)
     out = g_warp_config
     out = out.replace("<WARP_PRIVATE_KEY>", priv_key)
     out = out.replace("<JC>", str(jc))
@@ -1479,7 +1479,7 @@ def handle_add(opt) -> None:
         ipaddr = f"{str(ipaddress.IPv4Address(chosen))}/32"
     priv_key, pub_key = gen_pair_keys()
     psk = gen_preshared_key()
-    persistent_keepalive = random.randint(3, 30)
+    persistent_keepalive = random.randint(1, 9)
     srv_path = pathlib.Path(g_main_config_fn)
     srvcfg = srv_path.read_text(encoding='utf-8')
     srvcfg += f'\n'
@@ -1643,7 +1643,7 @@ def handle_confgen(opt) -> None:
         jc = random.randint(80, 120)
         jmin = random.randint(48, 64)
         jmax = random.randint(jmin + 8, 80)
-        persistent_keepalive = random.randint(3, 30)
+        persistent_keepalive = random.randint(1, 9)
         mtu = srv.get('MTU', str(opt.mtu))
 
         # Для каждого endpoint генерируем свой набор файлов
