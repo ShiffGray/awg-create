@@ -1527,7 +1527,7 @@ def handle_update(opt) -> None:
     cfg.set_param(p_name, 'PresharedKey', psk)
     gentime = datetime.datetime.now().isoformat()
     cfg.set_param(p_name, '_GenKeyTime', gentime, force=True, offset=2)
-    new_pk = random.randint(3, 30)
+    new_pk = random.randint(1, 9)
     cfg.set_param(p_name, 'PersistentKeepalive', str(new_pk), force=True, offset=3)
     ipaddr = cfg.peer[p_name]['AllowedIPs']
     cfg.save()
