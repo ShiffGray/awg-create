@@ -1,5 +1,5 @@
 # AWGcreate
-## Установка AmneziaWG и скрипта awgcreate
+### Установка AmneziaWG и скрипта awgcreate
 - Всё создавалось и тестировалось под ОС Ubuntu 20, 22, 24 и Debian11, 12, 13. Не знаю что насчет других ОС.
 - Чтобы скачать AmneziaWG и скрипт, используйте эту команду:
 ```sh
@@ -8,7 +8,7 @@ curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main
 
 ---
 
-## Краткий обзор
+### Краткий обзор
 
 awgcreate помогает:
 - Создать серверный конфиг AmneziaWG и PostUp/PostDown скрипты;
@@ -21,7 +21,7 @@ awgcreate помогает:
 
 ---
 
-## Требования
+### Требования
 
 - Python 3.8+.
 - На Linux (для генерации ключей и сетевых операций):
