@@ -3387,7 +3387,7 @@ def handle_makecfg(opt) -> None:
             error_msg = str(e)
 
             # Проверяем тип ошибки
-            if "Ошибка WARP API" in error_msg:
+            if "Ошибка WARP API" in error_msg or "WARP конфиги не сгенерированы" in error_msg:
                 # Проблема с доступом к API
                 logger.error("❌ Не удалось сгенерировать WARP: проблема с доступом к Cloudflare API")
                 if not opt.proxy:
