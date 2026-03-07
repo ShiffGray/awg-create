@@ -16,6 +16,7 @@ import datetime
 import glob
 import ipaddress
 import logging
+import math
 import os
 import pathlib
 import random
@@ -268,13 +269,13 @@ print(str(net.broadcast_address))
     exit 1
   }
 
-  # Проверяем, занимает ли сервер первый IP
-  if [ "$LOCAL_SERVER_IP" = "$FIRST_IP" ]; then
-    SERVER_OCCUPIES_FIRST=1
-    echo "📍 IPv4: Сервер на первом usable IP ($LOCAL_SERVER_IP)"
+  # Проверяем, занимает ли сервер NETWORK адрес
+  if [ "$LOCAL_SERVER_IP" = "$(python3 -c "import ipaddress; print(ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False).network_address)")" ]; then
+    SERVER_ON_NETWORK=1
+    echo "📍 IPv4: Сервер на network адресе ($LOCAL_SERVER_IP) — broadcast НЕ работает"
   else
-    SERVER_OCCUPIES_FIRST=0
-    echo "📍 IPv4: Сервер на network адресе ($LOCAL_SERVER_IP)"
+    SERVER_ON_NETWORK=0
+    echo "📍 IPv4: Сервер НЕ на network адресе ($LOCAL_SERVER_IP) — broadcast работает"
   fi
 fi
 
@@ -311,7 +312,7 @@ print(str(net.network_address + net.num_addresses - 2))
     SERVER_OCCUPIES_FIRST_IPV6=1
     echo "📍 IPv6: Сервер на первом usable IP ($LOCAL_SERVER_IP_IPV6)"
   else
-    # Сервер на network → все доступны
+    # Сервер на network/другом адресе → все доступны
     LAST_IP_IPV6=$(python3 -c "
 import ipaddress
 net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
@@ -321,7 +322,16 @@ print(str(net.network_address + net.num_addresses - 1))
       exit 1
     }
     SERVER_OCCUPIES_FIRST_IPV6=0
-    echo "📍 IPv6: Сервер на network адресе ($LOCAL_SERVER_IP_IPV6)"
+    echo "📍 IPv6: Сервер на network/другом адресе ($LOCAL_SERVER_IP_IPV6)"
+  fi
+  
+  # Проверяем, занимает ли сервер NETWORK адрес для IPv6
+  if [ "$LOCAL_SERVER_IP_IPV6" = "$(python3 -c "import ipaddress; print(ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False).network_address)")" ]; then
+    SERVER_ON_NETWORK_IPV6=1
+    echo "📍 IPv6: Сервер на network адресе ($LOCAL_SERVER_IP_IPV6) — multicast НЕ работает"
+  else
+    SERVER_ON_NETWORK_IPV6=0
+    echo "📍 IPv6: Сервер НЕ на network адресе ($LOCAL_SERVER_IP_IPV6) — multicast работает"
   fi
 fi
 
@@ -525,28 +535,48 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   # Создаём цепочку в ОБЕИХ таблицах (iptables и ip6tables)
   iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -N "$RANDOM_WARP_CHAIN" 2>/dev/null || true
   ip6tables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || ip6tables -t mangle -N "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-  iptables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-  ip6tables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || ip6tables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+  
+  # Добавляем правила PREROUTING для ВСЕХ интерфейсов (чтобы WARP работал для клиентов всех туннелей!)
+  iptables -t mangle -C PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+  ip6tables -t mangle -C PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || ip6tables -t mangle -A PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
   # --- Исключение подсетей из маркировки (идут напрямую через IFACE, мимо WARP) ---
-  # Формат: "none=subnet1, subnet2" в WARP_LIST (поддержка пробелов вокруг =)
-  # Поддержка списков через запятую: "none=10.0.0.0/24, 192.168.0.0/16"
-  # Используем get_ipt_cmd для поддержки IPv4/IPv6
+  # Собираем все IP/подсети для исключения из WARP:
+  # 1. none= из WARP_LIST (ручные исключения)
+  # 2. LAN_ALLOW (автоматически для локальной сети)
+  ALL_WARP_EXCLUSIONS=()
+  
+  # Добавляем none= из WARP_LIST
   for entry in "${WARP_LIST[@]}"; do
-    # Проверяем, начинается ли с "none" и содержит "=" (с поддержкой пробелов)
     if [[ "$entry" =~ ^none[[:space:]]*= ]]; then
-      # Извлекаем часть после "none=" (с поддержкой пробелов вокруг =)
       subnets_part="${entry#*=}"
       IFS=',' read -ra RAW_SUBNETS <<< "$subnets_part"
       for subnet in "${RAW_SUBNETS[@]}"; do
         subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        if [ -n "$subnet" ]; then
-          IPT_CMD="$(get_ipt_cmd "$subnet")"
-          $IPT_CMD -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
-        fi
+        [ -n "$subnet" ] && ALL_WARP_EXCLUSIONS+=("$subnet")
       done
     fi
   done
+  
+  # Добавляем LAN_ALLOW (автоматически)
+  if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
+    for rule in "${LAN_ALLOW[@]}"; do
+      IFS=',' read -ra PARTS <<< "$rule"
+      for part in "${PARTS[@]}"; do
+        part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -n "$part" ] && ALL_WARP_EXCLUSIONS+=("$part")
+      done
+    done
+  fi
+  
+  # Применяем все исключения
+  if [ ${#ALL_WARP_EXCLUSIONS[@]} -gt 0 ]; then
+    echo "🔒 Исключение ${#ALL_WARP_EXCLUSIONS[@]} IP/подсетей из WARP (локальная сеть + none=)"
+    for subnet in "${ALL_WARP_EXCLUSIONS[@]}"; do
+      IPT_CMD="$(get_ipt_cmd "$subnet")"
+      $IPT_CMD -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+    done
+  fi
 
   # --- Сначала собираем все интерфейсы БЕЗ подсетей в одну группу для балансировки всего остального трафика ---
   DEFAULT_WARP_GROUP=()
@@ -748,15 +778,17 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   # --- Настройка FORWARD и NAT для трафика через WARP ---
   # IPv4 правила
   for warp in "${!ALL_WARP_INTERFACES[@]}"; do
-    iptables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-    iptables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    # Разрешаем FORWARD для ВСЕХ туннелей на WARP (не только текущего!)
+    iptables -C FORWARD -o "$warp" -j ACCEPT 2>/dev/null || iptables -A FORWARD -o "$warp" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -i "$warp" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$warp" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     iptables -t nat -C POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
   done
-  
+
   # IPv6 правила (с NAT, так как WARP поддерживает IPv6)
   for warp in "${!ALL_WARP_INTERFACES[@]}"; do
-    ip6tables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-    ip6tables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    # Разрешаем FORWARD для ВСЕХ туннелей на WARP (не только текущего!)
+    ip6tables -C FORWARD -o "$warp" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -o "$warp" -j ACCEPT 2>/dev/null || true
+    ip6tables -C FORWARD -i "$warp" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$warp" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     ip6tables -t nat -C POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
   done
 fi
@@ -807,6 +839,28 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -t nat -C POSTROUTING -j "$HAIRPIN_CHAIN" 2>/dev/null || ip6tables -t nat -A POSTROUTING -j "$HAIRPIN_CHAIN" 2>/dev/null || true
 fi
 
+# --- Проброс портов через отдельные цепочки (DNAT + SNAT + ACCEPT) ---
+# ВАЖНО: Должно быть ДО LAN_ALLOW + DROP чтобы проброс портов работал для всех клиентов!
+echo "🔌 Проброс портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_FILTER, $PF_CHAIN_SNAT)"
+# Создаём цепочки в ОБЕИХ таблицах (iptables и ip6tables)
+iptables -t nat -N "$PF_CHAIN_NAT" 2>/dev/null || true
+iptables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
+iptables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
+ip6tables -t nat -N "$PF_CHAIN_NAT" 2>/dev/null || true
+ip6tables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
+ip6tables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
+
+# Добавляем правила PREROUTING для ВСЕХ интерфейсов (универсально, без привязки к туннелям!)
+# Это позволяет клиентам любых VPN (и не-VPN) подключаться к проброшенным портам
+iptables -t nat -C PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || iptables -t nat -A PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
+ip6tables -t nat -C PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || ip6tables -t nat -A PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
+
+# FORWARD и POSTROUTING для текущего туннеля
+iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
+ip6tables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || ip6tables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+ip6tables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || ip6tables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
+
 # --- Локальная сеть между клиентами ---
 # Расширенная сегментация: каждый элемент массива — это группа IP/подсетей которые могут общаться ДРУГ С ДРУГОМ
 # Формат: "IP1, IP2, IP3, ..." — все участники могут общаться со всеми остальными в этой группе
@@ -815,6 +869,41 @@ fi
 # СНАЧАЛА запрещаем ВСЁ межклиентское общение (DROP в КОНЕЦ цепи)
 iptables -A FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 ip6tables -A FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
+
+# --- Функция: найти туннель для IP/подсети ---
+# Возвращает имя туннеля (например, "awg0") или пустую строку если не найден
+find_tun_for_ip() {
+  local ip_or_subnet="$1"
+  
+  # Перебираем ВСЕ запущенные интерфейсы (не только awg*)
+  for test_tun in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1); do
+    
+    # Получаем все адреса этого интерфейса
+    local addrs=$(ip -o addr show "$test_tun" 2>/dev/null | awk '{print $4}')
+    
+    # Проверяем каждый адрес
+    for addr in $addrs; do
+      if python3 -c "
+import ipaddress
+try:
+    ip = ipaddress.ip_network('$ip_or_subnet', strict=False)
+    tun_net = ipaddress.ip_network('$addr', strict=False)
+    if ip.subnet_of(tun_net) or tun_net.subnet_of(ip) or ip.overlaps(tun_net):
+        exit(0)
+    exit(1)
+except:
+    exit(1)
+" 2>/dev/null; then
+        echo "$test_tun"
+        return 0
+      fi
+    done
+  done
+  
+  # Не нашли туннель для этого IP
+  echo ""
+  return 1
+}
 
 if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
   echo "🏠 Локальная сеть: РАЗРЕШЕНА для ${#LAN_ALLOW[@]} групп сегментации"
@@ -858,15 +947,28 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
           SRC="${PARTS_CLEAN[$i]}"
           DST="${PARTS_CLEAN[$j]}"
 
-          # Определяем тип источника
-          if [[ "$SRC" == *:* ]]; then
-            IPT_CMD="ip6tables"
-          else
-            IPT_CMD="iptables"
+          # Автоматически определяем туннель для источника
+          SRC_TUN=$(find_tun_for_ip "$SRC")
+          
+          # Если не нашли туннель для SRC — пропускаем эту пару
+          if [ -z "$SRC_TUN" ]; then
+            echo "    ⚠️  Пропущено: $SRC (туннель не найден)"
+            continue
+          fi
+          
+          # Автоматически определяем туннель для получателя
+          DST_TUN=$(find_tun_for_ip "$DST")
+          
+          # Если не нашли туннель для DST — пропускаем эту пару
+          if [ -z "$DST_TUN" ]; then
+            echo "    ⚠️  Пропущено: $DST (туннель не найден)"
+            continue
           fi
 
           # Разрешаем SRC → DST (в НАЧАЛО цепи, поверх DROP!)
-          $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC" -d "$DST" -j ACCEPT 2>/dev/null || true
+          # Используем найденные туннели (поддержка межтуннельного трафика!)
+          echo "    $SRC ($SRC_TUN) → $DST ($DST_TUN)"
+          $IPT_CMD -I FORWARD -i "$SRC_TUN" -o "$DST_TUN" -s "$SRC" -d "$DST" -j ACCEPT 2>/dev/null || true
         done
       done
     fi
@@ -879,7 +981,36 @@ fi
 # Сохраняем LAN_ALLOW в файл для последующей очистки в down.sh
 # Файл хранится в .state/ вместе с другими временными файлами туннеля
 LAN_ALLOW_FILE="$STATE_BASE_DIR/.lan_allow_${TUN}.conf"
-printf '%s\n' "${LAN_ALLOW[@]}" > "$LAN_ALLOW_FILE" 2>/dev/null || true
+
+# Собираем карту интерфейсов и подсетей для всех IP в LAN_ALLOW
+# Это нужно чтобы down.sh мог очистить правила даже если интерфейс больше не существует
+INTERFACE_MAP=()
+for rule in "${LAN_ALLOW[@]}"; do
+  IFS=',' read -ra PARTS <<< "$rule"
+  for part in "${PARTS[@]}"; do
+    part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$part" ] && continue
+    
+    # Находим туннель для этого IP/подсети
+    tun_name=$(find_tun_for_ip "$part")
+    if [ -n "$tun_name" ]; then
+      # Получаем подсеть этого туннеля
+      tun_subnet=$(ip -o addr show "$tun_name" 2>/dev/null | awk '{print $4}' | head -1)
+      if [ -n "$tun_subnet" ]; then
+        INTERFACE_MAP+=("$tun_name=$tun_subnet")
+      fi
+    fi
+  done
+done
+
+# Удаляем дубликаты из INTERFACE_MAP
+INTERFACE_MAP_UNIQUE=($(printf '%s\n' "${INTERFACE_MAP[@]}" | sort -u))
+
+# Записываем в файл: сначала карта интерфейсов, потом правила LAN_ALLOW
+{
+  echo "# INTERFACE_MAP: ${INTERFACE_MAP_UNIQUE[*]}"
+  printf '%s\n' "${LAN_ALLOW[@]}"
+} > "$LAN_ALLOW_FILE" 2>/dev/null || true
 
 # --- Broadcast/Multicast трафик (для игр и service discovery) ---
 # Работает ТОЛЬКО если сервер НЕ занимает ПЕРВЫЙ IP в подсети
@@ -889,7 +1020,7 @@ printf '%s\n' "${LAN_ALLOW[@]}" > "$LAN_ALLOW_FILE" 2>/dev/null || true
 # Диапазон: MARK_BASE+1000 до MARK_BASE+1099 (не пересекается с WARP mark)
 
 # IPv4 Broadcast
-if [ -n "$LOCAL_SUBNETS_IPV4" ] && [ -n "$BROADCAST_ADDR" ] && [ "$SERVER_OCCUPIES_FIRST" -eq 0 ]; then
+if [ -n "$LOCAL_SUBNETS_IPV4" ] && [ -n "$BROADCAST_ADDR" ] && [ "$SERVER_ON_NETWORK" -eq 0 ]; then
     # Для каждой группы в LAN_ALLOW создаём уникальные mark
     # Используем MARK_BASE чтобы mark были уникальны для каждого туннеля
     MARK=$((MARK_BASE + 1000))
@@ -929,8 +1060,8 @@ fi
 # ff02::1 - all nodes multicast (аналог 255.255.255.255)
 # Используем mark для полной изоляции — multicast доходит только до участников группы
 # Используем ТЕ ЖЕ mark что и для IPv4 (на основе MARK_BASE), так как это разные таблицы (ip6tables)
-# ВАЖНО: Multicast работает ТОЛЬКО если сервер на первом usable IP (как и broadcast)
-if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_OCCUPIES_FIRST_IPV6" -eq 1 ]; then
+# ВАЖНО: Multicast работает ТОЛЬКО если сервер НЕ на network адресе (как и broadcast)
+if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
     # Для каждой группы в LAN_ALLOW создаём уникальные mark (те же что и для IPv4)
     # Используем MARK_BASE чтобы mark были уникальны для каждого туннеля
     MARK=$((MARK_BASE + 1000))
@@ -964,22 +1095,6 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_OCCUPIES_FIRST_IPV6" -eq 1 ]; then
 
     # DROP не нужен — если mark не разрешён через ACCEPT, он блокируется автоматически
 fi
-
-# --- Проброс портов через отдельные цепочки (DNAT + SNAT + ACCEPT) ---
-echo "🔌 Проброс портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_FILTER, $PF_CHAIN_SNAT)"
-# Создаём цепочки в ОБЕИХ таблицах (iptables и ip6tables)
-iptables -t nat -N "$PF_CHAIN_NAT" 2>/dev/null || true
-iptables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
-iptables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
-ip6tables -t nat -N "$PF_CHAIN_NAT" 2>/dev/null || true
-ip6tables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
-ip6tables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
-iptables -t nat -C PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || iptables -t nat -A PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || true
-iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
-iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
-ip6tables -t nat -C PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || ip6tables -t nat -A PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || true
-ip6tables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || ip6tables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
-ip6tables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || ip6tables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 
 # --- Добавление правил для каждого проброса ---
 for rule in "${PORT_FORWARDING_RULES[@]}"; do
@@ -1284,6 +1399,59 @@ done
 # Формат: "subnet1, subnet2:limit" или "subnet:limit" (поддержка IPv4+IPv6)
 if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   echo "⚡ Настройка лимитов скорости"
+  
+  # --- Проверка диапазона масок подсетей (IPv4: /8-/32, IPv6: /104-/128) ---
+  VALID_SUBNETS_LIMITS=()
+  for entry in "${SUBNETS_LIMITS[@]}"; do
+    # Извлекаем подсети (всё до последнего :)
+    subnets_part=$(echo "$entry" | rev | cut -d':' -f2- | rev)
+    limit_part=$(echo "$entry" | rev | cut -d':' -f1 | rev)
+    
+    entry_valid=1
+    IFS=',' read -ra RAW_SUBNETS <<< "$subnets_part"
+    for subnet in "${RAW_SUBNETS[@]}"; do
+      subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -z "$subnet" ] && continue
+      
+      # Проверяем маску через Python
+      if ! python3 -c "
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network('$subnet', strict=False)
+    if isinstance(net, ipaddress.IPv4Network):
+        if net.prefixlen < 8 or net.prefixlen > 32:
+            print(f'IPv4 подсеть /{net.prefixlen} вне диапазона /8-/32', file=sys.stderr)
+            sys.exit(1)
+    else:
+        if net.prefixlen < 104 or net.prefixlen > 128:
+            print(f'IPv6 подсеть /{net.prefixlen} вне диапазона /104-/128', file=sys.stderr)
+            sys.exit(1)
+    sys.exit(0)
+except Exception as e:
+    print(f'Ошибка: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1; then
+        echo "⚠️  Пропущено: '$subnet' (недопустимая подсеть)"
+        entry_valid=0
+        break
+      fi
+    done
+    
+    # Если все подсети в правиле валидны — добавляем в список
+    if [ "$entry_valid" -eq 1 ]; then
+      VALID_SUBNETS_LIMITS+=("$entry")
+    fi
+  done
+  
+  # Если все правила отфильтрованы — выходим
+  if [ ${#VALID_SUBNETS_LIMITS[@]} -eq 0 ]; then
+    echo "ℹ️  Лимиты скорости отключены (нет валидных правил)"
+    return
+  fi
+  
+  # Используем валидные правила вместо исходных
+  SUBNETS_LIMITS=("${VALID_SUBNETS_LIMITS[@]}")
+  
   if ! modprobe ifb; then
     echo "Ошибка: не удалось загрузить модуль ifb"
     exit 1
@@ -1401,37 +1569,21 @@ PY
           done
           echo "$SUBNET -> ${LIM}mbit"
       else
-          # Несколько подсетей — проверяем одинаковый размер и генерируем общие лимиты
-          # Сначала получаем количество адресов в каждой подсети
-          SUBNET_SIZES=()
+          # Несколько подсетей — поддерживаем кратные соотношения
+          # Сначала получаем количество адресов и префиксы каждой подсети
+          SUBNET_INFO=()
           for subnet in "${SUBNET_ARRAY[@]}"; do
-              SIZE=$(python3 -c "
+              INFO=$(python3 -c "
 import ipaddress
 try:
     net = ipaddress.ip_network('${subnet}', strict=False)
-    print(net.num_addresses)
+    print(f'{net.num_addresses}:{net.prefixlen}')
 except:
-    print(0)
+    print('0:0')
 ")
-              SUBNET_SIZES+=("$SIZE")
+              SUBNET_INFO+=("$INFO")
           done
-          
-          # Проверяем, что все подсети одинакового размера
-          FIRST_SIZE="${SUBNET_SIZES[0]}"
-          ALL_EQUAL=1
-          for size in "${SUBNET_SIZES[@]}"; do
-              if [ "$size" != "$FIRST_SIZE" ]; then
-                  ALL_EQUAL=0
-                  break
-              fi
-          done
-          
-          if [ "$ALL_EQUAL" -eq 0 ]; then
-              echo "Ошибка: подсети должны иметь одинаковый размер: $SUBNETS_PART"
-              echo "Размеры: ${SUBNET_SIZES[*]}"
-              continue
-          fi
-          
+
           # Определяем типы подсетей (IPv4 или IPv6)
           SUBNET_TYPES=()
           for subnet in "${SUBNET_ARRAY[@]}"; do
@@ -1441,6 +1593,66 @@ except:
                   SUBNET_TYPES+=("ipv4")
               fi
           done
+
+          # Вычисляем соотношение подсетей через Python
+          # Возвращает: ipv4_count, ipv6_count, ipv4_client_mask, ipv6_client_mask, ratio_step
+          SHAPING_INFO=$(python3 - <<PY
+import ipaddress, math
+
+subnets = '${SUBNETS_PART}'.split(',')
+ipv4_nets = []
+ipv6_nets = []
+
+for s in subnets:
+    s = s.strip()
+    if not s:
+        continue
+    net = ipaddress.ip_network(s, strict=False)
+    if isinstance(net, ipaddress.IPv4Network):
+        ipv4_nets.append(net)
+    else:
+        ipv6_nets.append(net)
+
+# Если есть и IPv4 и IPv6
+if ipv4_nets and ipv6_nets:
+    # Берём первую IPv4 и первую IPv6 для расчёта соотношения
+    ipv4_net = ipv4_nets[0]
+    ipv6_net = ipv6_nets[0]
+    
+    ipv4_total = 2 ** (32 - ipv4_net.prefixlen)
+    ipv6_total = 2 ** (128 - ipv6_net.prefixlen)
+    ratio = ipv6_total / ipv4_total
+    
+    if ratio >= 1:
+        # 1 IPv4 : N IPv6
+        ipv4_client_mask = 32
+        ipv6_bits = int(math.log2(ratio))
+        ipv6_client_mask = 128 - ipv6_bits
+        ipv4_step = 1
+        ipv6_step = int(ratio)
+        # Количество классов = количество IPv4 адресов
+        num_classes = ipv4_total
+    else:
+        # N IPv4 : 1 IPv6
+        ipv6_client_mask = 128
+        ipv4_bits = int(math.log2(1 / ratio))
+        ipv4_client_mask = 32 - ipv4_bits
+        ipv4_step = int(1 / ratio)
+        ipv6_step = 1
+        # Количество классов = количество IPv6 адресов
+        num_classes = ipv6_total
+    
+    print(f'{num_classes}:{ipv4_step}:{ipv6_step}:{ipv4_client_mask}:{ipv6_client_mask}')
+else:
+    # Только один тип подсетей
+    print('0:1:1:32:128')
+PY
+)
+          NUM_CLASSES=$(echo "$SHAPING_INFO" | cut -d':' -f1)
+          IPV4_STEP=$(echo "$SHAPING_INFO" | cut -d':' -f2)
+          IPV6_STEP=$(echo "$SHAPING_INFO" | cut -d':' -f3)
+          IPV4_CLIENT_MASK=$(echo "$SHAPING_INFO" | cut -d':' -f4)
+          IPV6_CLIENT_MASK=$(echo "$SHAPING_INFO" | cut -d':' -f5)
 
           # Генерируем IP для каждой подсети
           ALL_IPS_ARRAYS=()
@@ -1459,29 +1671,66 @@ PY
 )
               ALL_IPS_ARRAYS[$i]="$IPS"
           done
-          
-          # Проходим по всем IP и создаём общие лимиты
-          # IP с одинаковым индексом в разных подсетях получают один лимит
-          for idx in $(seq 0 $((FIRST_SIZE - 1))); do
+
+          # Проходим по всем классам с учётом шага
+          # IP с соответствующими индексами получают один лимит
+          for idx in $(seq 0 $((NUM_CLASSES - 1))); do
               if [ "$minor_id" -gt 9999 ]; then
                   create_tc_hierarchy
               fi
 
               classid="${major_class}:${minor_id}"
               major="${major_class}:"
-              
+
               # Создаём класс с общим лимитом
               tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
               tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
-              
+
               # Добавляем фильтры для каждой подсети
               for i in "${!SUBNET_ARRAY[@]}"; do
                   subnet="${SUBNET_ARRAY[$i]}"
                   ip_type="${SUBNET_TYPES[$i]}"
                   ips_str="${ALL_IPS_ARRAYS[$i]}"
-                  
+
+                  # Определяем шаг для этого типа подсети
+                  if [ "$ip_type" = "ipv6" ]; then
+                      STEP="$IPV6_STEP"
+                  else
+                      STEP="$IPV4_STEP"
+                  fi
+
+                  # Вычисляем индекс с учётом шага
+                  REAL_IDX=$((idx * STEP + 1))
+
                   # Получаем IP по индексу
-                  target_ip=$(echo "$ips_str" | sed -n "$((idx + 1))p")
+                  target_ip=$(echo "$ips_str" | sed -n "${REAL_IDX}p")
+
+                  # Выравниваем по границе блока (как в Python скрипте)
+                  if [ -n "$target_ip" ]; then
+                      if [ "$ip_type" = "ipv6" ] && [ "$IPV6_CLIENT_MASK" -lt 128 ]; then
+                          # Выравниваем IPv6 по границе блока
+                          target_ip=$(python3 -c "
+import ipaddress
+ip = ipaddress.IPv6Address('$target_ip')
+mask = $IPV6_CLIENT_MASK
+block_size = 2 ** (128 - mask)
+aligned_int = int(ip) & ~(block_size - 1)
+aligned = ipaddress.IPv6Address(aligned_int)
+print(aligned)
+")
+                      elif [ "$ip_type" = "ipv4" ] && [ "$IPV4_CLIENT_MASK" -lt 32 ]; then
+                          # Выравниваем IPv4 по границе блока
+                          target_ip=$(python3 -c "
+import ipaddress
+ip = ipaddress.IPv4Address('$target_ip')
+mask = $IPV4_CLIENT_MASK
+block_size = 2 ** (32 - mask)
+aligned_int = int(ip) & ~(block_size - 1)
+aligned = ipaddress.IPv4Address(aligned_int)
+print(aligned)
+")
+                      fi
+                  fi
 
                   if [ -n "$target_ip" ]; then
                       if [ "$ip_type" = "ipv6" ]; then
@@ -1818,11 +2067,11 @@ fi
 # Очищаем всегда, даже если WARP не активен (на случай если правила остались)
 # Используем обе команды для поддержки IPv4 и IPv6
 iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-iptables -t mangle -D PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+iptables -t mangle -D PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 iptables -t mangle -X "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
 ip6tables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-ip6tables -t mangle -D PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+ip6tables -t mangle -D PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 ip6tables -t mangle -X "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
 # --- Очистка FORWARD для трафика через WARP (IPv4) ---
@@ -1879,8 +2128,8 @@ done
 # IPv4 + IPv6 очистка
 echo "🧹 Очистка проброса портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_SNAT, $PF_CHAIN_FILTER)"
 
-# IPv4 проброс портов
-iptables -t nat -D PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || true
+# IPv4 проброс портов (очищаем правило БЕЗ -i так как добавляли без него!)
+iptables -t nat -D PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
 iptables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
 iptables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
 
@@ -1892,8 +2141,8 @@ iptables -t filter -D FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
 iptables -t filter -F "$PF_CHAIN_FILTER" 2>/dev/null || true
 iptables -t filter -X "$PF_CHAIN_FILTER" 2>/dev/null || true
 
-# IPv6 проброс портов
-ip6tables -t nat -D PREROUTING -i "$IFACE" -j "$PF_CHAIN_NAT" 2>/dev/null || true
+# IPv6 проброс портов (очищаем правило БЕЗ -i так как добавляли без него!)
+ip6tables -t nat -D PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
 ip6tables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
 ip6tables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
 
@@ -1922,16 +2171,59 @@ ip6tables -t filter -X "$INPUT_CHAIN" 2>/dev/null || true
 # Читаем LAN_ALLOW из сохранённого файла в .state/
 LAN_ALLOW_FILE="$STATE_BASE_DIR/.lan_allow_${TUN}.conf"
 LAN_ALLOW=()
+INTERFACE_MAP=()
+
 if [ -f "$LAN_ALLOW_FILE" ]; then
   while IFS= read -r line; do
-    [ -n "$line" ] && LAN_ALLOW+=("$line")
+    # Читаем карту интерфейсов из комментария
+    if [[ "$line" =~ ^#.*INTERFACE_MAP: ]]; then
+      # Извлекаем карту интерфейсов: "# INTERFACE_MAP: awg0=10.0.0.0/24 awg1=10.1.0.0/24"
+      map_part="${line#*INTERFACE_MAP: }"
+      for mapping in $map_part; do
+        INTERFACE_MAP+=("$mapping")
+      done
+    elif [ -n "$line" ]; then
+      # Читаем правила LAN_ALLOW
+      LAN_ALLOW+=("$line")
+    fi
   done < "$LAN_ALLOW_FILE"
 fi
+
+# Функция: найти имя интерфейса из INTERFACE_MAP по IP/подсети
+find_tun_from_map() {
+  local ip_or_subnet="$1"
+  
+  # Ищем в сохранённой карте интерфейсов
+  for mapping in "${INTERFACE_MAP[@]}"; do
+    tun_name="${mapping%%=*}"      # awg0 из "awg0=10.0.0.0/24"
+    tun_subnet="${mapping#*=}"     # 10.0.0.0/24 из "awg0=10.0.0.0/24"
+    
+    # Проверяем попадает ли IP в эту подсеть
+    if python3 -c "
+import ipaddress
+try:
+    ip = ipaddress.ip_network('$ip_or_subnet', strict=False)
+    tun_net = ipaddress.ip_network('$tun_subnet', strict=False)
+    if ip.subnet_of(tun_net) or tun_net.subnet_of(ip) or ip.overlaps(tun_net):
+        exit(0)
+    exit(1)
+except:
+    exit(1)
+" 2>/dev/null; then
+      echo "$tun_name"
+      return 0
+    fi
+  done
+  
+  # Не нашли в карте — возвращаем пусто
+  echo ""
+  return 1
+}
 
 # Очищаем правила локальная сети если они есть
 if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
   echo "Очистка правил локальной сети (${#LAN_ALLOW[@]} групп сегментации)"
-  
+
   # Проходим по каждому правилу в LAN_ALLOW и удаляем созданные правила
   for rule in "${LAN_ALLOW[@]}"; do
     IFS=',' read -ra PARTS <<< "$rule"
@@ -1940,36 +2232,47 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
       part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       [ -n "$part" ] && PARTS_CLEAN+=("$part")
     done
-    
+
     [ ${#PARTS_CLEAN[@]} -eq 0 ] && continue
-    
+
     # Если часть всего одна — очищаем только внутри себя
     if [ ${#PARTS_CLEAN[@]} -eq 1 ]; then
       SOURCE="${PARTS_CLEAN[0]}"
-      
+      SOURCE_TUN=$(find_tun_from_map "$SOURCE")
+      [ -z "$SOURCE_TUN" ] && continue
+
       if [[ "$SOURCE" == *:* ]]; then
         IPT_CMD="ip6tables"
       else
         IPT_CMD="iptables"
       fi
-      
-      $IPT_CMD -D FORWARD -i "$TUN" -o "$TUN" -s "$SOURCE" -d "$SOURCE" -j ACCEPT 2>/dev/null || true
+
+      $IPT_CMD -D FORWARD -i "$SOURCE_TUN" -o "$SOURCE_TUN" -s "$SOURCE" -d "$SOURCE" -j ACCEPT 2>/dev/null || true
     else
       # Если частей несколько — очищаем ВСЕ пары (все ↔ все)
       for ((i=0; i<${#PARTS_CLEAN[@]}; i++)); do
         for ((j=0; j<${#PARTS_CLEAN[@]}; j++)); do
           [ $i -eq $j ] && continue
-          
+
           SRC="${PARTS_CLEAN[$i]}"
           DST="${PARTS_CLEAN[$j]}"
-          
+
+          # Находим туннели из сохранённой карты (даже если интерфейс не существует!)
+          SRC_TUN=$(find_tun_from_map "$SRC")
+          DST_TUN=$(find_tun_from_map "$DST")
+
+          # Пропускаем если туннель не найден в карте
+          [ -z "$SRC_TUN" ] && continue
+          [ -z "$DST_TUN" ] && continue
+
           if [[ "$SRC" == *:* ]]; then
             IPT_CMD="ip6tables"
           else
             IPT_CMD="iptables"
           fi
-          
-          $IPT_CMD -D FORWARD -i "$TUN" -o "$TUN" -s "$SRC" -d "$DST" -j ACCEPT 2>/dev/null || true
+
+          # Пытаемся удалить правило (даже если интерфейс не существует)
+          $IPT_CMD -D FORWARD -i "$SRC_TUN" -o "$DST_TUN" -s "$SRC" -d "$DST" -j ACCEPT 2>/dev/null || true
         done
       done
     fi
@@ -2297,13 +2600,57 @@ class WGConfig:
 # ----------------- Проверка endpoint'ов WARP и генерация -----------------
 
 CANDIDATE_WARP_ENDPOINTS = [
+    # Domain-based (Cloudflare автоматически выберет IPv4 или IPv6)
     "engage.cloudflareclient.com:2408",
     "engage.cloudflareclient.com:4500",
+    "engage.cloudflareclient.com:500",
+    "engage.cloudflareclient.com:1002",
+    "engage.cloudflareclient.com:1701",
+    "engage.cloudflareclient.com:3138",
+    "engage.cloudflareclient.com:3581",
+    "engage.cloudflareclient.com:7559",
+    "engage.cloudflareclient.com:8080",
+    "engage.cloudflareclient.com:8443",
+    
+    # IPv4 Endpoints (162.159.192.x range)
     "162.159.192.1:500",
+    "162.159.192.1:1002",
+    "162.159.192.1:2408",
+    "162.159.192.1:3138",
+    "162.159.192.1:4500",
+    "162.159.192.1:7559",
+    "162.159.192.9:500",
+    "162.159.192.9:1002",
+    "162.159.192.9:2408",
     "162.159.192.9:3138",
+    "162.159.192.9:4500",
+    "162.159.192.9:7559",
+    
+    # IPv4 Endpoints (162.159.193.x range)
+    "162.159.193.1:500",
+    "162.159.193.1:1002",
+    "162.159.193.1:2408",
+    "162.159.193.1:4500",
+    
+    # IPv4 Endpoints (188.114.96-99.x range - Europe)
+    "188.114.96.1:500",
+    "188.114.96.1:1002",
+    "188.114.96.1:2408",
+    "188.114.97.1:500",
+    "188.114.97.1:2408",
     "188.114.98.124:3581",
     "188.114.98.36:7559",
+    "188.114.99.1:500",
+    "188.114.99.1:2408",
     "188.114.99.224:1002",
+    
+    # IPv6 Endpoints (Cloudflare IPv6 ranges)
+    "[2606:4700:d0::a29f:c001]:2408",
+    "[2606:4700:d0::a29f:c001]:4500",
+    "[2606:4700:d1::a29f:c001]:2408",
+    "[2606:4700:d1::a29f:c001]:4500",
+    "[2a06:98c0:3600::103]:2408",
+    "[2a06:98c0:3600::103]:4500",
 ]
 
 FALLBACK_DSYT_ALLOWEDIPS = (
@@ -2393,12 +2740,17 @@ def _select_endpoint_from_api_result(result: dict) -> Optional[str]:
     return None
 
 
-def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]:
+def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "") -> Tuple[str, str]:
     """
     Генерация одного WARP-конфига.
     """
     api = "https://api.cloudflareclient.com/v0i1909051800"
     headers = {"user-agent": "amneziawg-script/1.0", "content-type": "application/json"}
+
+    # Настройка proxy если указан
+    proxies = None
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
 
     try:
         priv_key, pub_key = gen_pair_keys("AWG")
@@ -2410,7 +2762,13 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
             "type": "ios",
             "locale": "en_US",
         }
-        resp = requests.post(f"{api}/reg", headers=headers, json=data, timeout=10)
+        resp = requests.post(
+            f"{api}/reg",
+            headers=headers,
+            json=data,
+            timeout=10,  # Оптимальный таймаут для proxy
+            proxies=proxies,
+        )
         resp.raise_for_status()
         res = resp.json().get("result")
         if not res:
@@ -2423,7 +2781,8 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
             f"{api}/reg/{reg_id}",
             headers={**headers, "authorization": f"Bearer {token}"},
             json={"warp_enabled": True},
-            timeout=10,
+            timeout=10,  # Оптимальный таймаут для proxy
+            proxies=proxies,
         )
         resp2.raise_for_status()
         result_obj = resp2.json().get("result", {})
@@ -2444,16 +2803,22 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
     candidates.extend(CANDIDATE_WARP_ENDPOINTS)
 
     chosen = None
-    for ep in candidates:
+    total_endpoints = len(candidates)
+    for idx, ep in enumerate(candidates, 1):
         try:
-            if check_endpoint(ep, timeout=1.5):
+            logger.info("🔍 Проверка endpoint %d/%d: %s ...", idx, total_endpoints, ep)
+            if check_endpoint(ep, timeout=0.6):  # Уменьшено с 1.5 до 0.6 сек
                 chosen = ep
+                logger.info("✅ Endpoint найден: %s", chosen)
                 break
-        except Exception:
+            else:
+                logger.info("❌ Endpoint не доступен: %s", ep)
+        except Exception as e:
+            logger.info("❌ Endpoint ошибка: %s (%s)", ep, e)
             continue
 
     if not chosen:
-        raise RuntimeError("Не найден доступный endpoint для WARP")
+        raise RuntimeError("Не найден доступный endpoint для WARP (проверено %d endpoint'ов)" % total_endpoints)
 
     jc = random.randint(80, 120)
     jmin = random.randint(48, 64)
@@ -2473,16 +2838,16 @@ def generate_warp_config(tun_name: str, index: int, mtu: int) -> Tuple[str, str]
     return out, filename
 
 
-def generate_warp_configs(tun_name: str, num_warps: int, mtu: int) -> List[str]:
+def generate_warp_configs(tun_name: str, num_warps: int, mtu: int, proxy: str = "") -> List[str]:
     """
     Генерация N WARP-конфигов с попытками и откатом при неудаче.
     """
     warp_configs: List[str] = []
     for i in range(num_warps):
         success = False
-        for attempt in range(5):
+        for attempt in range(3):  # 3 попытки достаточно
             try:
-                conf_text, fname = generate_warp_config(tun_name, i, mtu)
+                conf_text, fname = generate_warp_config(tun_name, i, mtu, proxy)
                 path = pathlib.Path(g_main_config_fn).parent.joinpath(fname)
                 atomic_write_text(path, conf_text)
                 warp_configs.append(fname)
@@ -2491,7 +2856,7 @@ def generate_warp_configs(tun_name: str, num_warps: int, mtu: int) -> List[str]:
             except requests.exceptions.HTTPError as he:
                 status = getattr(he.response, "status_code", None)
                 if status == 429:
-                    backoff = 5 + attempt * 5
+                    backoff = 2 + attempt * 2  # 2, 4, 6 сек
                     logger.warning("⚠  Cloudflare API rate-limited; ожидаю %d сек", backoff)
                     time.sleep(backoff)
                     continue
@@ -2785,74 +3150,98 @@ def _ensure_endpoint_file_exists(default_addr: str) -> None:
         logger.warning("⚠  Не удалось создать _endpoint.config: %s", e)
 
 
+def calculate_client_masks(ipv4_net: ipaddress.IPv4Network, ipv6_net: Optional[ipaddress.IPv6Network]) -> Tuple[int, int, float]:
+    """
+    Вычисляет маски клиентов и коэффициент кратности на основе соотношения объёмов подсетей.
+    
+    Возвращает кортеж: (ipv4_client_mask, ipv6_client_mask, ratio)
+    где:
+    - ipv4_client_mask: маска для IPv4 адреса клиента (например, /32, /30, /31)
+    - ipv6_client_mask: маска для IPv6 адреса клиента (например, /128, /126, /125)
+    - ratio: коэффициент кратности (сколько IPv6 адресов на 1 IPv4, или наоборот)
+    
+    Примеры:
+    - /24 + /120 → ratio=1.0 → (32, 128, 1.0) — 1 IPv4 : 1 IPv6
+    - /24 + /119 → ratio=2.0 → (32, 127, 2.0) — 1 IPv4 : 2 IPv6
+    - /24 + /118 → ratio=4.0 → (32, 126, 4.0) — 1 IPv4 : 4 IPv6
+    - /22 + /120 → ratio=0.25 → (30, 128, 0.25) — 4 IPv4 : 1 IPv6
+    """
+    if not ipv6_net:
+        # Только IPv4
+        return 32, 128, 1.0
+    
+    # Количество адресов в подсетях
+    ipv4_total = 2 ** (32 - ipv4_net.prefixlen)
+    ipv6_total = 2 ** (128 - ipv6_net.prefixlen)
+    
+    # Соотношение
+    ratio = ipv6_total / ipv4_total
+    
+    if ratio >= 1:
+        # 1 IPv4 : N IPv6 (IPv6 подсеть шире)
+        ipv4_client_mask = 32  # 1 адрес
+        ipv6_bits = int(math.log2(ratio))
+        ipv6_client_mask = 128 - ipv6_bits
+    else:
+        # N IPv4 : 1 IPv6 (IPv4 подсеть шире)
+        ipv6_client_mask = 128  # 1 адрес
+        ipv4_bits = int(math.log2(1 / ratio))
+        ipv4_client_mask = 32 - ipv4_bits
+    
+    return ipv4_client_mask, ipv6_client_mask, ratio
+
+
 def validate_ipv4_ipv6_pair(ipv4_net: ipaddress.IPv4Network, ipv6_net: Optional[ipaddress.IPv6Network], ipv4_server_ip: str = "", ipv6_server_ip: str = "") -> bool:
     """
-    Проверяет что IPv4 и IPv6 подсети имеют одинаковое реальное количество доступных для клиентов IP.
-
-    Учитывает:
-    - Позицию сервера (первый usable или network)
-    - Резервирование broadcast/последнего адреса
-
+    Проверяет что IPv4 и IPv6 подсети совместимы.
+    
+    Проверки:
+    1. Позиция сервера: оба на network или оба не на network
+    2. Соотношение подсетей: не экстремальное (от 1:65536 до 65536:1)
+    
     Возвращает True если валидация пройдена, иначе бросает RuntimeError.
     """
     if not ipv6_net:
         return True  # IPv6 опционален
 
-    # Определяем позицию сервера для IPv4
-    ipv4_first_usable_int = int(ipv4_net.network_address) + 1
-    ipv4_first_usable_str = str(ipaddress.IPv4Address(ipv4_first_usable_int))
-    # Нормализуем ipv4_server_ip для сравнения
-    ipv4_server_ip_normalized = str(ipaddress.IPv4Address(ipv4_server_ip)) if ipv4_server_ip else ""
-    ipv4_server_on_first = (ipv4_server_ip_normalized == ipv4_first_usable_str) if ipv4_server_ip else True
-
-    # Вычисляем реальное количество доступных для клиентов IPv4 адресов
-    ipv4_broadcast_int = int(ipv4_net.broadcast_address)
-    if ipv4_server_on_first:
-        # Сервер на первом usable → broadcast зарезервирован
-        # Доступны: от (first_usable + 1) до (broadcast - 1)
-        ipv4_clients = (ipv4_broadcast_int - 1) - ipv4_first_usable_int
-    else:
-        # Сервер на network → broadcast НЕ зарезервирован
-        # Доступны: от first_usable до broadcast
-        ipv4_clients = ipv4_broadcast_int - ipv4_first_usable_int + 1
-
-    # Определяем позицию сервера для IPv6
-    ipv6_first_usable_int = int(ipv6_net.network_address) + 1
-    ipv6_first_usable_str = str(ipaddress.IPv6Address(ipv6_first_usable_int))
-    # Нормализуем ipv6_server_ip для сравнения
-    ipv6_server_ip_normalized = str(ipaddress.IPv6Address(ipv6_server_ip)) if ipv6_server_ip else ""
-    ipv6_server_on_first = (ipv6_server_ip_normalized == ipv6_first_usable_str) if ipv6_server_ip else True
-
-    # Вычисляем реальное количество доступных для клиентов IPv6 адресов
-    if ipv6_server_on_first:
-        # Сервер на первом usable → последний адрес зарезервирован
-        # Доступны: от (first_usable + 1) до (last_usable = network + num_addresses - 2)
-        ipv6_last_usable_int = int(ipv6_net.network_address) + ipv6_net.num_addresses - 2
-        ipv6_clients = ipv6_last_usable_int - ipv6_first_usable_int
-    else:
-        # Сервер на network → последний НЕ зарезервирован
-        # Доступны: от first_usable до last_usable = network + num_addresses - 1
-        ipv6_last_usable_int = int(ipv6_net.network_address) + ipv6_net.num_addresses - 1
-        ipv6_clients = ipv6_last_usable_int - ipv6_first_usable_int + 1
-
-    # Проверяем что реальное количество доступных для клиентов адресов одинаковое
-    if ipv4_clients != ipv6_clients:
-        raise RuntimeError(
-            f'IPv4 и IPv6 подсети должны иметь одинаковое реальное количество доступных для клиентов IP. '
-            f'IPv4: {ipv4_clients} адресов (сервер на {"первом usable" if ipv4_server_on_first else "network"}), '
-            f'IPv6: {ipv6_clients} адресов (сервер на {"первом usable" if ipv6_server_on_first else "network"}). '
-            f'Пример: 10.1.0.1/24 (252 клиента) и fd00::1/120 (252 клиента)'
-        )
-
-    # Проверяем что позиция сервера одинаковая для IPv4 и IPv6
-    if ipv4_server_on_first != ipv6_server_on_first:
+    # Вычисляем маски клиентов и коэффициент кратности
+    ipv4_client_mask, ipv6_client_mask, ratio = calculate_client_masks(ipv4_net, ipv6_net)
+    
+    # --- Проверка 1: Позиция сервера ---
+    # Сервер должен занимать одинаковую позицию в обеих подсетях
+    # (либо network address в обеих, либо не network address в обеих)
+    ipv4_is_network = (ipv4_server_ip == str(ipv4_net.network_address)) if ipv4_server_ip else True
+    ipv6_is_network = (ipv6_server_ip == str(ipv6_net.network_address)) if ipv6_server_ip else True
+    
+    if ipv4_is_network != ipv6_is_network:
         raise RuntimeError(
             f'Позиция сервера в IPv4 и IPv6 должна совпадать. '
-            f'IPv4: сервер на {"первом usable" if ipv4_server_on_first else "network"}, '
-            f'IPv6: сервер на {"первом usable" if ipv6_server_on_first else "network"}. '
-            f'Пример: 10.1.0.1/24,fd00::1/120 (оба на первом usable) или 10.1.0.0/24,fd00::0/120 (оба на network)'
+            f'IPv4: сервер на {"network" if ipv4_is_network else "не network"}, '
+            f'IPv6: сервер на {"network" if ipv6_is_network else "не network"}. '
+            f'Пример: 10.1.0.0/24,fd00::/120 (оба на network) или 10.1.0.1/24,fd00::1/120 (оба не на network)'
+        )
+    
+    # --- Проверка 2: Разумное соотношение ---
+    # Максимальное соотношение основано на диапазонах масок (/8-/30 и /104-/126)
+    # Максимум: IPv4 /30 + IPv6 /104 = 1:4194304 или IPv4 /8 + IPv6 /126 = 4194304:1
+    # 2^22 = 4194304 (разница между мин/масками: 30-8=22 или 126-104=22)
+    MAX_RATIO = 4194304  # 2^22 (максимум 1:4194304 или 4194304:1)
+    MIN_RATIO = 1 / MAX_RATIO
+
+    if ratio > MAX_RATIO:
+        raise RuntimeError(
+            f'Соотношение подсетей слишком большое: 1 IPv4 = {ratio:,.0f} IPv6. '
+            f'Максимальное соотношение: 1:{MAX_RATIO:,}. '
+            f'Пример: IPv4 /24 + IPv6 /112 (1:256)'
         )
 
+    if ratio < MIN_RATIO:
+        raise RuntimeError(
+            f'Соотношение подсетей слишком маленькое: 1 IPv4 = {ratio:.10f} IPv6 (1:{1/ratio:,.0f}). '
+            f'Минимальное соотношение: 1:{MAX_RATIO:,} ({MIN_RATIO:.10f}). '
+            f'Пример: IPv4 /16 + IPv6 /120 (256:1)'
+        )
+    
     return True
 
 
@@ -2884,17 +3273,17 @@ def parse_ipaddr_argument(ipaddr_str: str) -> Tuple[ipaddress.IPv4Network, Optio
 
         # Проверка размера подсети
         if isinstance(net, ipaddress.IPv4Network):
-            # IPv4: от /8 до /30
+            # IPv4: от /8 до /30 (практичные размеры для VPN)
             if net.prefixlen < 8:
                 raise RuntimeError(f'IPv4 подсеть /{net.prefixlen} слишком большая (минимум /8)')
             if net.prefixlen > 30:
                 raise RuntimeError(f'IPv4 подсеть /{net.prefixlen} слишком маленькая (максимум /30)')
         else:
-            # IPv6: от /8 до /128
-            if net.prefixlen < 8:
-                raise RuntimeError(f'IPv6 подсеть /{net.prefixlen} слишком большая (минимум /8)')
-            if net.prefixlen > 128:
-                raise RuntimeError(f'IPv6 подсеть /{net.prefixlen} слишком маленькая (максимум /128)')
+            # IPv6: от /104 до /126 (практичные размеры для VPN)
+            if net.prefixlen < 104:
+                raise RuntimeError(f'IPv6 подсеть /{net.prefixlen} слишком большая (минимум /104)')
+            if net.prefixlen > 126:
+                raise RuntimeError(f'IPv6 подсеть /{net.prefixlen} слишком маленькая (максимум /126)')
 
         # Определяем версию IP
         if isinstance(net, ipaddress.IPv4Network):
@@ -2988,6 +3377,40 @@ def handle_makecfg(opt) -> None:
     # Используем новую функцию для парсинга и валидации
     ipaddr_ipv4_net, ipaddr_ipv6_net, ipaddr_display, normalized_string = parse_ipaddr_argument(opt.ipaddr)
 
+    # --- СНАЧАЛА ГЕНЕРИРУЕМ WARP (если нужен) ---
+    warp_configs: List[str] = []
+    if opt.warp > 0:
+        logger.info("🌀 Генерация %d WARP конфигов...", opt.warp)
+        try:
+            warp_configs = generate_warp_configs(tun_name, opt.warp, opt.mtu, opt.proxy)
+        except RuntimeError as e:
+            error_msg = str(e)
+            
+            # Проверяем тип ошибки
+            if "Ошибка WARP API" in error_msg:
+                # Проблема с доступом к API
+                logger.error("❌ Не удалось сгенерировать WARP: проблема с доступом к Cloudflare API")
+                if not opt.proxy:
+                    logger.info("💡 Попробуйте использовать прокси для обхода блокировок через флаг --proxy \"адрес прокси\"")
+                else:
+                    logger.info("💡 Попробуйте использовать другой прокси для обхода блокировок через флаг --proxy \"адрес прокси\"")
+            elif "Не найден доступный endpoint" in error_msg:
+                # Проблема с доступностью endpoint'ов
+                logger.error("❌ Не удалось сгенерировать WARP: проблема с доступом к Cloudflare Endpoint")
+                logger.info("💡 Похоже WARP у вас не будет работать и лучше не используйте его, генерируйте интерфейс без флага --warp")
+            else:
+                # Неизвестная ошибка
+                logger.error("❌ Не удалось сгенерировать WARP: что-то пошло не так")
+                logger.error("📝 Детали: %s", error_msg)
+                logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\", если не выйдет то без --warp")
+            
+            raise RuntimeError("Генерация WARP не удалась — интерфейс не создан")
+        
+        for c in warp_configs:
+            logger.info("📄 WARP конфиг: %s", c)
+        logger.info("✅ WARP конфиги сгенерированы")
+
+    # --- ТЕПЕРЬ СОЗДАЁМ СЕРВЕРНЫЙ КОНФИГ И СКРИПТЫ ---
     priv, pub = gen_pair_keys(mtype)
     random.seed()
     jc = random.randint(80, 120)
@@ -3028,20 +3451,9 @@ def handle_makecfg(opt) -> None:
     out = out.replace("<SERVER_UP_SCRIPT>", str(up_path))
     out = out.replace("<SERVER_DOWN_SCRIPT>", str(down_path))
     out = out.replace("<MTU>", str(opt.mtu))
-    
+
     atomic_write_text(g_main_config_fn, out)
     logger.info("✅ Серверный конфиг создан: %s", g_main_config_fn)
-
-    warp_configs: List[str] = []
-    if opt.warp > 0:
-        logger.info("🌀 Генерация %d WARP конфигов...", opt.warp)
-        try:
-            warp_configs = generate_warp_configs(tun_name, opt.warp, opt.mtu)
-        except Exception as e:
-            logger.warning("⚠  ️  Генерация WARP не удалась: %s", e)
-            warp_configs = []
-        for c in warp_configs:
-            logger.info("📄 WARP конфиг: %s", c)
 
     if warp_configs:
         warp_list_str = "\n".join([f'  \"{pathlib.Path(cfg).stem}\"' for cfg in warp_configs])
@@ -3121,18 +3533,18 @@ def handle_add(opt) -> None:
         raise RuntimeError('IPv4 подсеть обязательна')
 
     # Проверка размера подсети
-    # IPv4: от /8 до /30
+    # IPv4: от /8 до /30 (практичные размеры для VPN)
     if net_ipv4.prefixlen < 8:
         raise RuntimeError(f'IPv4 подсеть /{net_ipv4.prefixlen} слишком большая (минимум /8)')
     if net_ipv4.prefixlen > 30:
         raise RuntimeError(f'IPv4 подсеть /{net_ipv4.prefixlen} слишком маленькая (максимум /30)')
-    
-    # IPv6: от /8 до /128
+
+    # IPv6: от /104 до /126 (практичные размеры для VPN)
     if net_ipv6 is not None:
-        if net_ipv6.prefixlen < 8:
-            raise RuntimeError(f'IPv6 подсеть /{net_ipv6.prefixlen} слишком большая (минимум /8)')
-        if net_ipv6.prefixlen > 128:
-            raise RuntimeError(f'IPv6 подсеть /{net_ipv6.prefixlen} слишком маленькая (максимум /128)')
+        if net_ipv6.prefixlen < 104:
+            raise RuntimeError(f'IPv6 подсеть /{net_ipv6.prefixlen} слишком большая (минимум /104)')
+        if net_ipv6.prefixlen > 126:
+            raise RuntimeError(f'IPv6 подсеть /{net_ipv6.prefixlen} слишком маленькая (максимум /126)')
 
     # --- Собираем используемые IPv4 адреса ---
     used_ips_ipv4 = set()
@@ -3171,28 +3583,28 @@ def handle_add(opt) -> None:
         # Не нашли Address, используем network
         server_ip_int_ipv4 = int(net_ipv4.network_address)
 
-    # Определяем: занимает ли сервер ПЕРВЫЙ USABLE IP в подсети?
-    server_occupies_first_usable_ipv4 = (server_ip_int_ipv4 == first_usable_int_ipv4)
+    # Определяем: занимает ли сервер NETWORK адрес (а не первый usable!)
+    # Это важно для определения доступности broadcast адреса
+    server_on_network_ipv4 = (server_ip_int_ipv4 == int(net_ipv4.network_address))
 
     # Добавляем IP сервера в занятые!
     used_ips_ipv4.add(server_ip_int_ipv4)
 
     # Последний usable зависит от позиции сервера
-    if server_occupies_first_usable_ipv4:
-        # Сервер на первом usable → broadcast зарезервирован
-        last_usable_int_ipv4 = broadcast_int_ipv4 - 1
-    else:
-        # Сервер на network → все доступны
+    if server_on_network_ipv4:
+        # Сервер на network → broadcast НЕ работает → можно выдать
         last_usable_int_ipv4 = broadcast_int_ipv4
+    else:
+        # Сервер НЕ на network (на первом usable или другом) → broadcast РАБОТАЕТ → зарезервирован
+        last_usable_int_ipv4 = broadcast_int_ipv4 - 1
     
     # --- Вычисляем первый/последний IP для IPv6 ---
     first_usable_int_ipv6 = None
     last_usable_int_ipv6 = None
-    server_occupies_first_usable_ipv6 = True
 
     if net_ipv6:
         first_usable_int_ipv6 = int(net_ipv6.network_address) + 1
-        
+
         # Реальный IP сервера из конфига (Address = ...)
         # Парсим "fd00::/112" → fd00::
         server_addr_ipv6 = srvcfg.split('[Peer]')[0]  # Только [Interface] секция
@@ -3208,16 +3620,20 @@ def handle_add(opt) -> None:
         else:
             # Не нашли Address, используем network
             ipv6_server_ip_int = int(net_ipv6.network_address)
-        
-        server_occupies_first_usable_ipv6 = (ipv6_server_ip_int == first_usable_int_ipv6)
-        
+
+        # Определяем: занимает ли сервер NETWORK адрес (а не первый usable!)
+        server_on_network_ipv6 = (ipv6_server_ip_int == int(net_ipv6.network_address))
+
         # Добавляем IP сервера в занятые!
         used_ips_ipv6.add(ipv6_server_ip_int)
-        
-        if server_occupies_first_usable_ipv6:
-            last_usable_int_ipv6 = int(net_ipv6.network_address) + net_ipv6.num_addresses - 2
-        else:
+
+        # Последний usable зависит от позиции сервера
+        if server_on_network_ipv6:
+            # Сервер на network → "broadcast" НЕ работает → можно выдать
             last_usable_int_ipv6 = int(net_ipv6.network_address) + net_ipv6.num_addresses - 1
+        else:
+            # Сервер НЕ на network → "broadcast" РАБОТАЕТ → зарезервирован
+            last_usable_int_ipv6 = int(net_ipv6.network_address) + net_ipv6.num_addresses - 2
 
     # --- Обработка ручного IP ---
     ipaddr_ipv4 = None
@@ -3239,8 +3655,8 @@ def handle_add(opt) -> None:
                 if ip_int in used_ips_ipv4:
                     raise RuntimeError(f'IPv4 адрес {manual_ip_str} уже используется')
 
-                # Проверка: если сервер занимает первый usable IP, нельзя выдать broadcast
-                if server_occupies_first_usable_ipv4 and ip_int == broadcast_int_ipv4:
+                # Проверка: если сервер НЕ на network, broadcast работает и зарезервирован
+                if not server_on_network_ipv4 and ip_int == broadcast_int_ipv4:
                     raise RuntimeError(f'IPv4 адрес {manual_ip_str} зарезервирован для broadcast')
 
                 ipaddr_ipv4 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
@@ -3255,23 +3671,37 @@ def handle_add(opt) -> None:
                 
                 ipaddr_ipv6 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
     else:
-        # --- Автоматический выбор IP ---
+        # --- Автоматический выбор IP с учётом кратности подсетей ---
+        # Вычисляем маски клиентов и коэффициент кратности
+        ipv4_client_mask, ipv6_client_mask, ratio = calculate_client_masks(net_ipv4, net_ipv6)
+        
+        # Определяем шаг для IPv4 и IPv6
+        # Если ratio > 1: 1 IPv4 : N IPv6 → IPv6 шаг = ratio
+        # Если ratio < 1: N IPv4 : 1 IPv6 → IPv4 шаг = 1/ratio
+        if ratio >= 1:
+            ipv4_step = 1
+            ipv6_step = int(ratio)
+        else:
+            ipv4_step = int(1 / ratio)
+            ipv6_step = 1
+        
         # IPv4
         chosen_ipv4 = None
         chosen_ipv6 = None
-        range_end_ipv4 = last_usable_int_ipv4 + 1 if server_occupies_first_usable_ipv4 else broadcast_int_ipv4 + 1
+        # range_end_ipv4 = последний usable + 1 (для range() не включительно)
+        range_end_ipv4 = last_usable_int_ipv4 + 1
 
-        # Проходим по всем IPv4 адресам и ищем пару IPv4+IPv6
-        for ip_int in range(first_usable_int_ipv4, range_end_ipv4):
+        # Проходим по всем IPv4 адресам с учётом шага
+        for ip_int in range(first_usable_int_ipv4, range_end_ipv4, ipv4_step):
             if ip_int not in used_ips_ipv4:
                 # Нашли свободный IPv4, теперь ищем соответствующий IPv6
                 if net_ipv6 and first_usable_int_ipv6 is not None:
-                    # Вычисляем индекс IPv6 по индексу IPv4
-                    ipv6_idx = ip_int - first_usable_int_ipv4
-                    ipv6_int = first_usable_int_ipv6 + ipv6_idx
-                    
-                    # Проверяем что IPv6 не занят
-                    if ipv6_int not in used_ips_ipv6:
+                    # Вычисляем индекс IPv6 по индексу IPv4 с учётом шага
+                    ipv4_idx = (ip_int - first_usable_int_ipv4) // ipv4_step
+                    ipv6_int = first_usable_int_ipv6 + (ipv4_idx * ipv6_step)
+
+                    # Проверяем что IPv6 не занят и в пределах диапазона
+                    if ipv6_int not in used_ips_ipv6 and ipv6_int <= last_usable_int_ipv6:
                         chosen_ipv4 = ip_int
                         chosen_ipv6 = ipv6_int
                         break
@@ -3283,11 +3713,51 @@ def handle_add(opt) -> None:
         if chosen_ipv4 is None:
             raise RuntimeError('Нет свободных IPv4 адресов')
 
-        ipaddr_ipv4 = f"{str(ipaddress.IPv4Address(chosen_ipv4))}/32"
+        # Вычисляем первый IP в блоке для IPv4 (выравнивание по границе маски)
+        # ВАЖНО: блок должен полностью попадать в диапазон usable адресов
+        if ipv4_client_mask < 32:
+            ipv4_block_size = 2 ** (32 - ipv4_client_mask)
+            # Выравниваем вниз до границы блока
+            chosen_ipv4_aligned = chosen_ipv4 & ~(ipv4_block_size - 1)
+            
+            # Проверяем что блок не начинается с network адреса
+            if chosen_ipv4_aligned == int(net_ipv4.network_address):
+                # Блок начинается с network — сдвигаем на следующий блок
+                chosen_ipv4_aligned += ipv4_block_size
+            
+            # Проверяем что блок не заканчивается на broadcast
+            block_end = chosen_ipv4_aligned + ipv4_block_size - 1
+            if block_end == int(net_ipv4.broadcast_address):
+                # Блок заканчивается на broadcast — сдвигаем на предыдущий блок
+                chosen_ipv4_aligned -= ipv4_block_size
+        else:
+            chosen_ipv4_aligned = chosen_ipv4
+
+        # Вычисляем первый IP в блоке для IPv6 (выравнивание по границе маски)
+        if ipv6_client_mask < 128 and chosen_ipv6 is not None:
+            ipv6_block_size = 2 ** (128 - ipv6_client_mask)
+            # Выравниваем вниз до границы блока
+            chosen_ipv6_aligned = chosen_ipv6 & ~(ipv6_block_size - 1)
+            
+            # Проверяем что блок не начинается с network адреса
+            if chosen_ipv6_aligned == int(net_ipv6.network_address):
+                # Блок начинается с network — сдвигаем на следующий блок
+                chosen_ipv6_aligned += ipv6_block_size
+            
+            # Проверяем что блок не заканчивается на последний адрес (аналог broadcast)
+            block_end = chosen_ipv6_aligned + ipv6_block_size - 1
+            if block_end == int(net_ipv6.broadcast_address):
+                # Блок заканчивается на broadcast — сдвигаем на предыдущий блок
+                chosen_ipv6_aligned -= ipv6_block_size
+        else:
+            chosen_ipv6_aligned = chosen_ipv6 if chosen_ipv6 else 0
+
+        # Формируем адрес с маской клиента
+        ipaddr_ipv4 = f"{str(ipaddress.IPv4Address(chosen_ipv4_aligned))}/{ipv4_client_mask}"
 
         # IPv6 (если есть подсеть и мы нашли пару)
         if net_ipv6 and chosen_ipv6 is not None:
-            ipaddr_ipv6 = f"{str(ipaddress.IPv6Address(chosen_ipv6))}/128"
+            ipaddr_ipv6 = f"{str(ipaddress.IPv6Address(chosen_ipv6_aligned))}/{ipv6_client_mask}"
         elif net_ipv6:
             # IPv6 подсеть есть, но не нашли пару — выдаём только IPv4 с предупреждением
             logger.warning('⚠  Нет свободных пар IPv4+IPv6, выдаём только IPv4')
@@ -3703,12 +4173,13 @@ parser.add_argument("-q", "--qrcode", action="store_true", help="QR-коды")
 parser.add_argument("-z", "--zip", action="store_true", help="ZIP-архивы")
 parser.add_argument("-o", "--only", help="Только указанные клиенты", default="")
 parser.add_argument("-i", "--ipaddr", default="", help="IP адрес")
-parser.add_argument("-p", "--port", type=int, default=44567, help="Порт")
+parser.add_argument("-p", "--port", type=int, default=4455, help="Порт")
 parser.add_argument("-l", "--limit", type=int, default=0, help="Limit (Mbit)")
 parser.add_argument("-f", "--iface", default="", help="Сетевой интерфейс (например ens3)")
 parser.add_argument("--make", dest="makecfg", default="", help="Создать серверный конфиг")
 parser.add_argument("--mtu", type=int, default=1388, help="MTU")
 parser.add_argument("--warp", type=int, default=0, help="WARP конфиги")
+parser.add_argument("--proxy", default="", help="Proxy сервер для WARP API (например http://proxy:8080 или socks5://127.0.0.1:9050)")
 opt = parser.parse_args()
 
 
