@@ -4343,6 +4343,11 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except RuntimeError as e:
+        # Ожидаемая ошибка (неудачная генерация WARP и т.п.)
+        logger.error("❌ %s", e)
+        sys.exit(1)
     except Exception as e:
-        logger.exception("Фатальная ошибка: %s", e)
+        # Неожиданная ошибка
+        logger.exception("❌ Фатальная ошибка: %s", e)
         sys.exit(1)
