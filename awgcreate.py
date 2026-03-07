@@ -2876,7 +2876,8 @@ def generate_warp_configs(tun_name: str, num_warps: int, mtu: int, proxy: str = 
                         p.unlink()
                 except Exception:
                     pass
-            raise RuntimeError("WARP конфиги не сгенерированы")
+            # Перебрасываем последнюю ошибку вместо создания новой
+            raise
     return warp_configs
 
 
@@ -3386,18 +3387,29 @@ def handle_makecfg(opt) -> None:
         except RuntimeError as e:
             error_msg = str(e)
 
-            # Проверяем тип ошибки
-            if "Ошибка WARP API" in error_msg or "WARP конфиги не сгенерированы" in error_msg:
-                # Проблема с доступом к API
-                logger.error("❌ Не удалось сгенерировать WARP: проблема с доступом к Cloudflare API")
-                if not opt.proxy:
-                    logger.info("💡 Попробуйте использовать прокси для обхода блокировок через флаг --proxy \"адрес прокси\"")
-                else:
-                    logger.info("💡 Попробуйте использовать другой прокси для обхода блокировок через флаг --proxy \"адрес прокси\"")
-            elif "Не найден доступный endpoint" in error_msg:
+            # Проверяем тип ошибки по тексту
+            if "Не найден доступный endpoint" in error_msg:
                 # Проблема с доступностью endpoint'ов
                 logger.error("❌ Не удалось сгенерировать WARP: проблема с доступом к Cloudflare Endpoint")
                 logger.info("💡 Похоже WARP у вас не будет работать и лучше не используйте его, генерируйте интерфейс без флага --warp")
+            elif "timed out" in error_msg or "timeout" in error_msg.lower():
+                # Таймаут — проблема с сетью или API недоступен
+                logger.error("❌ Не удалось сгенерировать WARP: таймаут подключения к Cloudflare API")
+                if not opt.proxy:
+                    logger.info("💡 Попробуйте использовать прокси для обхода блокировок через флаг --proxy \"адрес прокси\"")
+                else:
+                    logger.info("💡 Попробуйте использовать другой прокси или запустите без --warp")
+            elif "SSLError" in error_msg or "wrong version" in error_msg:
+                # SSL ошибка — прокси не поддерживает HTTPS
+                logger.error("❌ Не удалось сгенерировать WARP: SSL ошибка (прокси не поддерживает HTTPS)")
+                logger.info("💡 Используйте HTTP прокси или попробуйте другой прокси")
+            elif "WARP API" in error_msg:
+                # Другие ошибки API
+                logger.error("❌ Не удалось сгенерировать WARP: проблема с Cloudflare API")
+                if not opt.proxy:
+                    logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\"")
+                else:
+                    logger.info("💡 Попробуйте другой прокси или запустите без --warp")
             else:
                 # Неизвестная ошибка
                 logger.error("❌ Не удалось сгенерировать WARP: что-то пошло не так")
