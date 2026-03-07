@@ -314,7 +314,7 @@ print_info() {
     echo "  systemctl status awg-quick@awg         # Проверить состояние"
     echo "  # конфигурация"
     echo "  awg-quick strip awg > /tmp/awg.conf    # Сохранить конфиг в чистом формате во временный файл"
-    echo "  awg syncconf awg /tmp/awg.conf         # Обновить конфиг для обновления пользователей без перезапуска интерфейса"
+    echo "  awg syncconf awg /tmp/awg.conf         # Загрузить конфиг для обновления пользователей без перезапуска интерфейса"
     echo
     echo "Конфигурация:"
     echo "  /etc/amnezia/amneziawg/"
