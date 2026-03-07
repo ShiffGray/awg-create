@@ -2868,7 +2868,7 @@ def generate_warp_configs(tun_name: str, num_warps: int, mtu: int, proxy: str = 
                 time.sleep(1 + attempt)
                 continue
         if not success:
-            logger.warning("⚠  Отмена генерации WARP; продолжаем без WARP.")
+            logger.warning("⚠  Отмена генерации WARP.")
             for created in warp_configs:
                 try:
                     p = pathlib.Path(g_main_config_fn).parent.joinpath(created)
@@ -2876,7 +2876,7 @@ def generate_warp_configs(tun_name: str, num_warps: int, mtu: int, proxy: str = 
                         p.unlink()
                 except Exception:
                     pass
-            return []
+            raise RuntimeError("WARP конфиги не сгенерированы")
     return warp_configs
 
 
@@ -3385,7 +3385,7 @@ def handle_makecfg(opt) -> None:
             warp_configs = generate_warp_configs(tun_name, opt.warp, opt.mtu, opt.proxy)
         except RuntimeError as e:
             error_msg = str(e)
-            
+
             # Проверяем тип ошибки
             if "Ошибка WARP API" in error_msg:
                 # Проблема с доступом к API
@@ -3403,9 +3403,9 @@ def handle_makecfg(opt) -> None:
                 logger.error("❌ Не удалось сгенерировать WARP: что-то пошло не так")
                 logger.error("📝 Детали: %s", error_msg)
                 logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\", если не выйдет то без --warp")
-            
+
             raise RuntimeError("Генерация WARP не удалась — интерфейс не создан")
-        
+
         for c in warp_configs:
             logger.info("📄 WARP конфиг: %s", c)
         logger.info("✅ WARP конфиги сгенерированы")
