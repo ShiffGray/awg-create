@@ -2004,15 +2004,15 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     PF_PROTO="$second_last"
     PF_PORT_PROTO=$(echo "$MAIN_PART" | rev | cut -d':' -f3 | rev)
     CLIENT_IP=$(echo "$MAIN_PART" | rev | cut -d':' -f4- | rev)
-    SNAT_FLAG="SNAT"
+    SNAT_REQUESTED="SNAT"  # Запрошен ли SNAT в правиле
   else
     # Нет SNAT, PROTO = последнее
     PF_PROTO="$last_field"
     PF_PORT_PROTO="$second_last"
     CLIENT_IP=$(echo "$MAIN_PART" | rev | cut -d':' -f3- | rev)
-    SNAT_FLAG=""
+    SNAT_REQUESTED=""
   fi
-  
+
   # Проверяем протокол
   PF_PROTO_UPPER="${PF_PROTO^^}"
   if [ "$PF_PROTO_UPPER" != "TCP" ] && [ "$PF_PROTO_UPPER" != "UDP" ]; then
@@ -2028,13 +2028,13 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     cip="$(echo "$cip" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -n "$cip" ] && CLIENT_IP_ARRAY+=("$cip")
   done
-  
+
   # Если не указан ни один IP — ошибка
   if [ ${#CLIENT_IP_ARRAY[@]} -eq 0 ]; then
     echo "Ошибка: не указан клиентский IP в правиле '$rule'"
     continue
   fi
-  
+
   # Подготовка массива подсетей; если пусто — будем работать без фильтра -s/-d
   if [ -z "$ALLOWED_SUBNETS" ]; then
     USE_SUBNETS=0
@@ -2056,6 +2056,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
   [ -z "$PF_PORT_INT" ] && PF_PORT_INT="$PF_PORT_EXT"
 
   # Собираем уникальные SNAT правила (чтобы не дублировать)
+  # ВАЖНО: declare -A ПЕРЕД циклом, unset ПОСЛЕ цикла — для поддержки нескольких CLIENT_IP
   declare -A SNAT_RULES_ADDED
 
   # Проходим по всем CLIENT_IP (IPv4, IPv6 или оба)
@@ -2072,11 +2073,21 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         [[ "$subnet" == *:* ]] && FILTERED_SUBNETS+=("$subnet")
       done
 
-      # Если IPv6 серверный IP пустой — используем IPv4 (для SNAT)
-      [ -z "$SERVER_IP" ] && SERVER_IP="$LOCAL_SERVER_IP"
-      
+      # ВАЖНО: Если IPv6 серверный IP пустой — SNAT для IPv6 НЕ РАБОТАЕТ!
+      # Нельзя использовать IPv4 адрес для SNAT IPv6 трафика!
+      # SNAT_FLAG — локальная переменная для этого CLIENT_IP
+      if [ -z "$SERVER_IP" ]; then
+        echo "⚠️  Предупреждение: IPv6 SNAT отключен для $CLIENT_IP (нет IPv6 адреса сервера)"
+        SNAT_FLAG=""  # Отключаем SNAT для этого CLIENT_IP
+      else
+        # Используем SNAT_REQUESTED из правила
+        SNAT_FLAG="$SNAT_REQUESTED"
+      fi
+
       # Для DNAT IPv6 адреса нужно оборачивать в квадратные скобки: [IPv6]:port
       CLIENT_IP_DNAT="[$CLIENT_IP]"
+      # ВАЖНО: Уникальный ключ SNAT для IPv6 (чтобы не конфликтовал с IPv4)
+      SNAT_IP_PREFIX="ipv6:"
     else
       IPT_CMD="iptables"
       IP_VERSION="ipv4"
@@ -2087,9 +2098,13 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
       for subnet in "${SUBNETS_ARRAY[@]}"; do
         [[ "$subnet" != *:* ]] && FILTERED_SUBNETS+=("$subnet")
       done
-      
+
       # Для IPv4 квадратные скобки не нужны
       CLIENT_IP_DNAT="$CLIENT_IP"
+      # Уникальный ключ SNAT для IPv4
+      SNAT_IP_PREFIX="ipv4:"
+      # SNAT_FLAG для IPv4 — используем SNAT_REQUESTED из правила
+      SNAT_FLAG="$SNAT_REQUESTED"
     fi
 
     # Поддержка диапазонов портов: ext и int могут быть single или start-end
@@ -2111,7 +2126,8 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO
-              snat_key="${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
+              # ВАЖНО: Добавляем префикс ipv4:/ipv6 для уникальности между протоколами
+              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
               if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
                 SNAT_RULES_ADDED[$snat_key]=1
@@ -2123,7 +2139,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             # доступ всем — без -s / -d
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO
-            snat_key="${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
             if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
               SNAT_RULES_ADDED[$snat_key]=1
@@ -2150,7 +2166,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
-              snat_key="${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
+              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
               if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 SNAT_RULES_ADDED[$snat_key]=1
@@ -2161,7 +2177,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           else
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
-            snat_key="${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
             if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
               SNAT_RULES_ADDED[$snat_key]=1
@@ -2188,7 +2204,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
-              snat_key="${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
+              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
               if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 SNAT_RULES_ADDED[$snat_key]=1
@@ -2199,7 +2215,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           else
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
-            snat_key="${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
             if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
               SNAT_RULES_ADDED[$snat_key]=1
@@ -2222,7 +2238,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
-            snat_key="${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
             if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
               SNAT_RULES_ADDED[$snat_key]=1
@@ -2233,7 +2249,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         else
           $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
           # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
-          snat_key="${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
+          snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
           if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
             $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
             SNAT_RULES_ADDED[$snat_key]=1
@@ -2692,6 +2708,14 @@ if [ -f "$TUNNEL_PARAMS_FILE" ]; then
   PORT=$(grep "^PORT=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
   LOCAL_SUBNETS=$(grep "^LOCAL_SUBNETS=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
   MARK_BASE=$(grep "^MARK_BASE=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
+else
+  # .params файл не найден — пытаемся восстановить из имени скрипта
+  echo "⚠️  Файл параметров не найден: $TUNNEL_PARAMS_FILE"
+  echo "   Восстановление параметров из имени скрипта..."
+  TUN="$SCRIPT_NAME"
+  IFACE=""  # Не известен — очистка FORWARD будет пропущена
+  # MARK_BASE вычислим позже из имени туннеля
+  # LOCAL_SUBNETS не известен — очистка будет частичной
 fi
 
 # --- Настройка логирования ---
@@ -3446,11 +3470,15 @@ iptables -D FORWARD -i "$TUN" -o "$TUN" -j ACCEPT 2>/dev/null || true
 ip6tables -D FORWARD -i "$TUN" -o "$TUN" -j ACCEPT 2>/dev/null || true
 
 # Очищаем правила FORWARD для трафика напрямую через внешний интерфейс
-iptables -D FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-
-ip6tables -D FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
-ip6tables -D FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+# IFACE может быть пустым если .params файл не найден
+if [ -n "$IFACE" ]; then
+  iptables -D FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  ip6tables -D FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
+  ip6tables -D FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+else
+  echo "⚠️  Пропущено: очистка FORWARD для IFACE (не известен)"
+fi
 
 # POSTROUTING MASQUERADE не удаляем — он общий для всех туннелей (IPv4 и IPv6)
 
@@ -4733,8 +4761,17 @@ def handle_add(opt) -> None:
     if g_main_config_fn is None:
         get_main_config_path(check=True, override=opt.server_cfg)
 
+    # Проверка: существует ли конфиг сервера
+    if not g_main_config_fn.exists():
+        raise RuntimeError(f'Конфиг интерфейса не найден: {g_main_config_fn}. Сначала создайте интерфейс (--make)')
+
     cfg = WGConfig(str(g_main_config_fn))
     srv = cfg.iface
+    
+    # Проверка: есть ли в конфиге сервера Address (подсеть)
+    if not srv or 'Address' not in srv:
+        raise RuntimeError(f'В конфиге {g_main_config_fn} отсутствует подсеть (Address). Повредите конфиг или создайте интерфейс заново')
+    
     c_name = opt.addcl
     logger.info('👤 Создание нового пользователя "%s"...', c_name)
     if c_name.lower() in (x.lower() for x in cfg.peer.keys()):
@@ -5017,8 +5054,18 @@ def handle_add(opt) -> None:
 def handle_update(opt) -> None:
     if g_main_config_fn is None:
         get_main_config_path(check=True, override=opt.server_cfg)
+    
+    # Проверка: существует ли конфиг сервера
+    if not g_main_config_fn.exists():
+        raise RuntimeError(f'Конфиг интерфейса не найден: {g_main_config_fn}. Сначала создайте интерфейс (--make)')
+    
     cfg = WGConfig(str(g_main_config_fn))
     p_name = opt.update
+    
+    # Проверка: существует ли клиент
+    if p_name.lower() not in (x.lower() for x in cfg.peer.keys()):
+        raise RuntimeError(f'Клиент "{p_name}" не найден')
+    
     logger.info('🔄 Сброс ключей для "%s"...', p_name)
     priv_key, pub_key = gen_pair_keys()
     psk = gen_preshared_key()
@@ -5037,8 +5084,18 @@ def handle_update(opt) -> None:
 def handle_delete(opt) -> None:
     if g_main_config_fn is None:
         get_main_config_path(check=True, override=opt.server_cfg)
+    
+    # Проверка: существует ли конфиг сервера
+    if not g_main_config_fn.exists():
+        raise RuntimeError(f'Конфиг интерфейса не найден: {g_main_config_fn}. Сначала создайте интерфейс (--make)')
+    
     cfg = WGConfig(str(g_main_config_fn))
     p_name = opt.delete
+    
+    # Проверка: существует ли клиент
+    if p_name.lower() not in (x.lower() for x in cfg.peer.keys()):
+        raise RuntimeError(f'Клиент "{p_name}" не найден')
+    
     logger.info('🗑️  Удаление пользователя "%s"...', p_name)
     ipaddr = cfg.del_client(p_name)
     cfg.save()
