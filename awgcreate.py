@@ -877,13 +877,12 @@ for entry in "${WARP_LIST[@]}"; do
 done
 
 # Запускаем каждый уникальный WARP интерфейс
-# Используем файлы для отслеживания активных WARP (переменные в subshell не работают)
+# Reference counting + ПРЯМАЯ ПРОВЕРКА реального состояния интерфейса
 WARP_ACTIVE=0
 for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   echo "🚀 Запуск WARP-туннеля: $warp"
   WARP_REF_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.ref"
   WARP_LOCK_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.lock"
-  WARP_ACTIVE_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.active"
 
   # Используем flock для предотвращения race condition
   (
@@ -892,24 +891,44 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
       exit 1
     }
 
-    # Проверяем, запущен ли уже этот WARP
+    # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
+    WARP_RUNNING=0
+    if ip link show "$warp" &>/dev/null; then
+      if ip link show "$warp" | grep -q "state UP"; then
+        WARP_RUNNING=1
+      fi
+    fi
+
+    # Проверяем .ref файл
     if [ -f "$WARP_REF_FILE" ]; then
-      # WARP уже запущен, увеличиваем счётчик
       ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
-      echo $((ref_count + 1)) > "$WARP_REF_FILE"
+      
+      if [ "$WARP_RUNNING" -eq 1 ]; then
+        # WARP реально запущен и .ref существует — увеличиваем счётчик
+        echo $((ref_count + 1)) > "$WARP_REF_FILE"
+        echo "✅ WARP $warp уже запущен (ref=$ref_count → $((ref_count + 1)))"
+      else
+        # .ref есть но WARP НЕ запущен (после сбоя) — перезапускаем
+        echo "⚠️  WARP $warp не запущен при наличии .ref (ref=$ref_count) — перезапуск..."
+        rm -f "$WARP_REF_FILE"
+        if awg-quick up "$warp" 2>/dev/null; then
+          echo "1" > "$WARP_REF_FILE"
+        else
+          echo "Ошибка запуска $warp: $?"
+        fi
+      fi
     else
-      # Запускаем WARP впервые
-      if awg-quick up "$warp"; then
+      # .ref нет — запускаем WARP впервые
+      if awg-quick up "$warp" 2>/dev/null; then
         echo "1" > "$WARP_REF_FILE"
       else
         echo "Ошибка запуска $warp: $?"
       fi
     fi
   ) 200>"$WARP_LOCK_FILE"
-  
+
   # Проверяем, удалось ли запустить WARP (файл .ref существует)
   if [ -f "$WARP_REF_FILE" ]; then
-    touch "$WARP_ACTIVE_FILE"
     WARP_ACTIVE=1
   fi
 done
@@ -2868,7 +2887,7 @@ for entry in "${WARP_LIST[@]}"; do
 done
 
 # Останавливаем каждый уникальный WARP интерфейс
-# Используем файлы для отслеживания активных WARP (переменные в subshell не работают)
+# Reference counting + ПРЯМАЯ ПРОВЕРКА реального состояния интерфейса
 WARP_ACTIVE=0
 
 # СОХРАНЯЕМ список WARP интерфейсов ДО остановки (для последующей очистки!)
@@ -2889,51 +2908,65 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
       exit 1
     }
 
-    # Проверяем счётчик ссылок
+    # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
+    WARP_RUNNING=0
+    if ip link show "$warp" &>/dev/null; then
+      if ip link show "$warp" | grep -q "state UP"; then
+        WARP_RUNNING=1
+      fi
+    fi
+
+    # Проверяем .ref файл
     if [ -f "$WARP_REF_FILE" ]; then
       ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
+      
       if [ "$ref_count" -le 1 ]; then
-        # Последний пользователь, закрываем WARP
-        if awg-quick down "$warp" 2>/dev/null; then
-          : # WARP остановлен
+        # Последний пользователь — закрываем WARP (если он запущен)
+        if [ "$WARP_RUNNING" -eq 1 ]; then
+          if awg-quick down "$warp" 2>/dev/null; then
+            : # WARP остановлен
+          else
+            echo "Ошибка остановки $warp: $?"
+          fi
         else
-          echo "Ошибка остановки $warp: $?"
+          echo "⚠️  WARP $warp не запущен (ref=$ref_count) — только очистка .ref"
         fi
         rm -f "$WARP_REF_FILE"
       else
         # Уменьшаем счётчик
         echo $((ref_count - 1)) > "$WARP_REF_FILE"
+        echo "📋 WARP $warp используется другими туннелями (ref=$ref_count → $((ref_count - 1)))"
       fi
     else
-      # Файла нет, пробуем закрыть (на случай если счётчик потерялся)
-      if awg-quick down "$warp" 2>/dev/null; then
-        : # WARP остановлен
+      # .ref нет — проверяем запущен ли WARP и закрываем если да
+      if [ "$WARP_RUNNING" -eq 1 ]; then
+        echo "⚠️  WARP $warp запущен но .ref не найден — очистка..."
+        if awg-quick down "$warp" 2>/dev/null; then
+          : # WARP остановлен
+        else
+          echo "Ошибка остановки $warp: $?"
+        fi
       else
-        echo "Ошибка остановки $warp: $?"
+        echo "⚠️  WARP $warp не запущен и .ref не найден — пропускаем"
       fi
     fi
   ) 200>"$WARP_LOCK_FILE"
 
-  # Проверяем, удалось ли остановить WARP (файл .ref не существует)
-  if [ ! -f "$WARP_REF_FILE" ]; then
-    WARP_ACTIVE=1
-
-    # Очищаем маршруты и правила для этого WARP (только если ref=0!)
-    TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
-    if [ -n "$TABLE_ID" ]; then
-      ip route flush table "$TABLE_ID" 2>/dev/null || true
-    fi
-
-    # Очищаем FORWARD и NAT правила для этого WARP
-    # ВАЖНО: Правила созданы С -i "$TUN" для каждого туннеля!
-    iptables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
-
-    ip6tables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-    ip6tables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    ip6tables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
+  # Очищаем маршруты и правила для этого WARP
+  TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+  if [ -n "$TABLE_ID" ]; then
+    ip route flush table "$TABLE_ID" 2>/dev/null || true
   fi
+
+  # Очищаем FORWARD и NAT правила для этого WARP
+  # ВАЖНО: Правила созданы С -i "$TUN" для каждого туннеля!
+  iptables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
+
+  ip6tables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
+  ip6tables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  ip6tables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
 done
 
 # --- ЧИТАЕМ ПАРАМЕТРЫ СРАЗУ (до удаления .params)! ---
@@ -4928,11 +4961,15 @@ def handle_add(opt) -> None:
                 # Проверяем что IPv6 клиента в подсети сервера (если IPv6 подсеть есть)
                 if net_ipv6 and not manual_ip.subnet_of(net_ipv6):
                     raise RuntimeError(f'IPv6 адрес {manual_ip_str} не в подсети сервера {net_ipv6}')
-                
+
                 ip_int = int(manual_ip.network_address)
                 if ip_int in used_ips_ipv6:
                     raise RuntimeError(f'IPv6 адрес {manual_ip_str} уже используется')
-                
+
+                # Проверка: если сервер НЕ на network, broadcast (multicast) работает и зарезервирован
+                if net_ipv6 and not server_on_network_ipv6 and ip_int == int(net_ipv6.broadcast_address):
+                    raise RuntimeError(f'IPv6 адрес {manual_ip_str} зарезервирован для multicast (broadcast)')
+
                 ipaddr_ipv6 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
     else:
         # --- Автоматический выбор IP с учётом кратности подсетей ---
