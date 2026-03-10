@@ -173,14 +173,9 @@ LAN_ALLOW=(
 )
 # --- Пробросы портов ---
 PORT_FORWARDING_RULES=(
-  #"ЛокальныйIP:ВнешнийПорт[-Диапазон][>ВнутреннийПорт[-Диапазон]]:TCP/UDP[:SNAT][:Список_разрешённых_подсетей]"
+  #"ЛокальныйIPv4/+v6:ВнешнийПорт[-Диапазон][>ВнутреннийПорт[-Диапазон]][:[TCP]/+[UDP]][:SNAT][:Список_IPv4/+v6_подсетей]"
   #"10.1.0.1:80:TCP"
   #"10.1.0.2:443:TCP:SNAT"
-  #"10.1.0.3:8080:UDP:SNAT;192.168.0.1"
-  #"10.1.0.4:3000>3389:TCP:SNAT"
-  #"10.1.0.5:2000-2100>4000-4100:UDP"
-  #"10.1.0.6:8080:TCP;192.168.0.0/20, 10.0.0.0/23, 10.1.1.1:SNAT"
-  #"10.1.0.7:9000:UDP;10.1.0.0/24, 10.10.10.0/24"
 )
 
 # ================================================================
@@ -883,6 +878,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   echo "🚀 Запуск WARP-туннеля: $warp"
   WARP_REF_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.ref"
   WARP_LOCK_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.lock"
+  WARP_ACTIVE_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.active"
 
   # Используем flock для предотвращения race condition
   (
@@ -902,7 +898,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     # Проверяем .ref файл
     if [ -f "$WARP_REF_FILE" ]; then
       ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
-      
+
       if [ "$WARP_RUNNING" -eq 1 ]; then
         # WARP реально запущен и .ref существует — увеличиваем счётчик
         echo $((ref_count + 1)) > "$WARP_REF_FILE"
@@ -925,10 +921,15 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
         echo "Ошибка запуска $warp: $?"
       fi
     fi
+    
+    # ВАЖНО: Устанавливаем .active флаг ВНУТРИ блокировки
+    if [ -f "$WARP_REF_FILE" ]; then
+      touch "$WARP_ACTIVE_FILE"
+    fi
   ) 200>"$WARP_LOCK_FILE"
 
-  # Проверяем, удалось ли запустить WARP (файл .ref существует)
-  if [ -f "$WARP_REF_FILE" ]; then
+  # Проверяем .active файл (надёжнее чем .ref из-за гонки)
+  if [ -f "$WARP_ACTIVE_FILE" ]; then
     WARP_ACTIVE=1
   fi
 done
@@ -2282,8 +2283,14 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
       CLIENT_IP_DNAT="$CLIENT_IP"
       # Уникальный ключ SNAT для IPv4
       SNAT_IP_PREFIX="ipv4:"
-      # SNAT_FLAG для IPv4 — используем SNAT_REQUESTED из правила
-      SNAT_FLAG="$SNAT_REQUESTED"
+      # ВАЖНО: Если IPv4 серверный IP пустой — SNAT для IPv4 НЕ РАБОТАЕТ!
+      if [ -z "$SERVER_IP" ]; then
+        echo "⚠️  Предупреждение: IPv4 SNAT отключен для $CLIENT_IP (нет IPv4 адреса сервера)"
+        SNAT_FLAG=""  # Отключаем SNAT для этого CLIENT_IP
+      else
+        # Используем SNAT_REQUESTED из правила
+        SNAT_FLAG="$SNAT_REQUESTED"
+      fi
     fi
 
     # Поддержка диапазонов портов: ext и int могут быть single или start-end
@@ -3126,6 +3133,9 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   ip6tables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
   ip6tables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   ip6tables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
+
+  # Удаляем .active файл (используется для отслеживания в up.sh)
+  rm -f "$STATE_BASE_DIR/.warp/warp_${warp}.active" 2>/dev/null || true
 done
 
 # --- ЧИТАЕМ ПАРАМЕТРЫ СРАЗУ (до удаления .params)! ---
@@ -4869,7 +4879,8 @@ def handle_makecfg(opt) -> None:
 
     # --- ТЕПЕРЬ СОЗДАЁМ СЕРВЕРНЫЙ КОНФИГ И СКРИПТЫ ---
     priv, pub = gen_pair_keys(mtype)
-    random.seed()
+    # Используем более случайное семя для предотвращения одинаковых значений при быстром запуске
+    random.seed(time.time_ns() ^ os.getpid())
     jc = random.randint(80, 120)
     jmin = random.randint(48, 64)
     jmax = random.randint(jmin + 8, 80)
