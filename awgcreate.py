@@ -1990,7 +1990,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
   # Ищем подсети (содержат /) — они всегда в конце
   ALLOWED_SUBNETS=""
   MAIN_PART="$rule"
-  
+
   if [[ "$rule" == *"/"* ]]; then
     # Находим последнюю часть с / и всё после неё — подсети
     # Разделяем по : и ищем первую часть с /
@@ -2003,7 +2003,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         break
       fi
     done
-    
+
     # Собираем MAIN_PART (всё до подсетей)
     for ((i=0; i<SUBNET_START; i++)); do
       if [ $i -gt 0 ]; then
@@ -2011,7 +2011,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
       fi
       MAIN_PART+="${rule_parts[$i]}"
     done
-    
+
     # Собираем ALLOWED_SUBNETS (всё с подсетями)
     for ((i=SUBNET_START; i<${#rule_parts[@]}; i++)); do
       if [ $i -gt $SUBNET_START ]; then
@@ -2019,6 +2019,9 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
       fi
       ALLOWED_SUBNETS+="${rule_parts[$i]}"
     done
+    
+    # Удаляем trailing ':' из MAIN_PART (от обработки '::')
+    MAIN_PART="${MAIN_PART%:}"
   fi
 
   # Считаем количество ':' в основной части
@@ -2101,7 +2104,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     done
   }
 
-  # Определяем структуру: :PROTO:FLAGS или :PROTO или просто порт
+  # Определяем структуру: :PROTO:FLAGS или :PROTO или :FLAGS или просто порт
   PF_PROTO=""
   PF_PORT_PROTO=""
   CLIENT_IP=""
@@ -2109,20 +2112,49 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
   INTERFACE=""
 
   if is_flags "$last_field" && is_proto "$second_last"; then
-    # :PROTO:FLAGS
+    # :PROTO:FLAGS (без подсетей)
     parse_flags "$last_field"
     SNAT_REQUESTED="$PARSED_SNAT"
     INTERFACE="$PARSED_IFACE"
     PF_PROTO="$second_last"
     PF_PORT_PROTO="$third_last"
     CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-3;i++) printf "%s:", $i; print $(NF-3)}' | sed 's/:$//')
-  elif is_proto "$last_field"; then
-    # :PROTO (без FLAGS)
+  elif is_proto "$last_field" && [ -z "$ALLOWED_SUBNETS" ]; then
+    # :PROTO (без FLAGS, без подсетей)
     PF_PROTO="$last_field"
     PF_PORT_PROTO="$second_last"
     CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-2;i++) printf "%s:", $i; print $(NF-2)}' | sed 's/:$//')
+  elif is_flags "$last_field" && [ -z "$ALLOWED_SUBNETS" ]; then
+    # :FLAGS (без PROTO, без подсетей)
+    parse_flags "$last_field"
+    SNAT_REQUESTED="$PARSED_SNAT"
+    INTERFACE="$PARSED_IFACE"
+    PF_PROTO=""
+    PF_PORT_PROTO="$second_last"
+    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-2;i++) printf "%s:", $i; print $(NF-2)}' | sed 's/:$//')
+  elif is_proto "$second_last" && [ -n "$ALLOWED_SUBNETS" ]; then
+    # :PROTO:SUBNETS (FLAGS не указаны)
+    PF_PROTO="$second_last"
+    PF_PORT_PROTO="$third_last"
+    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-3;i++) printf "%s:", $i; print $(NF-3)}' | sed 's/:$//')
+  elif is_flags "$second_last" && [ -n "$ALLOWED_SUBNETS" ]; then
+    # :FLAGS:SUBNETS (PROTO не указан)
+    parse_flags "$second_last"
+    SNAT_REQUESTED="$PARSED_SNAT"
+    INTERFACE="$PARSED_IFACE"
+    PF_PROTO=""
+    PF_PORT_PROTO="$third_last"
+    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-3;i++) printf "%s:", $i; print $(NF-3)}' | sed 's/:$//')
+  elif is_proto "$third_last" && is_flags "$second_last" && [ -n "$ALLOWED_SUBNETS" ]; then
+    # :PROTO:FLAGS:SUBNETS (полный формат)
+    parse_flags "$second_last"
+    SNAT_REQUESTED="$PARSED_SNAT"
+    INTERFACE="$PARSED_IFACE"
+    PF_PROTO="$third_last"
+    PF_PORT_PROTO="$fourth_last"
+    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-4;i++) printf "%s:", $i; print $(NF-4)}' | sed 's/:$//')
   else
-    # Без протокола (последнее поле - порт)
+    # Без протокола и FLAGS (последнее поле - порт)
     PF_PROTO=""
     PF_PORT_PROTO="$last_field"
     CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-1;i++) printf "%s:", $i; print $(NF-1)}' | sed 's/:$//')
