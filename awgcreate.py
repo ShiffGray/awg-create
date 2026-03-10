@@ -1266,11 +1266,12 @@ ip6tables -t filter -N "$PF_CHAIN_FILTER" 2>/dev/null || true
 ip6tables -t nat -N "$PF_CHAIN_SNAT" 2>/dev/null || true
 
 # Добавляем правила PREROUTING для ВСЕХ интерфейсов (универсально, без привязки к туннелям!)
-# Это позволяет клиентам любых VPN (и не-VPN) подключаться к проброшенным портам
+# ВАЖНО: Проверяем что ссылка ещё не добавлена (защита от дубликатов!)
 iptables -t nat -C PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || iptables -t nat -A PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
 ip6tables -t nat -C PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || ip6tables -t nat -A PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
 
 # FORWARD и POSTROUTING для текущего туннеля
+# ВАЖНО: Проверяем что ссылка ещё не добавлена (защита от дубликатов!)
 iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
 iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 ip6tables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || ip6tables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
@@ -1978,69 +1979,193 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
 fi
 
 # --- Добавление правил для каждого проброса ---
-for rule in "${PORT_FORWARDING_RULES[@]}"; do
-  # Разбор правила: парсим с конца, чтобы поддержать IPv6 адреса
-  # Формат: CLIENT_IP:PORT[>PORT]:PROTO[:SNAT][;SUBNETS]
-  # IPv6 адреса содержат ':', поэтому SUBNETS отделяется ';' от остальных полей
-  # Примеры:
-  #   "10.1.0.5:80:TCP:SNAT" — без подсетей
-  #   "10.1.0.5:80:TCP:SNAT;192.168.0.0/24" — с IPv4 подсетями
-  #   "10.1.0.5:80:TCP:SNAT;2a01:e5c0:52cc::/48" — с IPv6 подсетями
-  #   "10.1.0.5:80:TCP;192.168.0.0/24, 2a01:e5c0:52cc::/48" — с несколькими подсетями без SNAT
+# Глобальная SNAT дедупликация (между всеми правилами и протоколами)
+declare -A GLOBAL_SNAT_RULES_ADDED
 
-  # Сначала разделяем по ';' чтобы отделить SUBNETS от остальных полей
-  if [[ "$rule" == *";"* ]]; then
-    # Есть разделитель ';' — разделяем основную часть и SUBNETS
-    MAIN_PART="${rule%%;*}"
-    ALLOWED_SUBNETS="${rule#*;}"
-  else
-    # Нет разделителя ';' — всё правило в основной части
-    MAIN_PART="$rule"
-    ALLOWED_SUBNETS=""
+for rule in "${PORT_FORWARDING_RULES[@]}"; do
+  # Разбор правила: новый формат CLIENT_IP:PORT[>PORT]:PROTO[:FLAGS][:SUBNETS]
+  # FLAGS: SNAT,интерфейс или интерфейс,SNAT (порядок не важен)
+  # Подсети через : (содержат /)
+  
+  # Ищем подсети (содержат /) — они всегда в конце
+  ALLOWED_SUBNETS=""
+  MAIN_PART="$rule"
+  
+  if [[ "$rule" == *"/"* ]]; then
+    # Находим последнюю часть с / и всё после неё — подсети
+    # Разделяем по : и ищем первую часть с /
+    IFS=':' read -ra rule_parts <<< "$rule"
+    MAIN_PART=""
+    SUBNET_START=0
+    for i in "${!rule_parts[@]}"; do
+      if [[ "${rule_parts[$i]}" == *"/"* ]]; then
+        SUBNET_START=$i
+        break
+      fi
+    done
+    
+    # Собираем MAIN_PART (всё до подсетей)
+    for ((i=0; i<SUBNET_START; i++)); do
+      if [ $i -gt 0 ]; then
+        MAIN_PART+=":"
+      fi
+      MAIN_PART+="${rule_parts[$i]}"
+    done
+    
+    # Собираем ALLOWED_SUBNETS (всё с подсетями)
+    for ((i=SUBNET_START; i<${#rule_parts[@]}; i++)); do
+      if [ $i -gt $SUBNET_START ]; then
+        ALLOWED_SUBNETS+=":"
+      fi
+      ALLOWED_SUBNETS+="${rule_parts[$i]}"
+    done
   fi
 
-  # Считаем количество ':' в основной части (без SUBNETS)
+  # Считаем количество ':' в основной части
   colon_count=$(echo "$MAIN_PART" | tr -cd ':' | wc -c)
 
-  # Определяем позиции полей с конца
-  # Последние поле: SNAT (опционально)
-  # Предпоследнее: PROTO (TCP/UDP)
-  # Пред-предпоследнее: PORT[>PORT]
-  # Всё остальное в начале: CLIENT_IP (может быть IPv6)
-
-  if [ "$colon_count" -lt 2 ]; then
-    echo "Ошибка: неверный формат правила '$rule' (минимум CLIENT_IP:PORT:PROTO)"
+  if [ "$colon_count" -lt 1 ]; then
+    echo "Ошибка: неверный формат правила '$rule' (минимум CLIENT_IP:PORT)"
     continue
   fi
 
-  # Извлекаем поля из основной части (без SUBNETS)
-  last_field=$(echo "$MAIN_PART" | rev | cut -d':' -f1 | rev)
-  second_last=$(echo "$MAIN_PART" | rev | cut -d':' -f2 | rev)
+  # Извлекаем поля через awk (работает в Git Bash)
+  last_field=$(echo "$MAIN_PART" | awk -F: '{print $NF}')
+  second_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-1)}')
+  third_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-2)}')
+  fourth_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-3)}')
 
-  # Определяем где PROTO и SNAT
-  if [ "${last_field^^}" = "SNAT" ]; then
-    # :SNAT в конце основной части
+  # Функция проверки является ли поле протоколом
+  is_proto() {
+    local s="$1"
+    local s_upper="${s^^}"
+    if [ "$s_upper" = "TCP" ] || [ "$s_upper" = "UDP" ]; then
+      return 0
+    fi
+    if [[ "$s_upper" == *","* ]]; then
+      IFS=',' read -ra proto_parts <<< "$s_upper"
+      for p in "${proto_parts[@]}"; do
+        p="${p// /}"
+        if [ "$p" != "TCP" ] && [ "$p" != "UDP" ]; then
+          return 1
+        fi
+      done
+      return 0
+    fi
+    return 1
+  }
+
+  # Функция проверки является ли поле валидным именем интерфейса
+  is_valid_interface() {
+    local s="$1"
+    if [ -z "$s" ]; then return 1; fi
+    if [ "${s^^}" = "SNAT" ]; then return 1; fi
+    if ! [[ "$s" =~ [a-zA-Z] ]]; then return 1; fi
+    if [[ "$s" =~ ^[a-zA-Z0-9_]+$ ]]; then return 0; fi
+    return 1
+  }
+
+  # Функция проверки является ли поле FLAGS
+  is_flags() {
+    local s="$1"
+    local s_upper="${s^^}"
+    if [ "$s_upper" = "SNAT" ]; then return 0; fi
+    if [[ "$s" == *","* ]]; then
+      IFS=',' read -ra flag_parts <<< "$s"
+      for part in "${flag_parts[@]}"; do
+        part="${part// /}"
+        part_upper="${part^^}"
+        if [ "$part_upper" = "SNAT" ]; then continue; fi
+        if ! is_valid_interface "$part"; then return 1; fi
+      done
+      return 0
+    fi
+    if is_valid_interface "$s"; then return 0; fi
+    return 1
+  }
+
+  # Функция парсинга FLAGS
+  parse_flags() {
+    local s="$1"
+    PARSED_SNAT=""
+    PARSED_IFACE=""
+    IFS=',' read -ra flag_parts <<< "$s"
+    for part in "${flag_parts[@]}"; do
+      part="${part// /}"
+      part_upper="${part^^}"
+      if [ "$part_upper" = "SNAT" ]; then
+        PARSED_SNAT="SNAT"
+      elif [ -n "$part" ]; then
+        PARSED_IFACE="$part"
+      fi
+    done
+  }
+
+  # Определяем структуру: :PROTO:FLAGS или :PROTO или просто порт
+  PF_PROTO=""
+  PF_PORT_PROTO=""
+  CLIENT_IP=""
+  SNAT_REQUESTED=""
+  INTERFACE=""
+
+  if is_flags "$last_field" && is_proto "$second_last"; then
+    # :PROTO:FLAGS
+    parse_flags "$last_field"
+    SNAT_REQUESTED="$PARSED_SNAT"
+    INTERFACE="$PARSED_IFACE"
     PF_PROTO="$second_last"
-    PF_PORT_PROTO=$(echo "$MAIN_PART" | rev | cut -d':' -f3 | rev)
-    CLIENT_IP=$(echo "$MAIN_PART" | rev | cut -d':' -f4- | rev)
-    SNAT_REQUESTED="SNAT"  # Запрошен ли SNAT в правиле
-  else
-    # Нет SNAT, PROTO = последнее
+    PF_PORT_PROTO="$third_last"
+    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-3;i++) printf "%s:", $i; print $(NF-3)}' | sed 's/:$//')
+  elif is_proto "$last_field"; then
+    # :PROTO (без FLAGS)
     PF_PROTO="$last_field"
     PF_PORT_PROTO="$second_last"
-    CLIENT_IP=$(echo "$MAIN_PART" | rev | cut -d':' -f3- | rev)
-    SNAT_REQUESTED=""
+    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-2;i++) printf "%s:", $i; print $(NF-2)}' | sed 's/:$//')
+  else
+    # Без протокола (последнее поле - порт)
+    PF_PROTO=""
+    PF_PORT_PROTO="$last_field"
+    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-1;i++) printf "%s:", $i; print $(NF-1)}' | sed 's/:$//')
   fi
 
-  # Проверяем протокол
-  PF_PROTO_UPPER="${PF_PROTO^^}"
-  if [ "$PF_PROTO_UPPER" != "TCP" ] && [ "$PF_PROTO_UPPER" != "UDP" ]; then
-    echo "Ошибка: неверный протокол '$PF_PROTO' в правиле '$rule' (должен быть TCP или UDP)"
+  # Обработка протокола
+  if [ -z "$PF_PROTO" ]; then
+    PF_PROTOCOLS=("TCP" "UDP")
+  else
+    PF_PROTOCOLS=()
+    IFS=',' read -ra proto_parts <<< "$PF_PROTO"
+    for p in "${proto_parts[@]}"; do
+      p="${p// /}"
+      p_upper="${p^^}"
+      if [ "$p_upper" = "TCP" ] || [ "$p_upper" = "UDP" ]; then
+        # Проверяем дубликаты
+        found=0
+        for existing in "${PF_PROTOCOLS[@]}"; do
+          [ "$existing" = "$p_upper" ] && found=1 && break
+        done
+        [ $found -eq 0 ] && PF_PROTOCOLS+=("$p_upper")
+      fi
+    done
+    if [ ${#PF_PROTOCOLS[@]} -eq 0 ]; then
+      PF_PROTOCOLS=("TCP" "UDP")
+    fi
+  fi
+
+  # Проверка на пустой порт
+  if [ -z "$PF_PORT_PROTO" ] || [ "$PF_PORT_PROTO" = ">" ]; then
+    echo "Ошибка: пустой порт в правиле '$rule'"
+    continue
+  fi
+
+  # Проверка что порт это число или диапазон
+  port_check="${PF_PORT_PROTO//-/}"
+  port_check="${port_check//>/}"
+  if ! [[ "$port_check" =~ ^[0-9]+$ ]]; then
+    echo "Ошибка: неверный порт '$PF_PORT_PROTO' в правиле '$rule'"
     continue
   fi
 
   # Поддержка списка CLIENT_IP через запятую (IPv4, IPv6 или оба)
-  # Формат: "10.1.0.5" или "fd00::5" или "10.1.0.5, fd00::5"
   CLIENT_IP_ARRAY=()
   IFS=',' read -ra RAW_CLIENT_IPS <<< "$CLIENT_IP"
   for cip in "${RAW_CLIENT_IPS[@]}"; do
@@ -2048,19 +2173,18 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     [ -n "$cip" ] && CLIENT_IP_ARRAY+=("$cip")
   done
 
-  # Если не указан ни один IP — ошибка
   if [ ${#CLIENT_IP_ARRAY[@]} -eq 0 ]; then
     echo "Ошибка: не указан клиентский IP в правиле '$rule'"
     continue
   fi
 
-  # Подготовка массива подсетей; если пусто — будем работать без фильтра -s/-d
+  # Подготовка массива подсетей
   if [ -z "$ALLOWED_SUBNETS" ]; then
     USE_SUBNETS=0
     ALLOWED_SUBNETS_DISPLAY="ALL"
+    SUBNETS_ARRAY=()
   else
     USE_SUBNETS=1
-    # Разбиваем по запятой и обрезаем пробелы
     SUBNETS_ARRAY=()
     IFS=',' read -ra RAW_SUBNETS <<< "$ALLOWED_SUBNETS"
     for s in "${RAW_SUBNETS[@]}"; do
@@ -2070,16 +2194,20 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     ALLOWED_SUBNETS_DISPLAY="$ALLOWED_SUBNETS"
   fi
 
-  # Разбор внешнего/внутреннего портов с опцией диапазонов
+  # Разбор внешнего/внутреннего портов
   IFS='>' read -r PF_PORT_EXT PF_PORT_INT <<< "$PF_PORT_PROTO"
   [ -z "$PF_PORT_INT" ] && PF_PORT_INT="$PF_PORT_EXT"
 
-  # Собираем уникальные SNAT правила (чтобы не дублировать)
-  # ВАЖНО: declare -A ПЕРЕД циклом, unset ПОСЛЕ цикла — для поддержки нескольких CLIENT_IP
-  declare -A SNAT_RULES_ADDED
+  # Определяем опцию интерфейса если указан
+  IFACE_OPT=""
+  if [ -n "$INTERFACE" ]; then
+    IFACE_OPT="-i $INTERFACE"
+  fi
 
-  # Проходим по всем CLIENT_IP (IPv4, IPv6 или оба)
-  for CLIENT_IP in "${CLIENT_IP_ARRAY[@]}"; do
+  # Проходим по всем протоколам (TCP и/или UDP)
+  for PF_PROTO in "${PF_PROTOCOLS[@]}"; do
+    # Проходим по всем CLIENT_IP (IPv4, IPv6 или оба)
+    for CLIENT_IP in "${CLIENT_IP_ARRAY[@]}"; do
     # Определяем тип CLIENT_IP (IPv4 или IPv6)
     if [[ "$CLIENT_IP" == *:* ]]; then
       IPT_CMD="ip6tables"
@@ -2143,25 +2271,25 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           INT_PORT=$((PF_PORT_INT_START + i))
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
-              # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
+              # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
               # ВАЖНО: Добавляем префикс ipv4:/ipv6 для уникальности между протоколами
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
-              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
-                SNAT_RULES_ADDED[$snat_key]=1
+                GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
             # доступ всем — без -s / -d
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
-            # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
+            # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
-              SNAT_RULES_ADDED[$snat_key]=1
+              GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -j ACCEPT
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -2183,23 +2311,23 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
-                SNAT_RULES_ADDED[$snat_key]=1
+                GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j ACCEPT
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
-              SNAT_RULES_ADDED[$snat_key]=1
+              GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -j ACCEPT
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -2221,23 +2349,23 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
-                SNAT_RULES_ADDED[$snat_key]=1
+                GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j ACCEPT
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
-              SNAT_RULES_ADDED[$snat_key]=1
+              GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -j ACCEPT
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -2255,23 +2383,23 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     # 4. Оба не диапазоны (single-port)
     if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
           for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
-              SNAT_RULES_ADDED[$snat_key]=1
+              GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -s "$ALLOWED_SUBNET" -j ACCEPT
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
           done
         else
-          $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+          $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
           # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
           snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
-          if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${SNAT_RULES_ADDED[$snat_key]}" ]; then
+          if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
             $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
-            SNAT_RULES_ADDED[$snat_key]=1
+            GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
           fi
           $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -j ACCEPT
           $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -2285,7 +2413,6 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     # Конец обработки всех вариантов портов
   done
   # Конец цикла по CLIENT_IP_ARRAY
-  unset SNAT_RULES_ADDED
 done
 # Конец цикла по PORT_FORWARDING_RULES
 
@@ -3299,30 +3426,49 @@ done
 # IPv4 + IPv6 очистка
 echo "🧹 Очистка проброса портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_SNAT, $PF_CHAIN_FILTER)"
 
-# IPv4 проброс портов (очищаем правило БЕЗ -i так как добавляли без него!)
+# СНАЧАЛА удаляем ссылки из глобальных цепочек (IPv4 + IPv6)
+echo "   Удаление ссылок из PREROUTING, FORWARD, POSTROUTING..."
+
+# PREROUTING → PF_CHAIN_NAT
 iptables -t nat -D PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
-iptables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
-iptables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
-
-iptables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
-iptables -t nat -F "$PF_CHAIN_SNAT" 2>/dev/null || true
-iptables -t nat -X "$PF_CHAIN_SNAT" 2>/dev/null || true
-
-iptables -t filter -D FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
-iptables -t filter -F "$PF_CHAIN_FILTER" 2>/dev/null || true
-iptables -t filter -X "$PF_CHAIN_FILTER" 2>/dev/null || true
-
-# IPv6 проброс портов (очищаем правило БЕЗ -i так как добавляли без него!)
 ip6tables -t nat -D PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
+
+# FORWARD → PF_CHAIN_FILTER
+iptables -t filter -D FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+ip6tables -t filter -D FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+
+# POSTROUTING → PF_CHAIN_SNAT
+iptables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
+ip6tables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
+
+# ПОТОМ очищаем цепочки (IPv4 + IPv6)
+echo "   Очистка цепочек..."
+
+# PF_CHAIN_NAT
+iptables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
 ip6tables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
+
+# PF_CHAIN_SNAT
+iptables -t nat -F "$PF_CHAIN_SNAT" 2>/dev/null || true
+ip6tables -t nat -F "$PF_CHAIN_SNAT" 2>/dev/null || true
+
+# PF_CHAIN_FILTER
+iptables -t filter -F "$PF_CHAIN_FILTER" 2>/dev/null || true
+ip6tables -t filter -F "$PF_CHAIN_FILTER" 2>/dev/null || true
+
+# В КОНЦЕ удаляем цепочки (IPv4 + IPv6)
+echo "   Удаление цепочек..."
+
+# PF_CHAIN_NAT
+iptables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
 ip6tables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
 
-ip6tables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
-ip6tables -t nat -F "$PF_CHAIN_SNAT" 2>/dev/null || true
+# PF_CHAIN_SNAT
+iptables -t nat -X "$PF_CHAIN_SNAT" 2>/dev/null || true
 ip6tables -t nat -X "$PF_CHAIN_SNAT" 2>/dev/null || true
 
-ip6tables -t filter -D FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
-ip6tables -t filter -F "$PF_CHAIN_FILTER" 2>/dev/null || true
+# PF_CHAIN_FILTER
+iptables -t filter -X "$PF_CHAIN_FILTER" 2>/dev/null || true
 ip6tables -t filter -X "$PF_CHAIN_FILTER" 2>/dev/null || true
 
 # --- Очистка FORWARD и NAT для трафика напрямую через внешний интерфейс ---
