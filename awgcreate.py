@@ -288,7 +288,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   fi
   echo ""
   echo "   ip rule (fwmark → table):"
-  ip rule show 2>/dev/null | grep -E "fwmark $MARK_BASE" || echo "   (нет правил с fwmark $MARK_BASE)"
+  echo "   IPv4:"
+  ip rule show 2>/dev/null | grep -E "fwmark $MARK_BASE" || echo "     (нет правил с fwmark $MARK_BASE)"
+  echo "   IPv6:"
+  ip -6 rule show 2>/dev/null | grep -E "fwmark $MARK_BASE" || echo "     (нет правил с fwmark $MARK_BASE)"
   echo ""
   echo "   Маршруты по таблицам WARP:"
   for warp_entry in "${WARP_LIST[@]}"; do
@@ -299,7 +302,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
         table_id=$(grep -E "^[0-9]+[[:space:]]+${warp_iface}$" /etc/iproute2/rt_tables 2>/dev/null | cut -d' ' -f1)
         if [ -n "$table_id" ]; then
           echo "   $warp_iface (table $table_id):"
-          ip route show table "$table_id" 2>/dev/null || echo "     (нет маршрутов)"
+          echo "     IPv4:"
+          ip route show table "$table_id" 2>/dev/null | head -5 || echo "     (нет маршрутов)"
+          echo "     IPv6:"
+          ip -6 route show table "$table_id" 2>/dev/null | head -5 || echo "     (нет маршрутов)"
         fi
       fi
     fi
@@ -1161,11 +1167,17 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
       warp_iface="${WARP_GROUP[$i]}"
       TABLE_ID="${WARP_TABLE_IDS[$warp_iface]}"
       if [ -n "$TABLE_ID" ]; then
-        # Проверяем, существует ли уже правило (с проверкой что ip rule show выполнился успешно)
+        # Проверяем, существует ли уже правило IPv4
         if ip rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
-          : # Правило уже существует
+          : # IPv4 правило уже существует
         else
           ip rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        fi
+        # Проверяем, существует ли уже правило IPv6
+        if ip -6 rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
+          : # IPv6 правило уже существует
+        else
+          ip -6 rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
         fi
       fi
     done
@@ -1181,10 +1193,17 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
       warp_iface="${DEFAULT_WARP_GROUP[$i]}"
       TABLE_ID="${WARP_TABLE_IDS[$warp_iface]}"
       if [ -n "$TABLE_ID" ]; then
+        # Проверяем, существует ли уже правило IPv4
         if ip rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
-          : # Правило уже существует
+          : # IPv4 правило уже существует
         else
           ip rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        fi
+        # Проверяем, существует ли уже правило IPv6
+        if ip -6 rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
+          : # IPv6 правило уже существует
+        else
+          ip -6 rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
         fi
       fi
     done
@@ -3360,26 +3379,33 @@ if [ ${#STOPPED_WARP_INTERFACES[@]} -gt 0 ]; then
       continue
     fi
 
-    # Удаляем ip rule для каждого MARK в группе
+    # Удаляем ip rule для каждого MARK в группе (IPv4 и IPv6)
     for i in $(seq 0 $((WARP_GROUP_COUNT-1))); do
       MARK=$((MARK_BASE + MARK_OFFSET + i))
       warp_iface="${WARP_GROUP[$i]}"
       # Получаем TABLE_ID из rt_tables (так же как в up.sh)
       TABLE_ID=$(awk -v name="$warp_iface" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
       if [ -n "$TABLE_ID" ]; then
+        # Удаляем IPv4 правило
         ip rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Удаляем IPv6 правило
+        ip -6 rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Удаляем маршрут
         ip route del default dev "$warp_iface" table "$TABLE_ID" 2>/dev/null || true
+        ip -6 route del default dev "$warp_iface" table "$TABLE_ID" 2>/dev/null || true
       else
         # Fallback: пробуем удалить по имени интерфейса
         ip rule del fwmark $MARK table "$warp_iface" 2>/dev/null || true
+        ip -6 rule del fwmark $MARK table "$warp_iface" 2>/dev/null || true
         ip route del default dev "$warp_iface" table "$warp_iface" 2>/dev/null || true
+        ip -6 route del default dev "$warp_iface" table "$warp_iface" 2>/dev/null || true
       fi
     done
 
     MARK_OFFSET=$((MARK_OFFSET + WARP_GROUP_COUNT))
   done
 
-  # --- Удаляем ip rule для интерфейсов БЕЗ подсетей ---
+  # --- Удаляем ip rule для интерфейсов БЕЗ подсетей (IPv4 и IPv6) ---
   DEFAULT_WARP_COUNT=${#DEFAULT_WARP_GROUP[@]}
   if [ "$DEFAULT_WARP_COUNT" -gt 0 ]; then
     for i in $(seq 0 $((DEFAULT_WARP_COUNT-1))); do
@@ -3388,8 +3414,13 @@ if [ ${#STOPPED_WARP_INTERFACES[@]} -gt 0 ]; then
       # Получаем TABLE_ID из rt_tables
       TABLE_ID=$(awk -v name="$warp_iface" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
       if [ -n "$TABLE_ID" ]; then
+        # Удаляем IPv4 правило
         ip rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Удаляем IPv6 правило
+        ip -6 rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Удаляем маршрут
         ip route del default dev "$warp_iface" table "$TABLE_ID" 2>/dev/null || true
+        ip -6 route del default dev "$warp_iface" table "$TABLE_ID" 2>/dev/null || true
       fi
     done
   fi
