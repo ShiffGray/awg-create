@@ -138,8 +138,6 @@ PublicKey = <WARP_PEER_PUBLIC_KEY>
 AllowedIPs = 0.0.0.0/0, ::/0
 """
 
-# Шаблоны up/down с поддержкой WARP
-
 # Шаблон для файла параметров (awg10.sh)
 params_script_template = r'''#!/bin/bash
 #set -x
@@ -473,6 +471,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 fi
 '''
 
+# Шаблоны up/down с поддержкой WARP
 up_script_template_warp = r'''#!/bin/bash
 
 # --- Опеределение пути и имени---
@@ -2105,66 +2104,114 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     continue
   fi
 
-  # Извлекаем поля через awk (работает в Git Bash)
-  last_field=$(echo "$MAIN_PART" | awk -F: '{print $NF}')
-  second_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-1)}')
-  third_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-2)}')
-  fourth_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-3)}')
-
-  # Определяем структуру: :PROTO:FLAGS или :PROTO или :FLAGS или просто порт
+  # Разбираем MAIN_PART с конца — ищем порт, протокол, FLAGS
+  # Формат: CLIENT_IP:PORT[:PROTO][:FLAGS]
+  # CLIENT_IP может быть IPv4, IPv6 или список через запятую
+  # PORT может быть диапазоном: 80-90 или 80>8080
+  # PROTO: TCP, UDP или TCP,UDP
+  # FLAGS: SNAT, интерфейс или SNAT,interface
+  
   PF_PROTO=""
   PF_PORT_PROTO=""
   CLIENT_IP=""
   SNAT_REQUESTED=""
   INTERFACE=""
-
-  if is_flags "$last_field" && is_proto "$second_last"; then
-    # :PROTO:FLAGS (без подсетей)
-    parse_flags "$last_field"
+  
+  # Разбиваем MAIN_PART по ':' и собираем поля с конца
+  IFS=':' read -ra FIELDS <<< "$MAIN_PART"
+  NUM_FIELDS=${#FIELDS[@]}
+  
+  # Минимум 2 поля: CLIENT_IP:PORT
+  if [ $NUM_FIELDS -lt 2 ]; then
+    echo "Ошибка: неверный формат правила '$rule' (минимум CLIENT_IP:PORT)"
+    continue
+  fi
+  
+  # Последнее поле — проверяем на FLAGS (SNAT или имя интерфейса)
+  LAST_IDX=$((NUM_FIELDS - 1))
+  LAST_FIELD="${FIELDS[$LAST_IDX]}"
+  
+  # Предпоследнее поле — проверяем на протокол или порт
+  PREV_IDX=$((NUM_FIELDS - 2))
+  PREV_FIELD="${FIELDS[$PREV_IDX]}"
+  
+  # Проверяем является ли поле протоколом
+  is_proto_field() {
+    local f="$1"
+    local f_upper=$(echo "$f" | tr '[:lower:]' '[:upper:]')
+    [ "$f_upper" = "TCP" ] || [ "$f_upper" = "UDP" ] || [ "$f_upper" = "TCP,UDP" ] || [ "$f_upper" = "UDP,TCP" ]
+  }
+  
+  # Проверяем является ли поле FLAGS (SNAT или интерфейс)
+  is_flags_field() {
+    local f="$1"
+    local f_upper=$(echo "$f" | tr '[:lower:]' '[:upper:]')
+    # SNAT
+    [ "$f_upper" = "SNAT" ] && return 0
+    # Интерфейс (содержит буквы, не содержит цифр и /)
+    [[ "$f" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] && return 0
+    # SNAT,interface или interface,SNAT
+    [[ "$f_upper" == *"SNAT"* ]] && [[ "$f" =~ [a-zA-Z] ]] && return 0
+    return 1
+  }
+  
+  # Проверяем является ли поле портом (содержит цифры, может содержать - и >)
+  is_port_field() {
+    local f="$1"
+    local f_check="${f//-/}"
+    f_check="${f_check//>/}"
+    [[ "$f_check" =~ ^[0-9]+$ ]]
+  }
+  
+  # Парсим с конца
+  if is_flags_field "$LAST_FIELD"; then
+    # Последнее поле — FLAGS
+    parse_flags "$LAST_FIELD"
     SNAT_REQUESTED="$PARSED_SNAT"
     INTERFACE="$PARSED_IFACE"
-    PF_PROTO="$second_last"
-    PF_PORT_PROTO="$third_last"
-    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-3;i++) printf "%s:", $i; print $(NF-3)}' | sed 's/:$//')
-  elif is_proto "$last_field" && [ -z "$ALLOWED_SUBNETS" ]; then
-    # :PROTO (без FLAGS, без подсетей)
-    PF_PROTO="$last_field"
-    PF_PORT_PROTO="$second_last"
-    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-2;i++) printf "%s:", $i; print $(NF-2)}' | sed 's/:$//')
-  elif is_flags "$last_field" && [ -z "$ALLOWED_SUBNETS" ]; then
-    # :FLAGS (без PROTO, без подсетей)
-    parse_flags "$last_field"
-    SNAT_REQUESTED="$PARSED_SNAT"
-    INTERFACE="$PARSED_IFACE"
-    PF_PROTO=""
-    PF_PORT_PROTO="$second_last"
-    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-2;i++) printf "%s:", $i; print $(NF-2)}' | sed 's/:$//')
-  elif is_proto "$second_last" && [ -n "$ALLOWED_SUBNETS" ]; then
-    # :PROTO:SUBNETS (FLAGS не указаны)
-    PF_PROTO="$second_last"
-    PF_PORT_PROTO="$third_last"
-    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-3;i++) printf "%s:", $i; print $(NF-3)}' | sed 's/:$//')
-  elif is_flags "$second_last" && [ -n "$ALLOWED_SUBNETS" ]; then
-    # :FLAGS:SUBNETS (PROTO не указан)
-    parse_flags "$second_last"
-    SNAT_REQUESTED="$PARSED_SNAT"
-    INTERFACE="$PARSED_IFACE"
-    PF_PROTO=""
-    PF_PORT_PROTO="$third_last"
-    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-3;i++) printf "%s:", $i; print $(NF-3)}' | sed 's/:$//')
-  elif is_proto "$third_last" && is_flags "$second_last" && [ -n "$ALLOWED_SUBNETS" ]; then
-    # :PROTO:FLAGS:SUBNETS (полный формат)
-    parse_flags "$second_last"
-    SNAT_REQUESTED="$PARSED_SNAT"
-    INTERFACE="$PARSED_IFACE"
-    PF_PROTO="$third_last"
-    PF_PORT_PROTO="$fourth_last"
-    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-4;i++) printf "%s:", $i; print $(NF-4)}' | sed 's/:$//')
+    
+    if is_proto_field "$PREV_FIELD"; then
+      # :PORT:PROTO:FLAGS
+      PF_PROTO="$PREV_FIELD"
+      # Порт — всё что между CLIENT_IP и PROTO
+      PF_PORT_PROTO="${FIELDS[$((NUM_FIELDS - 3))]}"
+      # CLIENT_IP — всё до порта
+      CLIENT_IP=""
+      for ((i=0; i<NUM_FIELDS-3; i++)); do
+        [ $i -gt 0 ] && CLIENT_IP+=":"
+        CLIENT_IP+="${FIELDS[$i]}"
+      done
+    else
+      # :PORT:FLAGS (без протокола)
+      PF_PROTO=""
+      PF_PORT_PROTO="$PREV_FIELD"
+      # CLIENT_IP — всё до порта
+      CLIENT_IP=""
+      for ((i=0; i<NUM_FIELDS-2; i++)); do
+        [ $i -gt 0 ] && CLIENT_IP+=":"
+        CLIENT_IP+="${FIELDS[$i]}"
+      done
+    fi
+  elif is_proto_field "$LAST_FIELD"; then
+    # Последнее поле — протокол
+    PF_PROTO="$LAST_FIELD"
+    PF_PORT_PROTO="$PREV_FIELD"
+    # CLIENT_IP — всё до порта
+    CLIENT_IP=""
+    for ((i=0; i<NUM_FIELDS-2; i++)); do
+      [ $i -gt 0 ] && CLIENT_IP+=":"
+      CLIENT_IP+="${FIELDS[$i]}"
+    done
   else
-    # Без протокола и FLAGS (последнее поле - порт)
+    # Последнее поле — порт (без протокола и FLAGS)
     PF_PROTO=""
-    PF_PORT_PROTO="$last_field"
-    CLIENT_IP=$(echo "$MAIN_PART" | awk -F: '{for(i=1;i<NF-1;i++) printf "%s:", $i; print $(NF-1)}' | sed 's/:$//')
+    PF_PORT_PROTO="$LAST_FIELD"
+    # CLIENT_IP — всё до порта
+    CLIENT_IP=""
+    for ((i=0; i<NUM_FIELDS-1; i++)); do
+      [ $i -gt 0 ] && CLIENT_IP+=":"
+      CLIENT_IP+="${FIELDS[$i]}"
+    done
   fi
 
   # Обработка протокола
