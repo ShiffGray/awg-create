@@ -141,7 +141,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 # Шаблоны up/down с поддержкой WARP
 
 # Шаблон для файла параметров (awg10.sh)
-params_script_template = '''#!/bin/bash
+params_script_template = r'''#!/bin/bash
 #set -x
 
 # --- Основные переменные ---
@@ -473,7 +473,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 fi
 '''
 
-up_script_template_warp = '''#!/bin/bash
+up_script_template_warp = r'''#!/bin/bash
 
 # --- Опеределение пути и имени---
 UP_SCRIPT_PATH="$(readlink -f "$0")"
@@ -890,9 +890,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
     WARP_RUNNING=0
     if ip link show "$warp" &>/dev/null; then
-      if ip link show "$warp" | grep -q "state UP"; then
-        WARP_RUNNING=1
-      fi
+      WARP_RUNNING=1
     fi
 
     # Проверяем .ref файл
@@ -1980,14 +1978,88 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
 fi
 
 # --- Добавление правил для каждого проброса ---
-# Глобальная SNAT дедупликация (между всеми правилами и протоколами)
-declare -A GLOBAL_SNAT_RULES_ADDED
 
+# --- Вспомогательные функции для разбора правил проброски портов ---
+# Функция проверки является ли поле протоколом
+is_proto() {
+  local s="$1"
+  local s_upper
+  s_upper=$(echo "$s" | tr '[:lower:]' '[:upper:]')
+  if [ "$s_upper" = "TCP" ] || [ "$s_upper" = "UDP" ]; then
+    return 0
+  fi
+  if [[ "$s_upper" == *","* ]]; then
+    IFS=',' read -ra proto_parts <<< "$s_upper"
+    for p in "${proto_parts[@]}"; do
+      p="${p// /}"
+      if [ "$p" != "TCP" ] && [ "$p" != "UDP" ]; then
+        return 1
+      fi
+    done
+    return 0
+  fi
+  return 1
+}
+
+# Функция проверки является ли поле валидным именем интерфейса
+is_valid_interface() {
+  local s="$1"
+  if [ -z "$s" ]; then return 1; fi
+  local s_upper
+  s_upper=$(echo "$s" | tr '[:lower:]' '[:upper:]')
+  if [ "$s_upper" = "SNAT" ]; then return 1; fi
+  if ! [[ "$s" =~ [a-zA-Z] ]]; then return 1; fi
+  if [[ "$s" =~ ^[a-zA-Z0-9_]+$ ]]; then return 0; fi
+  return 1
+}
+
+# Функция проверки является ли поле FLAGS
+is_flags() {
+  local s="$1"
+  local s_upper
+  s_upper=$(echo "$s" | tr '[:lower:]' '[:upper:]')
+  if [ "$s_upper" = "SNAT" ]; then return 0; fi
+  if [[ "$s" == *","* ]]; then
+    IFS=',' read -ra flag_parts <<< "$s"
+    for part in "${flag_parts[@]}"; do
+      part="${part// /}"
+      local part_upper
+      part_upper=$(echo "$part" | tr '[:lower:]' '[:upper:]')
+      if [ "$part_upper" = "SNAT" ]; then continue; fi
+      if ! is_valid_interface "$part"; then return 1; fi
+    done
+    return 0
+  fi
+  if is_valid_interface "$s"; then return 0; fi
+  return 1
+}
+
+# Функция парсинга FLAGS
+parse_flags() {
+  local s="$1"
+  PARSED_SNAT=""
+  PARSED_IFACE=""
+  IFS=',' read -ra flag_parts <<< "$s"
+  for part in "${flag_parts[@]}"; do
+    part="${part// /}"
+    local part_upper
+    part_upper=$(echo "$part" | tr '[:lower:]' '[:upper:]')
+    if [ "$part_upper" = "SNAT" ]; then
+      PARSED_SNAT="SNAT"
+    elif [ -n "$part" ]; then
+      PARSED_IFACE="$part"
+    fi
+  done
+}
+
+# Обработка правил проброски портов
+declare -A GLOBAL_SNAT_RULES_ADDED
 for rule in "${PORT_FORWARDING_RULES[@]}"; do
+
   # Разбор правила: новый формат CLIENT_IP:PORT[>PORT]:PROTO[:FLAGS][:SUBNETS]
   # FLAGS: SNAT,интерфейс или интерфейс,SNAT (порядок не важен)
   # Подсети через : (содержат /)
-  
+
   # Ищем подсети (содержат /) — они всегда в конце
   ALLOWED_SUBNETS=""
   MAIN_PART="$rule"
@@ -2020,7 +2092,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
       fi
       ALLOWED_SUBNETS+="${rule_parts[$i]}"
     done
-    
+
     # Удаляем trailing ':' из MAIN_PART (от обработки '::')
     MAIN_PART="${MAIN_PART%:}"
   fi
@@ -2038,72 +2110,6 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
   second_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-1)}')
   third_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-2)}')
   fourth_last=$(echo "$MAIN_PART" | awk -F: '{print $(NF-3)}')
-
-  # Функция проверки является ли поле протоколом
-  is_proto() {
-    local s="$1"
-    local s_upper="${s^^}"
-    if [ "$s_upper" = "TCP" ] || [ "$s_upper" = "UDP" ]; then
-      return 0
-    fi
-    if [[ "$s_upper" == *","* ]]; then
-      IFS=',' read -ra proto_parts <<< "$s_upper"
-      for p in "${proto_parts[@]}"; do
-        p="${p// /}"
-        if [ "$p" != "TCP" ] && [ "$p" != "UDP" ]; then
-          return 1
-        fi
-      done
-      return 0
-    fi
-    return 1
-  }
-
-  # Функция проверки является ли поле валидным именем интерфейса
-  is_valid_interface() {
-    local s="$1"
-    if [ -z "$s" ]; then return 1; fi
-    if [ "${s^^}" = "SNAT" ]; then return 1; fi
-    if ! [[ "$s" =~ [a-zA-Z] ]]; then return 1; fi
-    if [[ "$s" =~ ^[a-zA-Z0-9_]+$ ]]; then return 0; fi
-    return 1
-  }
-
-  # Функция проверки является ли поле FLAGS
-  is_flags() {
-    local s="$1"
-    local s_upper="${s^^}"
-    if [ "$s_upper" = "SNAT" ]; then return 0; fi
-    if [[ "$s" == *","* ]]; then
-      IFS=',' read -ra flag_parts <<< "$s"
-      for part in "${flag_parts[@]}"; do
-        part="${part// /}"
-        part_upper="${part^^}"
-        if [ "$part_upper" = "SNAT" ]; then continue; fi
-        if ! is_valid_interface "$part"; then return 1; fi
-      done
-      return 0
-    fi
-    if is_valid_interface "$s"; then return 0; fi
-    return 1
-  }
-
-  # Функция парсинга FLAGS
-  parse_flags() {
-    local s="$1"
-    PARSED_SNAT=""
-    PARSED_IFACE=""
-    IFS=',' read -ra flag_parts <<< "$s"
-    for part in "${flag_parts[@]}"; do
-      part="${part// /}"
-      part_upper="${part^^}"
-      if [ "$part_upper" = "SNAT" ]; then
-        PARSED_SNAT="SNAT"
-      elif [ -n "$part" ]; then
-        PARSED_IFACE="$part"
-      fi
-    done
-  }
 
   # Определяем структуру: :PROTO:FLAGS или :PROTO или :FLAGS или просто порт
   PF_PROTO=""
@@ -2169,7 +2175,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     IFS=',' read -ra proto_parts <<< "$PF_PROTO"
     for p in "${proto_parts[@]}"; do
       p="${p// /}"
-      p_upper="${p^^}"
+      p_upper=$(echo "$p" | tr '[:lower:]' '[:upper:]')
       if [ "$p_upper" = "TCP" ] || [ "$p_upper" = "UDP" ]; then
         # Проверяем дубликаты
         found=0
@@ -2314,7 +2320,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
               # ВАЖНО: Добавляем префикс ipv4:/ipv6 для уникальности между протоколами
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
-              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+              if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
@@ -2326,7 +2332,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
@@ -2334,7 +2340,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -m state --state RELATED,ESTABLISHED -j ACCEPT
           fi
 
-          if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+          if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ]; then
             echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
           else
             echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
@@ -2353,7 +2359,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+              if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
@@ -2364,7 +2370,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
@@ -2372,7 +2378,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -m state --state RELATED,ESTABLISHED -j ACCEPT
           fi
 
-          if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+          if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ]; then
             echo "$PF_PROTO порт $PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
           else
             echo "$PF_PROTO порт $PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
@@ -2391,7 +2397,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-              if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+              if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
                 $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
@@ -2402,7 +2408,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
@@ -2410,7 +2416,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -m state --state RELATED,ESTABLISHED -j ACCEPT
           fi
 
-          if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+          if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ]; then
             echo "$PF_PROTO порт $PF_PORT_EXT->$PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
           else
             echo "$PF_PROTO порт $PF_PORT_EXT->$PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
@@ -2425,7 +2431,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
-            if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+            if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
               $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
@@ -2436,7 +2442,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
           # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
           snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
-          if [ "${SNAT_FLAG^^}" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+          if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
             $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
             GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
           fi
@@ -2444,7 +2450,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -m state --state RELATED,ESTABLISHED -j ACCEPT
         fi
 
-        if [ "${SNAT_FLAG^^}" = "SNAT" ]; then
+        if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ]; then
           echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
         else
           echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
@@ -2452,6 +2458,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
     # Конец обработки всех вариантов портов
   done
   # Конец цикла по CLIENT_IP_ARRAY
+done
 done
 # Конец цикла по PORT_FORWARDING_RULES
 
@@ -2590,16 +2597,20 @@ except Exception as e:
       # Если только одна подсеть — используем старую логику
       if [ ${#SUBNET_ARRAY[@]} -eq 1 ]; then
           SUBNET="${SUBNET_ARRAY[0]}"
-          
+
           # Определяем версию IP (IPv4 или IPv6)
           if [[ "$SUBNET" == *:* ]]; then
               IP_VERSION="ipv6"
               PROTO_MATCH="ip6"
+              IPV4_CLIENT_MASK=32
+              IPV6_CLIENT_MASK=128
           else
               IP_VERSION="ip"
               PROTO_MATCH="ip"
+              IPV4_CLIENT_MASK=32
+              IPV6_CLIENT_MASK=128
           fi
-          
+
           IPS=$(python3 - <<PY
 import ipaddress, sys
 try:
@@ -2689,7 +2700,9 @@ if ipv4_nets and ipv6_nets:
     if ratio >= 1:
         # 1 IPv4 : N IPv6
         ipv4_client_mask = 32
-        ipv6_bits = int(math.log2(ratio))
+        ipv6_per_ipv4 = int(ratio)
+        # Используем bit_length() вместо log2() для правильных масок!
+        ipv6_bits = (ipv6_per_ipv4 - 1).bit_length() if ipv6_per_ipv4 > 0 else 0
         ipv6_client_mask = 128 - ipv6_bits
         ipv4_step = 1
         ipv6_step = int(ratio)
@@ -2698,7 +2711,9 @@ if ipv4_nets and ipv6_nets:
     else:
         # N IPv4 : 1 IPv6
         ipv6_client_mask = 128
-        ipv4_bits = int(math.log2(1 / ratio))
+        ipv4_per_ipv6 = int(1 / ratio)
+        # Используем bit_length() вместо log2() для правильных масок!
+        ipv4_bits = (ipv4_per_ipv6 - 1).bit_length() if ipv4_per_ipv6 > 0 else 0
         ipv4_client_mask = 32 - ipv4_bits
         ipv4_step = int(1 / ratio)
         ipv6_step = 1
@@ -2822,7 +2837,7 @@ fi
 echo "————————————————————————————————"
 '''
 
-down_script_template_warp = '''#!/bin/bash
+down_script_template_warp = r'''#!/bin/bash
 
 # --- Опеределение пути и имени ---
 DOWN_SCRIPT_PATH="$(readlink -f "$0")"
@@ -3077,15 +3092,13 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
     WARP_RUNNING=0
     if ip link show "$warp" &>/dev/null; then
-      if ip link show "$warp" | grep -q "state UP"; then
-        WARP_RUNNING=1
-      fi
+      WARP_RUNNING=1
     fi
 
     # Проверяем .ref файл
     if [ -f "$WARP_REF_FILE" ]; then
       ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
-      
+
       if [ "$ref_count" -le 1 ]; then
         # Последний пользователь — закрываем WARP (если он запущен)
         if [ "$WARP_RUNNING" -eq 1 ]; then
@@ -3095,11 +3108,20 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
             echo "Ошибка остановки $warp: $?"
           fi
         else
-          echo "⚠️  WARP $warp не запущен (ref=$ref_count) — только очистка .ref"
+          echo "⚠️  WARP $warp не запущен (ref=$ref_count) — очистка..."
         fi
+        
+        # Очищаем таблицу маршрутизации (только если последний пользователь)
+        TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+        if [ -n "$TABLE_ID" ]; then
+          ip route flush table "$TABLE_ID" 2>/dev/null || true
+          sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
+          echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
+        fi
+        
         rm -f "$WARP_REF_FILE"
       else
-        # Уменьшаем счётчик
+        # Уменьшаем счётчик — таблица остаётся для других
         echo $((ref_count - 1)) > "$WARP_REF_FILE"
         echo "📋 WARP $warp используется другими туннелями (ref=$ref_count → $((ref_count - 1)))"
       fi
@@ -3112,17 +3134,19 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
         else
           echo "Ошибка остановки $warp: $?"
         fi
+        
+        # Очищаем таблицу маршрутизации
+        TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+        if [ -n "$TABLE_ID" ]; then
+          ip route flush table "$TABLE_ID" 2>/dev/null || true
+          sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
+          echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
+        fi
       else
         echo "⚠️  WARP $warp не запущен и .ref не найден — пропускаем"
       fi
     fi
   ) 200>"$WARP_LOCK_FILE"
-
-  # Очищаем маршруты и правила для этого WARP
-  TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
-  if [ -n "$TABLE_ID" ]; then
-    ip route flush table "$TABLE_ID" 2>/dev/null || true
-  fi
 
   # Очищаем FORWARD и NAT правила для этого WARP
   # ВАЖНО: Правила созданы С -i "$TUN" для каждого туннеля!
@@ -4615,18 +4639,22 @@ def calculate_client_masks(ipv4_net: ipaddress.IPv4Network, ipv6_net: Optional[i
     
     # Соотношение
     ratio = ipv6_total / ipv4_total
-    
+
     if ratio >= 1:
         # 1 IPv4 : N IPv6 (IPv6 подсеть шире)
         ipv4_client_mask = 32  # 1 адрес
-        ipv6_bits = int(math.log2(ratio))
+        ipv6_per_ipv4 = int(ratio)
+        # Используем bit_length() вместо log2() для правильных масок!
+        ipv6_bits = (ipv6_per_ipv4 - 1).bit_length() if ipv6_per_ipv4 > 0 else 0
         ipv6_client_mask = 128 - ipv6_bits
     else:
         # N IPv4 : 1 IPv6 (IPv4 подсеть шире)
         ipv6_client_mask = 128  # 1 адрес
-        ipv4_bits = int(math.log2(1 / ratio))
+        ipv4_per_ipv6 = int(1 / ratio)
+        # Используем bit_length() вместо log2() для правильных масок!
+        ipv4_bits = (ipv4_per_ipv6 - 1).bit_length() if ipv4_per_ipv6 > 0 else 0
         ipv4_client_mask = 32 - ipv4_bits
-    
+
     return ipv4_client_mask, ipv6_client_mask, ratio
 
 
@@ -5121,6 +5149,19 @@ def handle_add(opt) -> None:
             # Сервер НЕ на network → "broadcast" РАБОТАЕТ → зарезервирован
             last_usable_int_ipv6 = int(net_ipv6.network_address) + net_ipv6.num_addresses - 2
 
+        # ВАЖНО: Проверяем что позиция сервера в IPv4 и IPv6 совпадает!
+        # (оба на network или оба НЕ на network)
+        if server_on_network_ipv4 != server_on_network_ipv6:
+            raise RuntimeError(
+                f'Позиция сервера в IPv4 и IPv6 подсетях должна совпадать!\n'
+                f'  IPv4: {ipaddress.IPv4Address(server_ip_int_ipv4)}/{net_ipv4.prefixlen} - '
+                f'{"на network address" if server_on_network_ipv4 else "НЕ на network address"}\n'
+                f'  IPv6: {ipaddress.IPv6Address(ipv6_server_ip_int)}/{net_ipv6.prefixlen} - '
+                f'{"на network address" if server_on_network_ipv6 else "НЕ на network address"}\n'
+                f'Исправьте: сервер должен быть или на network address в обеих подсетях, '
+                f'или НЕ на network address в обеих подсетях!'
+            )
+
     # --- Обработка ручного IP ---
     ipaddr_ipv4 = None
     ipaddr_ipv6 = None
@@ -5164,83 +5205,94 @@ def handle_add(opt) -> None:
         # --- Автоматический выбор IP с учётом кратности подсетей ---
         # Вычисляем маски клиентов и коэффициент кратности
         ipv4_client_mask, ipv6_client_mask, ratio = calculate_client_masks(net_ipv4, net_ipv6)
-        
-        # Определяем шаг для IPv4 и IPv6
-        # Если ratio > 1: 1 IPv4 : N IPv6 → IPv6 шаг = ratio
-        # Если ratio < 1: N IPv4 : 1 IPv6 → IPv4 шаг = 1/ratio
-        if ratio >= 1:
-            ipv4_step = 1
-            ipv6_step = int(ratio)
-        else:
-            ipv4_step = int(1 / ratio)
-            ipv6_step = 1
-        
+
+        # Вычисляем размеры блоков клиентов
+        ipv4_block_size = 2 ** (32 - ipv4_client_mask)
+        ipv6_block_size = 2 ** (128 - ipv6_client_mask)
+
         # IPv4
         chosen_ipv4 = None
         chosen_ipv6 = None
-        # range_end_ipv4 = последний usable + 1 (для range() не включительно)
-        range_end_ipv4 = last_usable_int_ipv4 + 1
 
-        # Проходим по всем IPv4 адресам с учётом шага
-        for ip_int in range(first_usable_int_ipv4, range_end_ipv4, ipv4_step):
-            if ip_int not in used_ips_ipv4:
-                # Нашли свободный IPv4, теперь ищем соответствующий IPv6
-                if net_ipv6 and first_usable_int_ipv6 is not None:
-                    # Вычисляем индекс IPv6 по индексу IPv4 с учётом шага
-                    ipv4_idx = (ip_int - first_usable_int_ipv4) // ipv4_step
-                    ipv6_int = first_usable_int_ipv6 + (ipv4_idx * ipv6_step)
+        # Начинаем с network_address для правильного выравнивания
+        ipv4_base = int(net_ipv4.network_address)
+        ipv6_base = int(net_ipv6.network_address) if net_ipv6 else 0
 
-                    # Проверяем что IPv6 не занят и в пределах диапазона
-                    if ipv6_int not in used_ips_ipv6 and ipv6_int <= last_usable_int_ipv6:
-                        chosen_ipv4 = ip_int
-                        chosen_ipv6 = ipv6_int
-                        break
-                else:
-                    # IPv6 подсети нет, выдаём только IPv4
-                    chosen_ipv4 = ip_int
-                    break
+        # Проходим по всем блокам IPv4 (выровнены по границе!)
+        # Используем полный диапазон подсети
+        max_ipv4_blocks = (int(net_ipv4.broadcast_address) - ipv4_base + 1) // ipv4_block_size
+
+        # Определяем позицию сервера (оба на network или оба НЕ на network)
+        server_on_network = server_on_network_ipv4  # Предполагаем что IPv6 совпадает (проверено выше)
+
+        for block_idx in range(0, max_ipv4_blocks):
+            # Вычисляем начало IPv4 блока (выровнено!)
+            ipv4_block_start = ipv4_base + (block_idx * ipv4_block_size)
+            ipv4_block_end = ipv4_block_start + ipv4_block_size - 1
+
+            # Вычисляем начало IPv6 блока (выровнено!)
+            ipv6_block_start = 0
+            ipv6_block_end = 0
+            if net_ipv6:
+                ipv6_block_start = ipv6_base + (block_idx * ipv6_block_size)
+                ipv6_block_end = ipv6_block_start + ipv6_block_size - 1
+
+            # Пропускаем network address (первый блок)
+            if block_idx == 0:
+                continue
+
+            # Проверяем что блок не заканчивается на broadcast
+            # ВАЖНО: broadcast существует ТОЛЬКО если сервер НЕ на network address!
+            if ipv4_block_end == int(net_ipv4.broadcast_address):
+                if not server_on_network:
+                    continue
+            
+            # Проверяем IPv6 broadcast
+            if net_ipv6 and ipv6_block_end == int(net_ipv6.broadcast_address):
+                if not server_on_network:
+                    continue
+
+            # Проверяем что блок не содержит адрес сервера (IPv4)
+            if ipv4_block_start <= server_ip_int_ipv4 <= ipv4_block_end:
+                continue
+            
+            # Проверяем что блок не содержит адрес сервера (IPv6)
+            if net_ipv6 and (ipv6_block_start <= ipv6_server_ip_int <= ipv6_block_end):
+                continue
+
+            # ВАЖНО: Проверяем что ОБА адреса в паре свободны!
+            # Если IPv4 занят — пропускаем (IPv6 тоже не выдаём!)
+            ipv4_free = (ipv4_block_start not in used_ips_ipv4)
+            
+            # Если IPv6 есть — проверяем и его
+            ipv6_free = True
+            if net_ipv6:
+                ipv6_free = (ipv6_block_start not in used_ips_ipv6)
+            
+            # Пропускаем если ХОТЯ БЫ ОДИН занят!
+            if not ipv4_free or not ipv6_free:
+                continue
+
+            # Нашли пару! ОБА свободны!
+            chosen_ipv4 = ipv4_block_start
+            chosen_ipv6 = ipv6_block_start if net_ipv6 else None
+            
+            # Выходим — нашли первую свободную пару!
+            break
 
         if chosen_ipv4 is None:
             raise RuntimeError('Нет свободных IPv4 адресов')
 
-        # Вычисляем первый IP в блоке для IPv4 (выравнивание по границе маски)
-        # ВАЖНО: блок должен полностью попадать в диапазон usable адресов
-        if ipv4_client_mask < 32:
-            ipv4_block_size = 2 ** (32 - ipv4_client_mask)
-            # Выравниваем вниз до границы блока
-            chosen_ipv4_aligned = chosen_ipv4 & ~(ipv4_block_size - 1)
-            
-            # Проверяем что блок не начинается с network адреса
-            if chosen_ipv4_aligned == int(net_ipv4.network_address):
-                # Блок начинается с network — сдвигаем на следующий блок
-                chosen_ipv4_aligned += ipv4_block_size
-            
-            # Проверяем что блок не заканчивается на broadcast
-            block_end = chosen_ipv4_aligned + ipv4_block_size - 1
-            if block_end == int(net_ipv4.broadcast_address):
-                # Блок заканчивается на broadcast — сдвигаем на предыдущий блок
-                chosen_ipv4_aligned -= ipv4_block_size
-        else:
-            chosen_ipv4_aligned = chosen_ipv4
+        # Вычисляем первый IP в блоке для IPv4 (уже выровнен!)
+        chosen_ipv4_aligned = chosen_ipv4
 
-        # Вычисляем первый IP в блоке для IPv6 (выравнивание по границе маски)
-        if ipv6_client_mask < 128 and chosen_ipv6 is not None:
-            ipv6_block_size = 2 ** (128 - ipv6_client_mask)
-            # Выравниваем вниз до границы блока
-            chosen_ipv6_aligned = chosen_ipv6 & ~(ipv6_block_size - 1)
-            
-            # Проверяем что блок не начинается с network адреса
-            if chosen_ipv6_aligned == int(net_ipv6.network_address):
-                # Блок начинается с network — сдвигаем на следующий блок
-                chosen_ipv6_aligned += ipv6_block_size
-            
-            # Проверяем что блок не заканчивается на последний адрес (аналог broadcast)
-            block_end = chosen_ipv6_aligned + ipv6_block_size - 1
-            if block_end == int(net_ipv6.broadcast_address):
-                # Блок заканчивается на broadcast — сдвигаем на предыдущий блок
-                chosen_ipv6_aligned -= ipv6_block_size
-        else:
-            chosen_ipv6_aligned = chosen_ipv6 if chosen_ipv6 else 0
+        # Вычисляем первый IP в блоке для IPv6 (уже выровнен!)
+        chosen_ipv6_aligned = chosen_ipv6 if chosen_ipv6 else 0
+
+        # Добавляем выделенные адреса в занятые
+        used_ips_ipv4.add(chosen_ipv4_aligned)
+        if chosen_ipv6_aligned:
+            used_ips_ipv6.add(chosen_ipv6_aligned)
 
         # Формируем адрес с маской клиента
         ipaddr_ipv4 = f"{str(ipaddress.IPv4Address(chosen_ipv4_aligned))}/{ipv4_client_mask}"
