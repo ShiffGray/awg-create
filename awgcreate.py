@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AmneziaWG / WireGuard Helper Script
-Features:
-- Multi-interface support (split system/work paths).
-- Strict Fallback for DsYt IPs.
-- Smart path resolution for --make.
-- Selective QR generation via _allowedips.config tags.
-- Automatic ZIP packaging with file directory support.
+AmneziaWG Helper Script
 """
 
 from __future__ import annotations
