@@ -942,6 +942,7 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
     else
       grep -q "^$TABLE_ID[[:space:]]$warp$" /etc/iproute2/rt_tables || echo "$TABLE_ID $warp" >> /etc/iproute2/rt_tables
       ip route replace default dev "$warp" table "$TABLE_ID"
+      ip -6 route replace default dev "$warp" table "$TABLE_ID"
       WARP_TABLE_IDS["$warp"]="$TABLE_ID"
     fi
   done
@@ -950,10 +951,11 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   # Создаём цепочку в ОБЕИХ таблицах (iptables и ip6tables)
   iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -N "$RANDOM_WARP_CHAIN" 2>/dev/null || true
   ip6tables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || ip6tables -t mangle -N "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-  
-  # Добавляем правила PREROUTING для ВСЕХ интерфейсов (чтобы WARP работал для клиентов всех туннелей!)
-  iptables -t mangle -C PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-  ip6tables -t mangle -C PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || ip6tables -t mangle -A PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+
+  # Добавляем правила PREROUTING ТОЛЬКО для трафика из VPN туннеля!
+  # ВАЖНО: -i "$TUN" чтобы не маркировать весь остальной трафик на сервере
+  iptables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || iptables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+  ip6tables -t mangle -C PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || ip6tables -t mangle -A PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
   # --- Исключение подсетей из маркировки (идут напрямую через IFACE, мимо WARP) ---
   # Собираем все IP/подсети для исключения из WARP:
@@ -988,8 +990,9 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   if [ ${#ALL_WARP_EXCLUSIONS[@]} -gt 0 ]; then
     echo "🔒 Исключение ${#ALL_WARP_EXCLUSIONS[@]} IP/подсетей из WARP (локальная сеть + none=)"
     for subnet in "${ALL_WARP_EXCLUSIONS[@]}"; do
-      IPT_CMD="$(get_ipt_cmd "$subnet")"
-      $IPT_CMD -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      # Создаём RETURN для IPv4 и IPv6
+      iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      ip6tables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
     done
   fi
 
@@ -1079,18 +1082,20 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
 
     # --- Создаём правила маркировки для этой группы WARP ---
     # Если есть подсети — маркируем только трафик на эти подсети
-    # Используем get_ipt_cmd для поддержки IPv4/IPv6
+    # Создаём правила для ОБЕИХ версий IP (IPv4 и IPv6)
 
     if [ "$HAS_SUBNETS" -eq 1 ] && [ ${#SUBNET_GROUP[@]} -gt 0 ]; then
       # --- Трафик на конкретные подсети через эту группу WARP ---
       for subnet in "${SUBNET_GROUP[@]}"; do
-        # Определяем версию IP (iptables или ip6tables)
-        IPT_CMD="$(get_ipt_cmd "$subnet")"
-        # Балансировка между интерфейсами в группе (nth statistic)
+        # Балансировка между интерфейсами в группе (nth statistic) для IPv4 и IPv6
         for i in $(seq 0 $((WARP_GROUP_COUNT-1))); do
           MARK=$((MARK_BASE + MARK_OFFSET + i))
-          # Маркируем только новые соединения на эту подсеть
-          $IPT_CMD -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -m conntrack --ctstate NEW \
+          # Маркируем только новые соединения на эту подсеть (IPv4)
+          iptables -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -m conntrack --ctstate NEW \
+            -m statistic --mode nth --every $WARP_GROUP_COUNT --packet $i \
+            -j CONNMARK --set-mark $MARK
+          # Маркируем только новые соединения на эту подсеть (IPv6)
+          ip6tables -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -m conntrack --ctstate NEW \
             -m statistic --mode nth --every $WARP_GROUP_COUNT --packet $i \
             -j CONNMARK --set-mark $MARK
         done
@@ -1104,17 +1109,22 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   # --- Обработка всех интерфейсов БЕЗ подсетей (для всего остального трафика) ---
   DEFAULT_WARP_COUNT=${#DEFAULT_WARP_GROUP[@]}
   if [ "$DEFAULT_WARP_COUNT" -gt 0 ]; then
-    # Сначала создаём RETURN для всех специфичных подсетей
-    # Используем get_ipt_cmd для поддержки IPv4/IPv6
+    # Сначала создаём RETURN для всех специфичных подсетей (IPv4 и IPv6) - В НАЧАЛО цепи!
     for subnet in "${ALL_SPECIFIC_SUBNETS[@]}"; do
-      IPT_CMD="$(get_ipt_cmd "$subnet")"
-      $IPT_CMD -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -j RETURN 2>/dev/null || true
+      # Создаём RETURN для IPv4 и IPv6 в НАЧАЛО цепи (чтобы до маркировки)
+      iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      ip6tables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
     done
 
     # Балансировка для всего остального трафика между ВСЕМИ интерфейсами без подсетей
     for i in $(seq 0 $((DEFAULT_WARP_COUNT-1))); do
       MARK=$((MARK_BASE + MARK_OFFSET + i))
+      # IPv4 маркировка
       iptables -t mangle -A "$RANDOM_WARP_CHAIN" -m conntrack --ctstate NEW \
+        -m statistic --mode nth --every $DEFAULT_WARP_COUNT --packet $i \
+        -j CONNMARK --set-mark $MARK
+      # IPv6 маркировка
+      ip6tables -t mangle -A "$RANDOM_WARP_CHAIN" -m conntrack --ctstate NEW \
         -m statistic --mode nth --every $DEFAULT_WARP_COUNT --packet $i \
         -j CONNMARK --set-mark $MARK
     done
@@ -1126,8 +1136,11 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   ip6tables -t mangle -A "$RANDOM_WARP_CHAIN" -j CONNMARK --restore-mark
 
   # --- Добавляем ip rule для каждого MARK -> TABLE ---
-  # Сначала обрабатываем записи с подсетями
-  MARK_OFFSET=0
+  # Обрабатываем ВСЕ записи WARP_LIST (и с подсетями и без)
+  # MARK для записей с подсетями идут первыми, потом для записей без подсетей
+  WARP_MARK_OFFSET=0
+  
+  # Сначала обрабатываем записи С подсетями
   for entry in "${WARP_LIST[@]}"; do
     if [ "$entry" = "none" ] || [ -z "$entry" ]; then
       continue
@@ -1137,7 +1150,7 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
     if [[ "$entry" == *"="* ]]; then
       interfaces_part="${entry%%=*}"
     else
-      continue  # Без подсетей обработаем потом
+      continue  # Записи без подсетей обрабатываем ниже
     fi
 
     # Разбиваем интерфейсы
@@ -1157,27 +1170,42 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
 
     # Добавляем ip rule для каждого MARK в группе
     for i in $(seq 0 $((WARP_GROUP_COUNT-1))); do
-      MARK=$((MARK_BASE + MARK_OFFSET + i))
+      MARK=$((MARK_BASE + WARP_MARK_OFFSET + i))
       warp_iface="${WARP_GROUP[$i]}"
       TABLE_ID="${WARP_TABLE_IDS[$warp_iface]}"
       if [ -n "$TABLE_ID" ]; then
-        # Проверяем, существует ли уже правило IPv4
-        if ip rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
-          : # IPv4 правило уже существует
-        else
-          ip rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-        fi
-        # Проверяем, существует ли уже правило IPv6
-        if ip -6 rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
-          : # IPv6 правило уже существует
-        else
-          ip -6 rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-        fi
+        # Сначала удаляем старые правила если есть (чтобы избежать дубликатов)
+        ip rule del fwmark $MARK 2>/dev/null || true
+        ip -6 rule del fwmark $MARK 2>/dev/null || true
+        # Создаём IPv4 правило с приоритетом
+        ip rule add priority $((32700 + WARP_MARK_OFFSET + i)) fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Создаём IPv6 правило с приоритетом
+        ip -6 rule add priority $((32700 + WARP_MARK_OFFSET + i)) fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
       fi
     done
 
-    MARK_OFFSET=$((MARK_OFFSET + WARP_GROUP_COUNT))
+    WARP_MARK_OFFSET=$((WARP_MARK_OFFSET + WARP_GROUP_COUNT))
   done
+  
+  # Теперь обрабатываем записи БЕЗ подсетей (DEFAULT_WARP_GROUP)
+  # Они используют те же MARK что и при маркировке
+  DEFAULT_WARP_COUNT=${#DEFAULT_WARP_GROUP[@]}
+  if [ "$DEFAULT_WARP_COUNT" -gt 0 ]; then
+    for i in $(seq 0 $((DEFAULT_WARP_COUNT-1))); do
+      MARK=$((MARK_BASE + WARP_MARK_OFFSET + i))
+      warp_iface="${DEFAULT_WARP_GROUP[$i]}"
+      TABLE_ID="${WARP_TABLE_IDS[$warp_iface]}"
+      if [ -n "$TABLE_ID" ]; then
+        # Сначала удаляем старые правила если есть (чтобы избежать дубликатов)
+        ip rule del fwmark $MARK 2>/dev/null || true
+        ip -6 rule del fwmark $MARK 2>/dev/null || true
+        # Создаём IPv4 правило с приоритетом
+        ip rule add priority $((32700 + WARP_MARK_OFFSET + i)) fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Создаём IPv6 правило с приоритетом
+        ip -6 rule add priority $((32700 + WARP_MARK_OFFSET + i)) fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+      fi
+    done
+  fi
 
   # --- Обработка интерфейсов БЕЗ подсетей (для всего остального трафика) ---
   DEFAULT_WARP_COUNT=${#DEFAULT_WARP_GROUP[@]}
@@ -1187,18 +1215,13 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
       warp_iface="${DEFAULT_WARP_GROUP[$i]}"
       TABLE_ID="${WARP_TABLE_IDS[$warp_iface]}"
       if [ -n "$TABLE_ID" ]; then
-        # Проверяем, существует ли уже правило IPv4
-        if ip rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
-          : # IPv4 правило уже существует
-        else
-          ip rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-        fi
-        # Проверяем, существует ли уже правило IPv6
-        if ip -6 rule show 2>/dev/null | grep -q "fwmark $MARK table $TABLE_ID"; then
-          : # IPv6 правило уже существует
-        else
-          ip -6 rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-        fi
+        # Сначала удаляем старые правила если есть (чтобы избежать дубликатов)
+        ip rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        ip -6 rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Создаём IPv4 правило
+        ip rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
+        # Создаём IPv6 правило
+        ip -6 rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
       fi
     done
   fi
