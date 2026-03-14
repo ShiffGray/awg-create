@@ -1483,6 +1483,23 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
 
       # Обрабатываем IPv4 группу отдельно
       if [ ${#IPV4_PARTS[@]} -gt 0 ]; then
+        # Создаём unicast правила для ВСЕХ пар участников (включая один туннель!)
+        echo "   Создание unicast правил для IPv4 пар..."
+        for ((i=0; i<${#IPV4_PARTS[@]}; i++)); do
+          for ((j=i+1; j<${#IPV4_PARTS[@]}; j++)); do
+            SRC="${IPV4_PARTS[$i]}"
+            DST="${IPV4_PARTS[$j]}"
+            
+            # Убираем маску /32 для правил
+            SRC_CLEAN="${SRC%/*}"
+            DST_CLEAN="${DST%/*}"
+            
+            echo "    $SRC_CLEAN ↔ $DST_CLEAN"
+            iptables -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
+            iptables -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
+          done
+        done
+        
         # Intra-subnet разрешён если:
         # 1. Участник только ОДИН (нет с кем общаться на inter-subnet)
         # 2. ИЛИ участник встречается >1 раза (явно указан дубль)
@@ -1564,6 +1581,23 @@ except Exception as e:
 
       # Обрабатываем IPv6 группу отдельно
       if [ ${#IPV6_PARTS[@]} -gt 0 ]; then
+        # Создаём unicast правила для ВСЕХ пар участников (включая один туннель!)
+        echo "   Создание unicast правил для IPv6 пар..."
+        for ((i=0; i<${#IPV6_PARTS[@]}; i++)); do
+          for ((j=i+1; j<${#IPV6_PARTS[@]}; j++)); do
+            SRC="${IPV6_PARTS[$i]}"
+            DST="${IPV6_PARTS[$j]}"
+            
+            # Убираем маску /124 для правил
+            SRC_CLEAN="${SRC%/*}"
+            DST_CLEAN="${DST%/*}"
+            
+            echo "    $SRC_CLEAN ↔ $DST_CLEAN"
+            ip6tables -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
+            ip6tables -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
+          done
+        done
+        
         # Intra-subnet разрешён если:
         # 1. Участник только ОДИН (нет с кем общаться на inter-subnet)
         # 2. ИЛИ участник встречается >1 раза (явно указан дубль)
@@ -3797,12 +3831,15 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
     # IPv4 - очищаем ВСЕ комбинации src/dst
     if [ ${#IPV4_PARTS[@]} -ge 1 ] && [ -n "$MAIN_TUN" ]; then
       for src in "${IPV4_PARTS[@]}"; do
+        # Убираем маску для очистки (например 10.100.0.100/32 → 10.100.0.100)
+        src_clean="${src%/*}"
         # Очищаем intra-subnet правило (src=dst)
-        iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$src" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$src_clean" -j ACCEPT 2>/dev/null || true
         # Очищаем cross-subnet правила (src→dst для всех dst)
         for dst in "${IPV4_PARTS[@]}"; do
           if [ "$src" != "$dst" ]; then
-            iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$dst" -j ACCEPT 2>/dev/null || true
+            dst_clean="${dst%/*}"
+            iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$dst_clean" -j ACCEPT 2>/dev/null || true
           fi
         done
       done
@@ -3811,12 +3848,15 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
     # IPv6 - очищаем ВСЕ комбинации src/dst
     if [ ${#IPV6_PARTS[@]} -ge 1 ] && [ -n "$MAIN_TUN" ]; then
       for src in "${IPV6_PARTS[@]}"; do
+        # Убираем маску для очистки (например fe10:100::640/124 → fe10:100::640)
+        src_clean="${src%/*}"
         # Очищаем intra-subnet правило (src=dst)
-        ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$src" -j ACCEPT 2>/dev/null || true
+        ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$src_clean" -j ACCEPT 2>/dev/null || true
         # Очищаем cross-subnet правила (src→dst для всех dst)
         for dst in "${IPV6_PARTS[@]}"; do
           if [ "$src" != "$dst" ]; then
-            ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$dst" -j ACCEPT 2>/dev/null || true
+            dst_clean="${dst%/*}"
+            ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$dst_clean" -j ACCEPT 2>/dev/null || true
           fi
         done
       done
