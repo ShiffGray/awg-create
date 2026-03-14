@@ -324,17 +324,56 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ❌ $IFB_OUT не найден"
   fi
   echo ""
-  echo "   tc классы ($IFB_OUT):"
-  tc class show "$IFB_OUT" 2>/dev/null || echo "   (нет классов)"
+  
+  # Проверка tc фильтров на TUN (перенаправление на IFB)
+  echo "   🔍 Фильтры перенаправления (на $TUN):"
+  echo "   IPv4 фильтры:"
+  ipv4_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -c "mirred" || echo "0")
+  if [ "$ipv4_filter_count" -gt 0 ]; then
+    echo "   ✅ Найдено $ipv4_filter_count IPv4 фильтров"
+    tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
+  else
+    echo "   ❌ IPv4 фильтры не найдены"
+  fi
+  echo "   IPv6 фильтры:"
+  ipv6_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -c "mirred" || echo "0")
+  if [ "$ipv6_filter_count" -gt 0 ]; then
+    echo "   ✅ Найдено $ipv6_filter_count IPv6 фильтров"
+    tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
+  else
+    echo "   ❌ IPv6 фильтры не найдены"
+  fi
   echo ""
-  echo "   tc фильтры ($IFB_OUT):"
-  tc filter show "$IFB_OUT" 2>/dev/null || echo "   (нет фильтров)"
+  
+  # Проверка tc классов на IFB
+  echo "   📊 Классы HTB ($IFB_OUT):"
+  total_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -i "rate.*44" | wc -l)
+  active_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -E "Sent [1-9]" | wc -l)
+  total_overlimits=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep "overlimits" | grep -oE "[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+  
+  if [ "$total_classes" -gt 0 ]; then
+    echo "   ✅ Создано классов с лимитом 44Mbit: $total_classes"
+    echo "   ✅ Активных классов (с трафиком): $active_classes"
+    echo "   ✅ Всего overlimits (ограничений): ${total_overlimits:-0}"
+    
+    # Показываем топ-5 активных классов
+    if [ "$active_classes" -gt 0 ]; then
+      echo "   📈 Топ-5 активных классов:"
+      tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -B1 "Sent [1-9]" | grep -E "class htb|Sent" | head -10
+    fi
+  else
+    echo "   ⚠️  Классы не созданы или лимиты не настроены"
+  fi
   echo ""
-  echo "   tc классы ($IFB_IN):"
-  tc class show "$IFB_IN" 2>/dev/null || echo "   (нет классов)"
-  echo ""
-  echo "   tc фильтры ($IFB_IN):"
-  tc filter show "$IFB_IN" 2>/dev/null || echo "   (нет фильтров)"
+  
+  # Проверка ingress фильтров (для входящего трафика)
+  echo "   🔍 Ingress фильтры (на $TUN):"
+  ingress_filter_count=$(tc -s filter show dev "$TUN" parent ffff: 2>/dev/null | grep -c "mirred" || echo "0")
+  if [ "$ingress_filter_count" -gt 0 ]; then
+    echo "   ✅ Найдено $ingress_filter_count ingress фильтров"
+  else
+    echo "   ⚠️  Ingress фильтры не найдены (это нормально если лимиты только на исходящий трафик)"
+  fi
   echo ""
 
   # --- 5. WARP интерфейсы ---
