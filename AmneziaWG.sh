@@ -150,60 +150,40 @@ install_resolvconf() {
             return 0
         else
             log_warning "resolvconf найден но НЕ работает (битый symlink)"
-            log_info "Пытаемся пересоздать symlink..."
-        fi
-    fi
-
-    # Если resolvconf найден но не работает — пересоздаём symlink
-    if [ -f /sbin/resolvconf ]; then
-        ln -sf /sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
-        log_success "symlink /usr/bin/resolvconf → /sbin/resolvconf пересоздан"
-        # Проверяем что заработал
-        if resolvconf --version &> /dev/null; then
-            log_success "resolvconf теперь работает"
-            return 0
-        fi
-    fi
-    
-    if [ -f /usr/sbin/resolvconf ]; then
-        ln -sf /usr/sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
-        log_success "symlink /usr/bin/resolvconf → /usr/sbin/resolvconf пересоздан"
-        # Проверяем что заработал
-        if resolvconf --version &> /dev/null; then
-            log_success "resolvconf теперь работает"
-            return 0
         fi
     fi
 
     # Попытка 1: openresolv (предпочтительно)
-    if apt-get install -y openresolv 2>/dev/null; then
-        log_success "openresolv установлен"
-        # Ждём пока dpkg закончит
-        sleep 2
-        # Создаём symlink во все возможные места (ПРОВЕРЯЕМ ОБА!)
-        if [ -f /sbin/resolvconf ]; then
-            ln -sf /sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
-            log_success "symlink /usr/bin/resolvconf → /sbin/resolvconf создан"
+    if ! apt-get install -y openresolv 2>/dev/null; then
+        # Попытка 2: resolvconf
+        if ! apt-get install -y resolvconf 2>/dev/null; then
+            # Заглушка (последний вариант)
+            log_warning "Создаём заглушку..."
+            printf '#!/bin/bash\nexit 0\n' > /usr/sbin/resolvconf
+            chmod +x /usr/sbin/resolvconf
         fi
-        if [ -f /usr/sbin/resolvconf ]; then
-            ln -sf /usr/sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
-            log_success "symlink /usr/bin/resolvconf → /usr/sbin/resolvconf создан"
-        fi
-        return 0
     fi
 
-    # Попытка 2: resolvconf
-    if apt-get install -y resolvconf 2>/dev/null; then
-        log_success "resolvconf установлен"
-        return 0
+    # Ждём пока dpkg закончит
+    sleep 2
+
+    # СОЗДАЁМ SYMLINK В ЛЮБОМ СЛУЧАЕ!
+    log_info "Создание symlink для resolvconf..."
+    if [ -f /sbin/resolvconf ]; then
+        ln -sf /sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
+        log_success "symlink /usr/bin/resolvconf → /sbin/resolvconf создан"
+    fi
+    if [ -f /usr/sbin/resolvconf ]; then
+        ln -sf /usr/sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
+        log_success "symlink /usr/bin/resolvconf → /usr/sbin/resolvconf создан"
     fi
 
-    # Заглушка (последний вариант)
-    log_warning "Создаём заглушку..."
-    printf '#!/bin/bash\nexit 0\n' > /usr/sbin/resolvconf
-    chmod +x /usr/sbin/resolvconf
-    ln -sf /usr/sbin/resolvconf /sbin/resolvconf 2>/dev/null || true
-    log_success "Заглушка создана"
+    # Проверяем что работает
+    if command -v resolvconf &> /dev/null && resolvconf --version &> /dev/null; then
+        log_success "resolvconf установлен и работает"
+    else
+        log_warning "resolvconf НЕ работает — WARP с DNS не будут работать"
+    fi
 }
 
 # Настройка DNS
