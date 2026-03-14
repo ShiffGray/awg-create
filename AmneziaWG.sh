@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# AmneziaWG Installer v5.5
+# AmneziaWG Installer v5.4
 # Ubuntu 20.04-25.04 | Debian 11-13
 # Чистый код с учётом всех ошибок
 #
@@ -142,48 +142,30 @@ install_deps() {
 install_resolvconf() {
     log_info "Установка openresolv / resolvconf..."
 
-    # Проверяем что уже стоит И РАБОТАЕТ
+    # Проверяем что уже стоит
     if command -v resolvconf &> /dev/null; then
-        # Проверяем работает ли (вызываем с --version)
-        if resolvconf --version &> /dev/null; then
-            log_success "resolvconf/openresolv уже установлен и работает"
-            return 0
-        else
-            log_warning "resolvconf найден но НЕ работает (битый symlink)"
-        fi
+        log_success "resolvconf/openresolv уже установлен"
+        return 0
     fi
 
     # Попытка 1: openresolv (предпочтительно)
-    if ! apt-get install -y openresolv 2>/dev/null; then
-        # Попытка 2: resolvconf
-        if ! apt-get install -y resolvconf 2>/dev/null; then
-            # Заглушка (последний вариант)
-            log_warning "Создаём заглушку..."
-            printf '#!/bin/bash\nexit 0\n' > /usr/sbin/resolvconf
-            chmod +x /usr/sbin/resolvconf
-        fi
+    if apt-get install -y openresolv 2>/dev/null; then
+        log_success "openresolv установлен"
+        return 0
     fi
 
-    # Ждём пока dpkg закончит
-    sleep 2
-
-    # СОЗДАЁМ SYMLINK В ЛЮБОМ СЛУЧАЕ!
-    log_info "Создание symlink для resolvconf..."
-    if [ -f /sbin/resolvconf ]; then
-        ln -sf /sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
-        log_success "symlink /usr/bin/resolvconf → /sbin/resolvconf создан"
-    fi
-    if [ -f /usr/sbin/resolvconf ]; then
-        ln -sf /usr/sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
-        log_success "symlink /usr/bin/resolvconf → /usr/sbin/resolvconf создан"
+    # Попытка 2: resolvconf
+    if apt-get install -y resolvconf 2>/dev/null; then
+        log_success "resolvconf установлен"
+        return 0
     fi
 
-    # Проверяем что работает
-    if command -v resolvconf &> /dev/null && resolvconf --version &> /dev/null; then
-        log_success "resolvconf установлен и работает"
-    else
-        log_warning "resolvconf НЕ работает — WARP с DNS не будут работать"
-    fi
+    # Заглушка (последний вариант)
+    log_warning "Создаём заглушку..."
+    printf '#!/bin/bash\nexit 0\n' > /usr/sbin/resolvconf
+    chmod +x /usr/sbin/resolvconf
+    ln -sf /usr/sbin/resolvconf /sbin/resolvconf 2>/dev/null || true
+    log_success "Заглушка создана"
 }
 
 # Настройка DNS
@@ -298,14 +280,6 @@ verify() {
         exit 1
     fi
 
-    # Проверка resolvconf
-    if command -v resolvconf &> /dev/null; then
-        log_success "resolvconf найден: $(which resolvconf)"
-    else
-        log_warning "resolvconf НЕ найден — WARP с DNS не будут работать!"
-        log_info "Исправь вручную: ln -sf /sbin/resolvconf /usr/bin/resolvconf"
-    fi
-
     lsmod | grep -q amneziawg 2>/dev/null || \
         log_info "Модуль ядра загрузится при первом запуске"
 
@@ -362,7 +336,7 @@ main() {
 
     echo
     echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   AmneziaWG Installer v5.5             ║${NC}"
+    echo -e "${GREEN}║   AmneziaWG Installer v5.4             ║${NC}"
     echo -e "${GREEN}║   Ubuntu 20-25 | Debian 11-13          ║${NC}"
     echo -e "${GREEN}║   + disable systemd-resolved           ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
