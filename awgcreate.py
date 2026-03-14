@@ -5617,7 +5617,60 @@ def handle_confgen(opt) -> Set[str]:
             out_base = tmpcfg[:]
             out_base = out_base.replace('<MTU>', mtu)
             out_base = out_base.replace('<CLIENT_PRIVATE_KEY>', peer['PrivateKey'])
-            out_base = out_base.replace('<CLIENT_TUNNEL_IP>', peer['AllowedIPs'])
+
+            # Исправляем маску клиента на маску подсети сервера ТОЛЬКО если broadcast работает
+            # (сервер НЕ на network address) — это нужно для работы broadcast/multicast
+            client_allowed_ips = peer['AllowedIPs']
+            try:
+                # Парсим AllowedIPs и проверяем позицию сервера
+                allowed_ips_list = [ip.strip() for ip in client_allowed_ips.split(',')]
+                fixed_allowed_ips = []
+                
+                # Проверяем занимает ли сервер network address (broadcast НЕ работает)
+                server_addr_ipv4 = srvcfg.split('[Peer]')[0]
+                server_ipv4_on_network = False
+                for line in server_addr_ipv4.split('\n'):
+                    if line.strip().startswith('Address = '):
+                        addr_part = line.split('=')[1].strip().split(',')[0].strip()
+                        if '/' in addr_part:
+                            server_ip_net = ipaddress.ip_network(addr_part, strict=False)
+                            server_ipv4_on_network = (int(server_ip_net.network_address) == int(net_ipv4.network_address))
+                        break
+                
+                server_ipv6_on_network = False
+                if net_ipv6:
+                    for line in server_addr_ipv4.split('\n'):
+                        if line.strip().startswith('Address = '):
+                            addr_part = line.split('=')[1].strip()
+                            if ',' in addr_part:
+                                addr_part = addr_part.split(',')[1].strip()
+                            if '/' in addr_part:
+                                server_ip_net = ipaddress.ip_network(addr_part, strict=False)
+                                server_ipv6_on_network = (int(server_ip_net.network_address) == int(net_ipv6.network_address))
+                            break
+                
+                for ip_str in allowed_ips_list:
+                    if '/' in ip_str:
+                        ip_net = ipaddress.ip_network(ip_str, strict=False)
+                        if isinstance(ip_net, ipaddress.IPv4Network):
+                            # Для IPv4: заменяем маску на серверную ТОЛЬКО если broadcast работает
+                            if not server_ipv4_on_network:
+                                fixed_allowed_ips.append(f"{ip_net.network_address}/{net_ipv4.prefixlen}")
+                            else:
+                                fixed_allowed_ips.append(ip_str)
+                        elif net_ipv6:
+                            # Для IPv6: заменяем маску на серверную ТОЛЬКО если multicast работает
+                            if not server_ipv6_on_network:
+                                fixed_allowed_ips.append(f"{ip_net.network_address}/{net_ipv6.prefixlen}")
+                            else:
+                                fixed_allowed_ips.append(ip_str)
+                    else:
+                        fixed_allowed_ips.append(ip_str)
+                client_allowed_ips = ', '.join(fixed_allowed_ips)
+            except Exception:
+                pass  # Если ошибка, оставляем как есть
+
+            out_base = out_base.replace('<CLIENT_TUNNEL_IP>', client_allowed_ips)
             out_base = out_base.replace('<JC>', str(jc))
             out_base = out_base.replace('<JMIN>', str(jmin))
             out_base = out_base.replace('<JMAX>', str(jmax))
