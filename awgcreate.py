@@ -132,7 +132,7 @@ PublicKey = <WARP_PEER_PUBLIC_KEY>
 AllowedIPs = 0.0.0.0/0, ::/0
 """
 
-# Шаблон для файла параметров (awg10.sh)
+# Шаблон для файла параметров (awg.sh), так же это тестовый скрипт
 params_script_template = r'''#!/bin/bash
 #set -x
 
@@ -471,7 +471,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 fi
 '''
 
-# Шаблоны up/down с поддержкой WARP
+# Шаблоны up/down с поддержкой WARP, пробросов портов и лимитов скорости
 up_script_template_warp = r'''#!/bin/bash
 
 # --- Опеределение пути и имени---
@@ -892,31 +892,42 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
       WARP_RUNNING=1
     fi
 
-    # Проверяем .ref файл
-    if [ -f "$WARP_REF_FILE" ]; then
-      ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
+    # Проверяем состояние WARP интерфейса и .ref файла
+    # Логика:
+    # 1. Нет интерфейса + Нет .ref → Запускаем интерфейс, создаём .ref=1
+    # 2. Нет интерфейса + Есть .ref → Запускаем интерфейс, пересоздаём .ref=1
+    # 3. Есть интерфейс + Есть .ref → Увеличиваем .ref += 1
+    # 4. Есть интерфейс + Нет .ref → Создаём .ref=1
 
-      if [ "$WARP_RUNNING" -eq 1 ]; then
-        # WARP реально запущен и .ref существует — увеличиваем счётчик
-        echo $((ref_count + 1)) > "$WARP_REF_FILE"
-        echo "✅ WARP $warp уже запущен (ref=$ref_count → $((ref_count + 1)))"
-      else
-        # .ref есть но WARP НЕ запущен (после сбоя) — перезапускаем
-        echo "⚠️  WARP $warp не запущен при наличии .ref (ref=$ref_count) — перезапуск..."
-        rm -f "$WARP_REF_FILE"
-        if awg-quick up "$warp" 2>/dev/null; then
-          echo "1" > "$WARP_REF_FILE"
-        else
-          echo "Ошибка запуска $warp: $?"
-        fi
-      fi
-    else
-      # .ref нет — запускаем WARP впервые
+    if [ "$WARP_RUNNING" -eq 0 ] && [ ! -f "$WARP_REF_FILE" ]; then
+      # Случай 1: Нет интерфейса + Нет .ref → Запускаем интерфейс, создаём .ref=1
+      echo "🔧 Запуск WARP: $warp (интерфейс не активен, .ref не найден)"
       if awg-quick up "$warp" 2>/dev/null; then
         echo "1" > "$WARP_REF_FILE"
+        echo "✅ WARP $warp запущен (ref=1)"
       else
-        echo "Ошибка запуска $warp: $?"
+        echo "❌ Ошибка запуска $warp: $?"
       fi
+    elif [ "$WARP_RUNNING" -eq 0 ] && [ -f "$WARP_REF_FILE" ]; then
+      # Случай 2: Нет интерфейса + Есть .ref → Запускаем интерфейс, пересоздаём .ref=1
+      ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
+      echo "🔧 Перезапуск WARP: $warp (интерфейс не активен, ref=$ref_count)"
+      rm -f "$WARP_REF_FILE"
+      if awg-quick up "$warp" 2>/dev/null; then
+        echo "1" > "$WARP_REF_FILE"
+        echo "✅ WARP $warp перезапущен (ref=1)"
+      else
+        echo "❌ Ошибка запуска $warp: $?"
+      fi
+    elif [ "$WARP_RUNNING" -eq 1 ] && [ -f "$WARP_REF_FILE" ]; then
+      # Случай 3: Есть интерфейс + Есть .ref → Увеличиваем .ref += 1
+      ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
+      echo "✅ WARP $warp уже запущен (ref=$ref_count → $((ref_count + 1)))"
+      echo $((ref_count + 1)) > "$WARP_REF_FILE"
+    else
+      # Случай 4: Есть интерфейс + Нет .ref → Создаём .ref=1
+      echo "⚠️  WARP $warp уже запущен но .ref не найден — создаём .ref=1"
+      echo "1" > "$WARP_REF_FILE"
     fi
     
     # ВАЖНО: Устанавливаем .active флаг ВНУТРИ блокировки
