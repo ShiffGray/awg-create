@@ -382,7 +382,7 @@ main() {
 
     echo
     echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   AmneziaWG Installer v5.4             ║${NC}"
+    echo -e "${GREEN}║   AmneziaWG Installer v5.5             ║${NC}"
     echo -e "${GREEN}║   Ubuntu 20-25 | Debian 11-13          ║${NC}"
     echo -e "${GREEN}║   + disable systemd-resolved           ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
