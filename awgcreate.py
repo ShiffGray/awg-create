@@ -5639,7 +5639,7 @@ def handle_confgen(opt) -> Set[str]:
                         net_ipv6 = net
                 
                 # Проверяем занимает ли сервер network address (broadcast НЕ работает)
-                # Сервер на network если его IP == network_address подсети
+                # Сервер на network если его ФАКТИЧЕСКИЙ IP (из конфига) == network_address подсети
                 server_ipv4_on_network = False
                 if net_ipv4:
                     if ',' in srv_addr_line:
@@ -5647,10 +5647,12 @@ def handle_confgen(opt) -> Set[str]:
                     else:
                         srv_ipv4_part = srv_addr_line.strip()
                     if '/' in srv_ipv4_part:
-                        srv_ip_net = ipaddress.ip_network(srv_ipv4_part, strict=False)
-                        # Сравниваем IP адрес сервера (не network!) с network_address подсети
-                        server_ipv4_on_network = (int(list(srv_ip_net.hosts())[0]) == int(net_ipv4.network_address))
-                
+                        # Получаем ФАКТИЧЕСКИЙ IP адрес (не network!)
+                        srv_ip_str = srv_ipv4_part.split('/')[0]
+                        srv_ip_int = int(ipaddress.ip_address(srv_ip_str))
+                        # Сравниваем фактический IP с network_address подсети
+                        server_ipv4_on_network = (srv_ip_int == int(net_ipv4.network_address))
+
                 server_ipv6_on_network = False
                 if net_ipv6:
                     if ',' in srv_addr_line:
@@ -5658,9 +5660,11 @@ def handle_confgen(opt) -> Set[str]:
                     else:
                         srv_ipv6_part = srv_addr_line.strip()
                     if '/' in srv_ipv6_part:
-                        srv_ip_net = ipaddress.ip_network(srv_ipv6_part, strict=False)
-                        # Сравниваем IP адрес сервера (не network!) с network_address подсети
-                        server_ipv6_on_network = (int(list(srv_ip_net.hosts())[0]) == int(net_ipv6.network_address))
+                        # Получаем ФАКТИЧЕСКИЙ IP адрес (не network!)
+                        srv_ip_str = srv_ipv6_part.split('/')[0]
+                        srv_ip_int = int(ipaddress.ip_address(srv_ip_str))
+                        # Сравниваем фактический IP с network_address подсети
+                        server_ipv6_on_network = (srv_ip_int == int(net_ipv6.network_address))
                 
                 for ip_str in allowed_ips_list:
                     if '/' in ip_str:
