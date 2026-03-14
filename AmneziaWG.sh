@@ -180,11 +180,12 @@ install_resolvconf() {
         log_success "openresolv установлен"
         # Ждём пока dpkg закончит
         sleep 2
-        # Создаём symlink во все возможные места
+        # Создаём symlink во все возможные места (ПРОВЕРЯЕМ ОБА!)
         if [ -f /sbin/resolvconf ]; then
             ln -sf /sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
             log_success "symlink /usr/bin/resolvconf → /sbin/resolvconf создан"
-        elif [ -f /usr/sbin/resolvconf ]; then
+        fi
+        if [ -f /usr/sbin/resolvconf ]; then
             ln -sf /usr/sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
             log_success "symlink /usr/bin/resolvconf → /usr/sbin/resolvconf создан"
         fi
