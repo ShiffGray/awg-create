@@ -5626,28 +5626,41 @@ def handle_confgen(opt) -> Set[str]:
                 allowed_ips_list = [ip.strip() for ip in client_allowed_ips.split(',')]
                 fixed_allowed_ips = []
                 
+                # Получаем подсети сервера из srv['Address']
+                srv_addr_line = srv.get('Address', '')
+                raw_subnets = [s.strip() for s in srv_addr_line.split(',')]
+                net_ipv4 = None
+                net_ipv6 = None
+                for subnet_str in raw_subnets:
+                    net = ipaddress.ip_network(subnet_str, strict=False)
+                    if isinstance(net, ipaddress.IPv4Network):
+                        net_ipv4 = net
+                    else:
+                        net_ipv6 = net
+                
                 # Проверяем занимает ли сервер network address (broadcast НЕ работает)
-                server_addr_ipv4 = srvcfg.split('[Peer]')[0]
+                # Сервер на network если его IP == network_address подсети
                 server_ipv4_on_network = False
-                for line in server_addr_ipv4.split('\n'):
-                    if line.strip().startswith('Address = '):
-                        addr_part = line.split('=')[1].strip().split(',')[0].strip()
-                        if '/' in addr_part:
-                            server_ip_net = ipaddress.ip_network(addr_part, strict=False)
-                            server_ipv4_on_network = (int(server_ip_net.network_address) == int(net_ipv4.network_address))
-                        break
+                if net_ipv4:
+                    if ',' in srv_addr_line:
+                        srv_ipv4_part = srv_addr_line.split(',')[0].strip()
+                    else:
+                        srv_ipv4_part = srv_addr_line.strip()
+                    if '/' in srv_ipv4_part:
+                        srv_ip_net = ipaddress.ip_network(srv_ipv4_part, strict=False)
+                        # Сравниваем IP адрес сервера (не network!) с network_address подсети
+                        server_ipv4_on_network = (int(list(srv_ip_net.hosts())[0]) == int(net_ipv4.network_address))
                 
                 server_ipv6_on_network = False
                 if net_ipv6:
-                    for line in server_addr_ipv4.split('\n'):
-                        if line.strip().startswith('Address = '):
-                            addr_part = line.split('=')[1].strip()
-                            if ',' in addr_part:
-                                addr_part = addr_part.split(',')[1].strip()
-                            if '/' in addr_part:
-                                server_ip_net = ipaddress.ip_network(addr_part, strict=False)
-                                server_ipv6_on_network = (int(server_ip_net.network_address) == int(net_ipv6.network_address))
-                            break
+                    if ',' in srv_addr_line:
+                        srv_ipv6_part = srv_addr_line.split(',')[1].strip()
+                    else:
+                        srv_ipv6_part = srv_addr_line.strip()
+                    if '/' in srv_ipv6_part:
+                        srv_ip_net = ipaddress.ip_network(srv_ipv6_part, strict=False)
+                        # Сравниваем IP адрес сервера (не network!) с network_address подсети
+                        server_ipv6_on_network = (int(list(srv_ip_net.hosts())[0]) == int(net_ipv6.network_address))
                 
                 for ip_str in allowed_ips_list:
                     if '/' in ip_str:
@@ -5667,7 +5680,8 @@ def handle_confgen(opt) -> Set[str]:
                     else:
                         fixed_allowed_ips.append(ip_str)
                 client_allowed_ips = ', '.join(fixed_allowed_ips)
-            except Exception:
+            except Exception as e:
+                logger.error('❌ Ошибка замены маски: %s', e)
                 pass  # Если ошибка, оставляем как есть
 
             out_base = out_base.replace('<CLIENT_TUNNEL_IP>', client_allowed_ips)
