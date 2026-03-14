@@ -1001,9 +1001,14 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   if [ ${#ALL_WARP_EXCLUSIONS[@]} -gt 0 ]; then
     echo "🔒 Исключение ${#ALL_WARP_EXCLUSIONS[@]} IP/подсетей из WARP (локальная сеть + none=)"
     for subnet in "${ALL_WARP_EXCLUSIONS[@]}"; do
-      # Создаём RETURN для IPv4 и IPv6
-      iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
-      ip6tables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      # Определяем тип подсети (IPv4 или IPv6) и применяем правило только к нужной таблице
+      if [[ "$subnet" == *:* ]]; then
+        # IPv6 подсеть — применяем только к ip6tables
+        ip6tables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      else
+        # IPv4 подсеть — применяем только к iptables
+        iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      fi
     done
   fi
 
@@ -1098,18 +1103,24 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
     if [ "$HAS_SUBNETS" -eq 1 ] && [ ${#SUBNET_GROUP[@]} -gt 0 ]; then
       # --- Трафик на конкретные подсети через эту группу WARP ---
       for subnet in "${SUBNET_GROUP[@]}"; do
-        # Балансировка между интерфейсами в группе (nth statistic) для IPv4 и IPv6
-        for i in $(seq 0 $((WARP_GROUP_COUNT-1))); do
-          MARK=$((MARK_BASE + MARK_OFFSET + i))
-          # Маркируем только новые соединения на эту подсеть (IPv4)
-          iptables -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -m conntrack --ctstate NEW \
-            -m statistic --mode nth --every $WARP_GROUP_COUNT --packet $i \
-            -j CONNMARK --set-mark $MARK
-          # Маркируем только новые соединения на эту подсеть (IPv6)
-          ip6tables -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -m conntrack --ctstate NEW \
-            -m statistic --mode nth --every $WARP_GROUP_COUNT --packet $i \
-            -j CONNMARK --set-mark $MARK
-        done
+        # Определяем тип подсети и применяем правило только к нужной таблице
+        if [[ "$subnet" == *:* ]]; then
+          # IPv6 подсеть — применяем только к ip6tables
+          for i in $(seq 0 $((WARP_GROUP_COUNT-1))); do
+            MARK=$((MARK_BASE + MARK_OFFSET + i))
+            ip6tables -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -m conntrack --ctstate NEW \
+              -m statistic --mode nth --every $WARP_GROUP_COUNT --packet $i \
+              -j CONNMARK --set-mark $MARK
+          done
+        else
+          # IPv4 подсеть — применяем только к iptables
+          for i in $(seq 0 $((WARP_GROUP_COUNT-1))); do
+            MARK=$((MARK_BASE + MARK_OFFSET + i))
+            iptables -t mangle -A "$RANDOM_WARP_CHAIN" -d "$subnet" -m conntrack --ctstate NEW \
+              -m statistic --mode nth --every $WARP_GROUP_COUNT --packet $i \
+              -j CONNMARK --set-mark $MARK
+          done
+        fi
       done
     fi
 
@@ -1122,9 +1133,14 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   if [ "$DEFAULT_WARP_COUNT" -gt 0 ]; then
     # Сначала создаём RETURN для всех специфичных подсетей (IPv4 и IPv6) - В НАЧАЛО цепи!
     for subnet in "${ALL_SPECIFIC_SUBNETS[@]}"; do
-      # Создаём RETURN для IPv4 и IPv6 в НАЧАЛО цепи (чтобы до маркировки)
-      iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
-      ip6tables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      # Определяем тип подсети (IPv4 или IPv6) и применяем правило только к нужной таблице
+      if [[ "$subnet" == *:* ]]; then
+        # IPv6 подсеть — применяем только к ip6tables
+        ip6tables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      else
+        # IPv4 подсеть — применяем только к iptables
+        iptables -t mangle -I "$RANDOM_WARP_CHAIN" 1 -d "$subnet" -j RETURN 2>/dev/null || true
+      fi
     done
 
     # Балансировка для всего остального трафика между ВСЕМИ интерфейсами без подсетей
