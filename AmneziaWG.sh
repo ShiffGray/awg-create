@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# AmneziaWG Installer v5.4
+# AmneziaWG Installer v5.5
 # Ubuntu 20.04-25.04 | Debian 11-13
 # Чистый код с учётом всех ошибок
 #
