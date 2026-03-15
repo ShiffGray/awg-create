@@ -98,6 +98,12 @@ disable_systemd_resolved() {
 purge_resolvconf() {
     log_info "Очистка resolvconf заглушек..."
 
+    # Проверяем если openresolv уже установлен — пропускаем очистку
+    if [ -x /usr/sbin/resolvconf ] && [ ! -L /usr/sbin/resolvconf ]; then
+        log_info "openresolv уже установлен (корректный бинарник)"
+        return 0
+    fi
+
     # Удаляем ВСЕ симлинки resolvconf (включая битые)
     for path in /sbin/resolvconf /usr/sbin/resolvconf /usr/bin/resolvconf; do
         if [ -L "$path" ]; then
@@ -151,34 +157,43 @@ install_deps() {
 # Создание симлинков для resolvconf
 create_resolvconf_symlinks() {
     log_info "Создание симлинков resolvconf..."
-    
+
     # Проверяем что /usr/sbin/resolvconf существует и это не битый симлинк
     if [ -L /usr/sbin/resolvconf ]; then
         # Это симлинк — проверяем куда указывает
         local target
         target=$(readlink -f /usr/sbin/resolvconf 2>/dev/null)
         if [ ! -x "$target" ]; then
-            log_warning "/usr/sbin/resolvconf — битый симлинк, переустанавливаем openresolv..."
-            apt-get install -y --reinstall openresolv 2>/dev/null || true
+            log_warning "/usr/sbin/resolvconf — битый симлинк, переустанавливаем..."
+            # Пробуем определить какой пакет установлен и переустановить его
+            if dpkg -l | grep -q "^ii[[:space:]]*openresolv[[:space:]]" 2>/dev/null; then
+                apt-get install -y --reinstall openresolv 2>/dev/null || true
+            elif dpkg -l | grep -q "^ii[[:space:]]*resolvconf[[:space:]]" 2>/dev/null; then
+                apt-get install -y --reinstall resolvconf 2>/dev/null || true
+            else
+                # Неизвестно — пробуем оба
+                apt-get install -y --reinstall openresolv 2>/dev/null || \
+                apt-get install -y --reinstall resolvconf 2>/dev/null || true
+            fi
         fi
     elif [ ! -x /usr/sbin/resolvconf ]; then
         log_warning "/usr/sbin/resolvconf не найден, пробуем установить..."
         apt-get install -y openresolv 2>/dev/null || apt-get install -y resolvconf 2>/dev/null || true
     fi
-    
+
     # Финальная проверка
     if [ ! -e /usr/sbin/resolvconf ]; then
         log_error "Не удалось восстановить /usr/sbin/resolvconf"
         exit 1
     fi
-    
+
     # Убеждаемся что директории существуют
     mkdir -p /sbin /usr/bin 2>/dev/null || true
-    
+
     # Создаём симлинки
     ln -sf /usr/sbin/resolvconf /sbin/resolvconf 2>/dev/null || true
     ln -sf /usr/sbin/resolvconf /usr/bin/resolvconf 2>/dev/null || true
-    
+
     # Проверяем что симлинки работают
     if [ -e /sbin/resolvconf ] || [ -e /usr/bin/resolvconf ] || [ -x /usr/sbin/resolvconf ]; then
         log_success "Симлинки созданы"
@@ -192,9 +207,9 @@ create_resolvconf_symlinks() {
 install_resolvconf() {
     log_info "Установка openresolv / resolvconf..."
 
-    # Проверяем что уже стоит (по файлу, а не по PATH)
-    if [ -x /usr/sbin/resolvconf ] || [ -x /sbin/resolvconf ] || [ -x /usr/bin/resolvconf ]; then
-        log_success "resolvconf/openresolv уже установлен"
+    # Проверяем если уже всё работает
+    if [ -x /usr/sbin/resolvconf ] && [ ! -L /usr/sbin/resolvconf ]; then
+        log_success "resolvconf уже установлен"
         create_resolvconf_symlinks
         return 0
     fi
@@ -202,22 +217,17 @@ install_resolvconf() {
     # Попытка 1: openresolv (предпочтительно)
     log_info "Устанавливаем openresolv..."
     if apt-get install -y --reinstall openresolv 2>/dev/null; then
-        # Проверяем что установился корректно
-        if [ -x /usr/sbin/resolvconf ] || [ -L /usr/sbin/resolvconf ]; then
-            log_success "openresolv установлен"
-            create_resolvconf_symlinks
-            return 0
-        fi
+        log_success "openresolv установлен"
+        create_resolvconf_symlinks
+        return 0
     fi
 
     # Попытка 2: resolvconf
     log_info "Устанавливаем resolvconf..."
     if apt-get install -y --reinstall resolvconf 2>/dev/null; then
-        if [ -x /usr/sbin/resolvconf ] || [ -L /usr/sbin/resolvconf ]; then
-            log_success "resolvconf установлен"
-            create_resolvconf_symlinks
-            return 0
-        fi
+        log_success "resolvconf установлен"
+        create_resolvconf_symlinks
+        return 0
     fi
 
     # Заглушка (последний вариант)
