@@ -142,54 +142,30 @@ install_deps() {
 install_resolvconf() {
     log_info "Установка openresolv / resolvconf..."
 
+    # Проверяем что уже стоит
+    if command -v resolvconf &> /dev/null; then
+        log_success "resolvconf/openresolv уже установлен"
+        return 0
+    fi
+
     # Попытка 1: openresolv (предпочтительно)
-    if ! apt-get install -y openresolv 2>/dev/null; then
-        # Попытка 2: resolvconf
-        if ! apt-get install -y resolvconf 2>/dev/null; then
-            # Заглушка (последний вариант)
-            log_warning "Создаём заглушку..."
-            printf '#!/bin/bash\nexit 0\n' > /usr/sbin/resolvconf
-            chmod +x /usr/sbin/resolvconf
-        fi
+    if apt-get install -y openresolv 2>/dev/null; then
+        log_success "openresolv установлен"
+        return 0
     fi
 
-    # Ждём пока dpkg закончит
-    sleep 2
-
-    # СОЗДАЁМ SYMLINK АВТОМАТИЧЕСКИ!
-    log_info "Создание symlink для resolvconf..."
-    
-    # Ищем где resolvconf (openresolv ставит в /sbin)
-    RESOLVCONF_PATH=""
-    if [ -e /sbin/resolvconf ]; then
-        RESOLVCONF_PATH="/sbin/resolvconf"
-    elif [ -e /usr/sbin/resolvconf ]; then
-        RESOLVCONF_PATH="/usr/sbin/resolvconf"
-    elif [ -e /usr/lib/openresolv/resolvconf ]; then
-        RESOLVCONF_PATH="/usr/lib/openresolv/resolvconf"
-    else
-        # Ищем через find
-        RESOLVCONF_PATH=$(find /usr /sbin /bin -name "resolvconf" \( -type f -o -type l \) 2>/dev/null | head -n1)
-    fi
-    
-    # Создаём symlink если нашли
-    if [ -n "$RESOLVCONF_PATH" ] && [ -e "$RESOLVCONF_PATH" ]; then
-        # СНАЧАЛА УДАЛЯЕМ СТАРЫЙ SYMLINK (если есть)
-        rm -f /usr/bin/resolvconf 2>/dev/null || true
-        # Создаём новый
-        ln -sf "$RESOLVCONF_PATH" /usr/bin/resolvconf 2>/dev/null || true
-        log_success "symlink /usr/bin/resolvconf → $RESOLVCONF_PATH создан"
-    else
-        log_warning "resolvconf бинарник не найден"
+    # Попытка 2: resolvconf
+    if apt-get install -y resolvconf 2>/dev/null; then
+        log_success "resolvconf установлен"
+        return 0
     fi
 
-    # Проверяем что работает
-    if command -v resolvconf &> /dev/null && resolvconf --version &> /dev/null; then
-        log_success "resolvconf установлен и работает"
-    else
-        log_warning "resolvconf НЕ работает — WARP с DNS не будут работать"
-        log_info "Исправь вручную: ln -sf /sbin/resolvconf /usr/bin/resolvconf"
-    fi
+    # Заглушка (последний вариант)
+    log_warning "Создаём заглушку..."
+    printf '#!/bin/bash\nexit 0\n' > /usr/sbin/resolvconf
+    chmod +x /usr/sbin/resolvconf
+    ln -sf /usr/sbin/resolvconf /sbin/resolvconf 2>/dev/null || true
+    log_success "Заглушка создана"
 }
 
 # Настройка DNS
