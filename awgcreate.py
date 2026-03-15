@@ -671,18 +671,21 @@ print(str(net.broadcast_address))
   }
 
   # Проверяем, занимает ли сервер NETWORK адрес (сравниваем как IP адреса!)
+  # Используем strict=True для точного сравнения
   if python3 -c "
 import ipaddress
 import sys
 try:
     server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP')
     net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
-    if server_ip == net.network_address:
+    # Сравниваем как целые числа для точности
+    if int(server_ip) == int(net.network_address):
         sys.exit(0)
     sys.exit(1)
-except:
+except Exception as e:
+    # При ошибке считаем что сервер НЕ на network адресе
     sys.exit(1)
-" 2>/dev/null; then
+"; then
     SERVER_ON_NETWORK=1
     echo "📍 IPv4: Сервер на network адресе ($LOCAL_SERVER_IP) — broadcast НЕ работает"
   else
@@ -755,12 +758,14 @@ import sys
 try:
     server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP_IPV6')
     net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
-    if server_ip == net.network_address:
+    # Сравниваем как целые числа для точности
+    if int(server_ip) == int(net.network_address):
         sys.exit(0)
     sys.exit(1)
-except:
+except Exception as e:
+    # При ошибке считаем что сервер НЕ на network адресе
     sys.exit(1)
-" 2>/dev/null; then
+"; then
     SERVER_ON_NETWORK_IPV6=1
     echo "📍 IPv6: Сервер на network адресе ($LOCAL_SERVER_IP_IPV6) — multicast НЕ работает"
   else
@@ -3141,6 +3146,45 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   LOCAL_SERVER_IP_IPV6="$(echo "$LOCAL_SUBNETS_IPV6" | cut -d'/' -f1)"
 fi
 
+# --- Проверка: занимает ли сервер NETWORK адрес (для broadcast/multicast) ---
+# Нужно для правильной очистки правил в down скрипте
+SERVER_ON_NETWORK=0
+SERVER_ON_NETWORK_IPV6=0
+
+if [ -n "$LOCAL_SUBNETS_IPV4" ] && [ -n "$LOCAL_SERVER_IP" ]; then
+  if python3 -c "
+import ipaddress
+import sys
+try:
+    server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP')
+    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
+    if int(server_ip) == int(net.network_address):
+        sys.exit(0)
+    sys.exit(1)
+except:
+    sys.exit(1)
+"; then
+    SERVER_ON_NETWORK=1
+  fi
+fi
+
+if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ -n "$LOCAL_SERVER_IP_IPV6" ]; then
+  if python3 -c "
+import ipaddress
+import sys
+try:
+    server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP_IPV6')
+    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
+    if int(server_ip) == int(net.network_address):
+        sys.exit(0)
+    sys.exit(1)
+except:
+    sys.exit(1)
+"; then
+    SERVER_ON_NETWORK_IPV6=1
+  fi
+fi
+
 # "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
 TUN_SAFE="$(echo "$TUN" | sed 's/[^a-zA-Z0-9]/_/g')"
 # Суффиксированные/уникальные имена цепочек/ресурсов
@@ -3595,11 +3639,12 @@ fi
 # IPv4 Broadcast очистка (mangle mark)
 # Правила созданы как: iptables -t mangle -A FORWARD -s "$src" -d "$BROADCAST_ADDR" -j MARK --set-mark $MARK
 # Поэтому удаляем с теми же параметрами
-if [ -n "$BROADCAST_ADDR" ]; then
+# ВАЖНО: Очищаем ТОЛЬКО если broadcast был включён (сервер НЕ на network адресе)
+if [ -n "$BROADCAST_ADDR" ] && [ "$SERVER_ON_NETWORK" -eq 0 ]; then
   MARK=$((MARK_BASE + 1000))
   for rule in "${LAN_ALLOW[@]}"; do
     IFS=',' read -ra PARTS <<< "$rule"
-    
+
     # Собираем только IPv4 участников (так же как в up.sh)
     IPV4_PARTS=()
     for part in "${PARTS[@]}"; do
@@ -3607,13 +3652,13 @@ if [ -n "$BROADCAST_ADDR" ]; then
       [ -z "$part" ] && continue
       [[ "$part" != *:* ]] && IPV4_PARTS+=("$part")
     done
-    
+
     # Удаляем правила маркировки broadcast для каждого IPv4 участника
     for src in "${IPV4_PARTS[@]}"; do
       iptables -t mangle -D FORWARD -s "$src" -d "$BROADCAST_ADDR" -j MARK --set-mark $MARK 2>/dev/null || true
       iptables -t mangle -D FORWARD -s "$src" -d 255.255.255.255 -j MARK --set-mark $MARK 2>/dev/null || true
     done
-    
+
     MARK=$((MARK + 1))
   done
 fi
@@ -3642,46 +3687,52 @@ done
 
 # IPv6 Multicast очистка (mangle mark)
 # Правила созданы как: ip6tables -t mangle -A FORWARD -s "$src" -d "ff02::1" -j MARK --set-mark $MARK
-MARK=$((MARK_BASE + 1000))
-for rule in "${LAN_ALLOW[@]}"; do
-  IFS=',' read -ra PARTS <<< "$rule"
-  
-  # Собираем только IPv6 участников (так же как в up.sh)
-  IPV6_PARTS=()
-  for part in "${PARTS[@]}"; do
-    part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [ -z "$part" ] && continue
-    [[ "$part" == *:* ]] && IPV6_PARTS+=("$part")
+# ВАЖНО: Очищаем ТОЛЬКО если multicast был включён (сервер НЕ на network адресе)
+if [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
+  MARK=$((MARK_BASE + 1000))
+  for rule in "${LAN_ALLOW[@]}"; do
+    IFS=',' read -ra PARTS <<< "$rule"
+
+    # Собираем только IPv6 участников (так же как в up.sh)
+    IPV6_PARTS=()
+    for part in "${PARTS[@]}"; do
+      part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -z "$part" ] && continue
+      [[ "$part" == *:* ]] && IPV6_PARTS+=("$part")
+    done
+
+    # Удаляем правила маркировки multicast для каждого IPv6 участника
+    for src in "${IPV6_PARTS[@]}"; do
+      ip6tables -t mangle -D FORWARD -s "$src" -d "ff02::1" -j MARK --set-mark $MARK 2>/dev/null || true
+    done
+
+    MARK=$((MARK + 1))
   done
-  
-  # Удаляем правила маркировки multicast для каждого IPv6 участника
-  for src in "${IPV6_PARTS[@]}"; do
-    ip6tables -t mangle -D FORWARD -s "$src" -d "ff02::1" -j MARK --set-mark $MARK 2>/dev/null || true
-  done
-  
-  MARK=$((MARK + 1))
-done
+fi
 
 # Очищаем ACCEPT правила для multicast (filter таблица)
-MARK=$((MARK_BASE + 1000))
-for rule in "${LAN_ALLOW[@]}"; do
-  IFS=',' read -ra PARTS <<< "$rule"
-  
-  # Собираем только IPv6 участников (так же как в up.sh)
-  IPV6_PARTS=()
-  for part in "${PARTS[@]}"; do
-    part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [ -z "$part" ] && continue
-    [[ "$part" == *:* ]] && IPV6_PARTS+=("$part")
+# ВАЖНО: Очищаем ТОЛЬКО если multicast был включён (сервер НЕ на network адресе)
+if [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
+  MARK=$((MARK_BASE + 1000))
+  for rule in "${LAN_ALLOW[@]}"; do
+    IFS=',' read -ra PARTS <<< "$rule"
+
+    # Собираем только IPv6 участников (так же как в up.sh)
+    IPV6_PARTS=()
+    for part in "${PARTS[@]}"; do
+      part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -z "$part" ] && continue
+      [[ "$part" == *:* ]] && IPV6_PARTS+=("$part")
+    done
+
+    # Удаляем ACCEPT правила для каждого IPv6 участника
+    for dst in "${IPV6_PARTS[@]}"; do
+      ip6tables -D FORWARD -i "$TUN" -o "$TUN" -m mark --mark $MARK -d "$dst" -j ACCEPT 2>/dev/null || true
+    done
+
+    MARK=$((MARK + 1))
   done
-  
-  # Удаляем ACCEPT правила для каждого IPv6 участника
-  for dst in "${IPV6_PARTS[@]}"; do
-    ip6tables -D FORWARD -i "$TUN" -o "$TUN" -m mark --mark $MARK -d "$dst" -j ACCEPT 2>/dev/null || true
-  done
-  
-  MARK=$((MARK + 1))
-done
+fi
 
 # --- Полное удаление цепочек проброса портов (специфично для туннеля) ---
 # IPv4 + IPv6 очистка
