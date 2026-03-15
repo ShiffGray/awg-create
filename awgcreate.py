@@ -347,15 +347,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   
   # Проверка tc классов на IFB
   echo "   📊 Классы HTB ($IFB_OUT):"
-  total_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -i "rate.*44" | wc -l)
+  total_classes=$(tc class show dev "$IFB_OUT" 2>/dev/null | grep -c "rate" || echo "0")
   active_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -E "Sent [1-9]" | wc -l)
   total_overlimits=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep "overlimits" | grep -oE "[0-9]+" | awk '{sum+=$1} END {print sum+0}')
-  
+
   if [ "$total_classes" -gt 0 ]; then
-    echo "   ✅ Создано классов с лимитом 44Mbit: $total_classes"
+    echo "   ✅ Создано HTB классов: $total_classes"
     echo "   ✅ Активных классов (с трафиком): $active_classes"
     echo "   ✅ Всего overlimits (ограничений): ${total_overlimits:-0}"
-    
+
     # Показываем топ-5 активных классов
     if [ "$active_classes" -gt 0 ]; then
       echo "   📈 Топ-5 активных классов:"
