@@ -6,6 +6,7 @@ AmneziaWG Helper Script
 
 from __future__ import annotations
 import argparse
+import base64
 import datetime
 import glob
 import ipaddress
@@ -15,13 +16,13 @@ import os
 import pathlib
 import random
 import re
+import secrets
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 import zipfile
-import base64
 from typing import Dict, List, Optional, Tuple, Set
 
 # ----------------- Сторонние библиотеки -----------------
@@ -63,24 +64,16 @@ g_main_config_fn: Optional[pathlib.Path] = None
 g_main_config_type: Optional[str] = None  # 'WG' или 'AWG'
 clients_for_zip: List[str] = []
 
+
 # ----------------- Шаблоны -----------------
 
-g_defserver_config = """
+g_defserver_config = """# Protocol: <PROTOCOL>
 [Interface]
 #_GenKeyTime = <SERVER_KEY_TIME>
 #_PublicKey = <SERVER_PUBLIC_KEY>
 Address = <SERVER_ADDR>
 ListenPort = <SERVER_PORT>
-Jc = <JC>
-Jmin = <JMIN>
-Jmax = <JMAX>
-S1 = <S1>
-S2 = <S2>
-H1 = <H1>
-H2 = <H2>
-H3 = <H3>
-H4 = <H4>
-MTU = <MTU>
+<JC_LINE><JMIN_LINE><JMAX_LINE><S1_LINE><S2_LINE><S3_LINE><S4_LINE><H1_LINE><H2_LINE><H3_LINE><H4_LINE><I1_LINE><I2_LINE><I3_LINE><I4_LINE><I5_LINE>MTU = <MTU>
 PrivateKey = <SERVER_PRIVATE_KEY>
 
 PostUp = bash <SERVER_UP_SCRIPT>
@@ -91,16 +84,7 @@ g_defclient_config = """
 [Interface]
 Address = <CLIENT_TUNNEL_IP>
 DNS = 1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001
-Jc = <JC>
-Jmin = <JMIN>
-Jmax = <JMAX>
-S1 = <S1>
-S2 = <S2>
-H1 = <H1>
-H2 = <H2>
-H3 = <H3>
-H4 = <H4>
-MTU = <MTU>
+<JC_LINE><JMIN_LINE><JMAX_LINE><S1_LINE><S2_LINE><S3_LINE><S4_LINE><H1_LINE><H2_LINE><H3_LINE><H4_LINE><I1_LINE><I2_LINE><I3_LINE><I4_LINE><I5_LINE>MTU = <MTU>
 PrivateKey = <CLIENT_PRIVATE_KEY>
 
 [Peer]
@@ -114,16 +98,8 @@ AllowedIPs = <ALLOWED_IPS>
 g_warp_config = """
 [Interface]
 Address = <WARP_ADDRESS>
-Jc = <JC>
-Jmin = <JMIN>
-Jmax = <JMAX>
-H1 = 1
-H2 = 2
-H3 = 3
-H4 = 4
-MTU = <MTU>
+<JC_LINE><JMIN_LINE><JMAX_LINE><I1_LINE><I2_LINE><I3_LINE><I4_LINE><I5_LINE><TABLE_LINE>MTU = <MTU>
 PrivateKey = <WARP_PRIVATE_KEY>
-Table = off
 
 [Peer]
 Endpoint = <WARP_ENDPOINT>
@@ -3998,6 +3974,351 @@ rm -f "$TUNNEL_PARAMS_FILE" 2>/dev/null || true
 echo "————————————————————————————————"
 '''
 
+# ----------------- Генерация параметров обфускации -----------------
+
+def generate_cps_packet(
+    static_bytes: str = None,
+    static_bytes_range: int = 0,  # Если > 0, то длина static_bytes будет случайной
+    use_timestamp: bool = False,
+    random_bytes: int = 0,
+    random_bytes_range: int = 0,  # Если > 0, то random_bytes будет случайным в диапазоне
+    random_ascii: int = 0,
+    random_ascii_range: int = 0,  # Если > 0, то random_ascii будет случайным в диапазоне
+    random_digits: int = 0,
+) -> str:
+    """
+    Генерация CPS-пакета (I1-I5) для маскировки под легитимные UDP протоколы.
+
+    Протоколы для России (никогда не заблокируют):
+    - DNS (порт 53) — без DNS интернет не работает
+    - QUIC (порт 443) — Google, YouTube, Chrome
+    - DTLS (порт 443) — WebRTC, Zoom, Teams
+    - NTP (порт 123) — синхронизация времени
+
+    Формат: <b 0xHEX><t><r N><rc N><rd N> (по документации AmneziaWG)
+
+    ВАЖНО: Размеры должны быть разумными чтобы не крашить ядро!
+    """
+    parts = []
+
+    # Генерируем static_bytes с рандомной длиной если указан диапазон
+    if static_bytes:
+        if static_bytes_range > 0:
+            # Генерируем случайную длину в байтах (не в hex!)
+            actual_length = random.randint(len(static_bytes)//2, len(static_bytes)//2 + static_bytes_range)
+            static_bytes = f"0x{secrets.token_hex(actual_length)}"
+        parts.append(f"<b {static_bytes}>")
+
+    if use_timestamp:
+        parts.append("<t>")
+    
+    # Если указан диапазон, генерируем случайное значение
+    if random_bytes_range > 0:
+        actual_random_bytes = random.randint(random_bytes, random_bytes + random_bytes_range)
+    else:
+        actual_random_bytes = random_bytes
+    
+    if actual_random_bytes > 0:
+        parts.append(f"<r {actual_random_bytes}>")
+    
+    # Если указан диапазон, генерируем случайное значение
+    if random_ascii_range > 0:
+        actual_random_ascii = random.randint(random_ascii, random_ascii + random_ascii_range)
+    else:
+        actual_random_ascii = random_ascii
+    
+    if actual_random_ascii > 0:
+        parts.append(f"<rc {actual_random_ascii}>")
+    
+    if random_digits > 0:
+        parts.append(f"<rd {random_digits}>")
+    
+    return "".join(parts)
+
+
+def _generate_j_params() -> Tuple[int, int, int]:
+    """Генерация Jc, Jmin, Jmax (junk-пакеты)."""
+    Jc = random.randint(80, 120)
+    Jmin = random.randint(48, 64)
+    Jmax = random.randint(Jmin + 8, 80)
+    return Jc, Jmin, Jmax
+
+
+def _generate_s_params() -> Tuple[int, int, int, int]:
+    """Генерация S1, S2, S3, S4 (случайные префиксы).
+    
+    Все S-параметры отличаются минимум на 3 единицы.
+    S1+56 ≠ S2 (требование AmneziaWG).
+    """
+    while True:
+        S1 = random.randint(61, 255)
+        S2 = random.randint(29, 127)
+        S3 = random.randint(13, 63)
+        S4 = random.randint(3, 31)
+
+        s_values = [S1, S2, S3, S4]
+        min_diff_ok = all(abs(s_values[i] - s_values[j]) >= 3
+                          for i in range(len(s_values)) for j in range(i+1, len(s_values)))
+
+        if S1 + 56 != S2 and min_diff_ok:
+            break
+    
+    return S1, S2, S3, S4
+
+
+def _generate_h_params_static() -> Tuple[int, int, int, int]:
+    """Генерация H1-H4 как статичных чисел (для AWG1.0, AWG1.5).
+
+    Все H-параметры отличаются минимум на 30,000.
+    Возвращаемые значения перемешиваются для непредсказуемости.
+    """
+    H_MIN_DIFF = 30000
+
+    while True:
+        H1 = random.randint(0x10000011, 0xFFFFFFF0)
+        H2 = random.randint(0x10000011, 0xFFFFFFF0)
+        H3 = random.randint(0x10000011, 0xFFFFFFF0)
+        H4 = random.randint(0x10000011, 0xFFFFFFF0)
+
+        h_values = [H1, H2, H3, H4]
+        h_diff_ok = all(abs(h_values[i] - h_values[j]) >= H_MIN_DIFF
+                        for i in range(len(h_values)) for j in range(i+1, len(h_values)))
+
+        if h_diff_ok:
+            break
+
+    # Перемешиваем значения перед возвратом
+    h_values = [H1, H2, H3, H4]
+    random.shuffle(h_values)
+
+    return h_values[0], h_values[1], h_values[2], h_values[3]
+
+
+def _generate_h_params_ranges() -> Tuple[str, str, str, str]:
+    """Генерация H1-H4 как диапазонов (для AWG2.0).
+
+    Возвращает строки формата "start-end".
+    Каждый диапазон 300M-600M (случайный размер), с зазором ≥30,000 между диапазонами.
+    """
+    H_MIN_SIZE = 300000000  # 300M минимальный размер
+    H_MAX_SIZE = 600000000  # 600M максимальный размер
+    H_MIN_GAP = 30000       # 30K минимальный зазор
+
+    while True:
+        # Генерируем 4 случайных размера диапазонов
+        h_sizes = [random.randint(H_MIN_SIZE, H_MAX_SIZE) for _ in range(4)]
+
+        # Генерируем 4 стартовые точки
+        h_starts = []
+        max_possible_start = 2147483647 - H_MAX_SIZE - H_MIN_GAP * 3
+        for _ in range(4):
+            h_start = random.randint(5, max_possible_start)
+            h_starts.append(h_start)
+
+        # Проверяем на пересечения (с учётом разных размеров)
+        overlaps = False
+        for i in range(4):
+            for j in range(i + 1, 4):
+                start_i, end_i = h_starts[i], h_starts[i] + h_sizes[i]
+                start_j, end_j = h_starts[j], h_starts[j] + h_sizes[j]
+
+                # Проверяем есть ли зазор ≥30K между диапазонами
+                if end_i + H_MIN_GAP > start_j and end_j + H_MIN_GAP > start_i:
+                    overlaps = True
+                    break
+            if overlaps:
+                break
+
+        if not overlaps:
+            break
+
+    # Создаём диапазоны
+    ranges = [(s, s + sz) for s, sz in zip(h_starts, h_sizes)]
+    random.shuffle(ranges)
+
+    return (f"{ranges[0][0]}-{ranges[0][1]}",
+            f"{ranges[1][0]}-{ranges[1][1]}",
+            f"{ranges[2][0]}-{ranges[2][1]}",
+            f"{ranges[3][0]}-{ranges[3][1]}")
+
+
+def _generate_i_params() -> Dict[str, str]:
+    """Генерация I1-I5 (CPS-пакеты для маскировки под критическую инфраструктуру).
+
+    I1: DNS (порт 53)
+    I2: QUIC (порт 443) — Google, YouTube, Chrome
+    I3: DTLS 1.2 (порт 443) — WebRTC, Zoom, Teams
+    I4: NTP (порт 123) — синхронизация времени
+    I5: DTLS 1.3 (порт 443)
+    """
+    return {
+        "I1": generate_cps_packet(static_bytes="0x01", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
+        "I2": generate_cps_packet(static_bytes="0xc7", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
+        "I3": generate_cps_packet(static_bytes="0x16FEFD", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
+        "I4": generate_cps_packet(static_bytes="0x1B", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
+        "I5": generate_cps_packet(static_bytes="0x16FEFF", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
+    }
+
+
+
+def generate_all_params(version: str, for_client: bool = False, for_server: bool = True) -> dict:
+    """
+    УНИВЕРСАЛЬНАЯ ФУНКЦИЯ — генерирует ВСЕ параметры обфускации сразу.
+
+    Возвращает полный набор параметров, но неподдерживаемые версии = None.
+
+    Таблица реализации:
+    ┌────────┬──────────────┬───────────────┬──────────────┬────────────┬──────────────┐
+    │ Версия │ Jc,Jmin,Jmax │ S1,S2         │ H1-H4        │ I1-I5      │ S3,S4        │
+    ├────────┼──────────────┼───────────────┼──────────────┼────────────┼──────────────┤
+    │ WG     │ - коммент    │ - коммент     │ - коммент    │ - коммент  │ - коммент    │
+    │ AWG    │ + разные     │ + одинаковые  │ - коммент    │ - коммент  │ - коммент    │
+    │ AWG1.0 │ + разные     │ + одинаковые  │ + статичные  │ - коммент  │ - коммент    │
+    │ AWG1.5 │ + разные     │ + одинаковые  │ + статичные  │ + клиент   │ - коммент    │
+    │ AWG2.0 │ + разные     │ + одинаковые  │ + диапазоны  │ + клиент   │ + одинаковые │
+    └────────┴──────────────┴───────────────┴──────────────┴────────────┴──────────────┘
+
+┌────────┬───────────────────┬────────────────────────────┬────────────────────────────┬────────────────────┬────────────────────────────┐
+│ Версия │ Jc,Jmin,Jmax      │ S1,S2                      │ H1-H4                      │ I1-I5              │ S3,S4                      │
+├────────┼───────────────────┼────────────────────────────┼────────────────────────────┼────────────────────┼────────────────────────────┤
+│ WG     │ - с:#,к/Wс/Wк:нет │ - с:#,к/Wс/Wк:нет          │ - с:#,к/Wс/Wк:нет          │ - с:#,к/Wс/Wк:нет  │ - с:#,к/Wс/Wк:нет          │
+│ AWG    │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ - с:#,к/Wс/Wк:нет          │ - с:#,к/Wс/Wк:нет  │ - с:#,к/Wс/Wк:нет          │
+│ AWG1.0 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ - с:#,к/Wс/Wк:нет  │ - с:#,к/Wс/Wк:нет          │
+│ AWG1.5 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ + с/к/Wс/Wк:свои   │ - с:#,к/Wс/Wк:нет          │
+│ AWG2.0 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ + с/к/Wс/Wк:свои   │ + с/к:одинаковые,Wс/Wк:нет │
+└────────┴───────────────────┴────────────────────────────┴────────────────────────────┴────────────────────┴────────────────────────────┘
+
+    Args:
+        version: "WG", "AWG", "AWG1.0", "AWG1.5", "AWG2.0"
+        for_client: Если True, генерировать I1-I5 для клиента
+        for_server: Если True, генерировать ВСЕ параметры (даже неподдерживаемые) для сервера
+
+    Returns:
+        Словарь со всеми параметрами. None = параметр не поддерживается (закомментировать).
+    """
+    # Генерируем полный набор параметров для максимальной версии (AWG2.0)
+    Jc, Jmin, Jmax = _generate_j_params()
+    S1, S2, S3, S4 = _generate_s_params()
+    
+    # H1-H4: статичные для AWG1.0/1.5, диапазоны для AWG2.0
+    if version == "AWG2.0":
+        H1, H2, H3, H4 = _generate_h_params_ranges()
+    else:
+        H1, H2, H3, H4 = _generate_h_params_static()
+
+    # Определяем какие параметры поддерживаются в данной версии
+    supports_jc = version in ["AWG", "AWG1.0", "AWG1.5", "AWG2.0"]
+    supports_s1_s2 = version in ["AWG", "AWG1.0", "AWG1.5", "AWG2.0"]
+    supports_h = version in ["AWG1.0", "AWG1.5", "AWG2.0"]
+    supports_i = version in ["AWG1.5", "AWG2.0"]  # I1-I5 для сервера и клиента
+    supports_s3_s4 = version == "AWG2.0"
+
+    # Формируем результат
+    result = {}
+
+    # Jc, Jmin, Jmax
+    if supports_jc:
+        result.update({"Jc": Jc, "Jmin": Jmin, "Jmax": Jmax})
+    else:
+        if for_server:
+            result.update({"Jc": Jc, "Jmin": Jmin, "Jmax": Jmax, "_J_comment": "AWG+"})
+        else:
+            result.update({"Jc": None, "Jmin": None, "Jmax": None})
+
+    # S1, S2
+    if supports_s1_s2:
+        # Клиент читает S1, S2 из серверного конфига
+        if for_server:
+            result.update({"S1": S1, "S2": S2})
+        else:
+            result.update({"S1": None, "S2": None})
+    else:
+        if for_server:
+            result.update({"S1": S1, "S2": S2, "_S12_comment": "AWG+"})
+        else:
+            result.update({"S1": None, "S2": None})
+
+    # S3, S4
+    if supports_s3_s4:
+        # AWG2.0 поддерживает S3, S4, но клиент читает их из серверного конфига
+        if for_server:
+            result.update({"S3": S3, "S4": S4})
+        else:
+            result.update({"S3": None, "S4": None})
+    else:
+        if for_server:
+            result.update({"S3": S3, "S4": S4, "_S34_comment": "AWG2.0"})
+        else:
+            result.update({"S3": None, "S4": None})
+
+    # H1-H4
+    if supports_h:
+        # Клиент читает H1-H4 из серверного конфига
+        if for_server:
+            result.update({"H1": H1, "H2": H2, "H3": H3, "H4": H4})
+        else:
+            result.update({"H1": None, "H2": None, "H3": None, "H4": None})
+    else:
+        if for_server:
+            result.update({"H1": H1, "H2": H2, "H3": H3, "H4": H4, "_H_comment": "AWG1.0+"})
+        else:
+            result.update({"H1": None, "H2": None, "H3": None, "H4": None})
+
+    # I1-I5 — генерируем всегда для сервера, чтобы были закомментированные значения
+    if supports_i or for_server:
+        i_params = _generate_i_params()
+        if supports_i:
+            result.update(i_params)
+        else:
+            # WG, AWG, AWG1.0 — закомментированные значения
+            result.update({
+                "I1": i_params["I1"], "I2": i_params["I2"], "I3": i_params["I3"],
+                "I4": i_params["I4"], "I5": i_params["I5"]
+            })
+    else:
+        # Клиент без I1-I5
+        result.update({"I1": None, "I2": None, "I3": None, "I4": None, "I5": None})
+
+    return result
+
+# ----------------- Генерация ключей -----------------
+
+def gen_pair_keys(cfg_type: Optional[str] = None) -> Tuple[str, str]:
+    """Генерация пары ключей (PrivateKey + PublicKey) через wg/awg genkey."""
+    global g_main_config_type
+    if not cfg_type:
+        cfg_type = g_main_config_type
+    if not cfg_type:
+        raise RuntimeError("Неизвестный тип конфига для генерации ключей")
+    wgtool = "wg" if cfg_type.lower().startswith("w") else "awg"
+    rc, out = exec_cmd([wgtool, "genkey"])
+    if rc != 0 or not out:
+        # Fallback
+        if wgtool == "awg":
+            logger.warning("⚠  awg не найден, пробую wg...")
+            rc, out = exec_cmd(["wg", "genkey"])
+            wgtool = "wg"
+    if rc != 0 or not out:
+        raise RuntimeError(f"Не удалось сгенерировать приватный ключ через {wgtool}: {out.strip()}")
+    priv = out.strip()
+    rc, out = exec_cmd([wgtool, "pubkey"], input=priv + "\n")
+    if rc != 0 or not out:
+        raise RuntimeError(f"Не удалось сгенерировать публичный ключ через {wgtool}: {out.strip()}")
+    pub = out.strip()
+    return priv, pub
+
+
+def gen_preshared_key() -> str:
+    """Генерация preshared key через openssl rand или os.urandom."""
+    rc, out = exec_cmd(["openssl", "rand", "-base64", "32"])
+    if rc == 0 and out:
+        return out.strip()
+    try:
+        return base64.b64encode(os.urandom(32)).decode("ascii")
+    except Exception:
+        raise RuntimeError("Не удалось сгенерировать preshared key")
+
+
 # ----------------- Утилиты -----------------
 
 
@@ -4041,40 +4362,6 @@ def exec_cmd(cmd, input: Optional[str] = None, shell: bool = False, timeout: Opt
         return 1, f"exec_cmd failed: {e}"
 
 
-def gen_pair_keys(cfg_type: Optional[str] = None) -> Tuple[str, str]:
-    global g_main_config_type
-    if not cfg_type:
-        cfg_type = g_main_config_type
-    if not cfg_type:
-        raise RuntimeError("Неизвестный тип конфига для генерации ключей")
-    wgtool = "wg" if cfg_type.lower().startswith("w") else "awg"
-    rc, out = exec_cmd([wgtool, "genkey"])
-    if rc != 0 or not out:
-        # Fallback
-        if wgtool == "awg":
-            logger.warning("⚠  awg не найден, пробую wg...")
-            rc, out = exec_cmd(["wg", "genkey"])
-            wgtool = "wg"
-    if rc != 0 or not out:
-        raise RuntimeError(f"Не удалось сгенерировать приватный ключ через {wgtool}: {out.strip()}")
-    priv = out.strip()
-    rc, out = exec_cmd([wgtool, "pubkey"], input=priv + "\n")
-    if rc != 0 or not out:
-        raise RuntimeError(f"Не удалось сгенерировать публичный ключ через {wgtool}: {out.strip()}")
-    pub = out.strip()
-    return priv, pub
-
-
-def gen_preshared_key() -> str:
-    rc, out = exec_cmd(["openssl", "rand", "-base64", "32"])
-    if rc == 0 and out:
-        return out.strip()
-    try:
-        return base64.b64encode(os.urandom(32)).decode("ascii")
-    except Exception:
-        raise RuntimeError("Не удалось сгенерировать preshared key")
-
-
 def get_main_iface() -> Optional[str]:
     rc, out = exec_cmd(["ip", "link", "show"])
     if rc != 0:
@@ -4089,14 +4376,50 @@ def get_main_iface() -> Optional[str]:
 
 
 def get_ext_ipaddr() -> str:
-    try:
-        r = requests.get("https://icanhazip.com", timeout=6)
-        r.raise_for_status()
-        ip = r.text.strip()
-        ipaddress.ip_address(ip)
-        return ip
-    except Exception as e:
-        raise RuntimeError(f"Не удалось получить внешний IP: {e}")
+    """
+    Получение внешнего IP адреса сервера.
+    
+    Использует несколько сервисов по порядку (fallback) пока не получит валидный IP.
+    Сервисы проверяются в порядке: icanhazip.com → api.ipify.org → ifconfig.me → checkip.amazonaws.com
+    
+    Returns:
+        str: Внешний IPv4 или IPv6 адрес сервера
+    
+    Raises:
+        RuntimeError: Если ни один сервис не ответил
+    """
+    # Список сервисов для получения внешнего IP (по порядку)
+    services = [
+        ("https://icanhazip.com", "text"),
+        ("https://api.ipify.org", "text"),
+        ("https://ifconfig.me/ip", "text"),
+        ("https://checkip.amazonaws.com", "text"),
+    ]
+    
+    last_error = None
+    
+    for service_url, service_type in services:
+        try:
+            r = requests.get(service_url, timeout=6)
+            r.raise_for_status()
+            ip = r.text.strip()
+            
+            # Проверяем что это валидный IP адрес
+            ipaddress.ip_address(ip)
+            
+            return ip
+            
+        except requests.exceptions.RequestException as e:
+            # Ошибка сети — пробуем следующий сервис
+            last_error = f"{service_url}: {e}"
+            continue
+        except ValueError as e:
+            # Неверный формат IP — пробуем следующий сервис
+            last_error = f"{service_url}: неверный формат IP"
+            continue
+    
+    # Ни один сервис не сработал
+    raise RuntimeError(f"Не удалось получить внешний IP ни из одного сервиса. Последняя ошибка: {last_error}")
 
 
 class IPAddr:
@@ -4442,9 +4765,12 @@ def _select_endpoint_from_api_result(result: dict) -> Optional[object]:
     return None
 
 
-def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "") -> Tuple[str, str]:
+def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", version: str = "AWG2.0", for_server: bool = True) -> Tuple[str, str]:
     """
-    Генерация одного WARP-конфига.
+    Генерация одного WARP-конфига (универсальная функция).
+    
+    for_server=True  → Серверный WARP (с Table = off, для up/down скриптов)
+    for_server=False → Клиентский WARP (без Table = off, для личного использования)
     """
     api = "https://api.cloudflareclient.com/v0i1909051800"
     headers = {"user-agent": "amneziawg-script/1.0", "content-type": "application/json"}
@@ -4527,36 +4853,68 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "") -
     if not chosen:
         raise RuntimeError("Не найден доступный endpoint для WARP (проверено %d endpoint'ов)" % total_endpoints)
 
-    jc = random.randint(80, 120)
-    jmin = random.randint(48, 64)
-    jmax = random.randint(jmin + 8, 80)
-    persistent_keepalive = random.randint(1, 9)
+    # Генерируем все параметры обфускации через общую функцию
+    # WARP это клиентский конфиг, поэтому for_client=True
+    warp_obf_params = generate_all_params(version, for_client=True, for_server=False)
+
+    persistent_keepalive = _generate_persistent_keepalive()
     out = g_warp_config
     out = out.replace("<WARP_PRIVATE_KEY>", priv_key)
-    out = out.replace("<JC>", str(jc))
-    out = out.replace("<JMIN>", str(jmin))
-    out = out.replace("<JMAX>", str(jmax))
+    
+    # Jc, Jmin, Jmax
+    if warp_obf_params.get("Jc") is not None:
+        out = out.replace("<JC_LINE>", f"Jc = {warp_obf_params['Jc']}\n")
+        out = out.replace("<JMIN_LINE>", f"Jmin = {warp_obf_params['Jmin']}\n")
+        out = out.replace("<JMAX_LINE>", f"Jmax = {warp_obf_params['Jmax']}\n")
+    else:
+        # WG не поддерживает Jc, Jmin, Jmax — удаляем
+        out = out.replace("<JC_LINE>", "")
+        out = out.replace("<JMIN_LINE>", "")
+        out = out.replace("<JMAX_LINE>", "")
+    
     out = out.replace("<MTU>", str(mtu))
     out = out.replace("<WARP_ADDRESS>", ", ".join([x for x in (client_ipv4, client_ipv6) if x]))
     out = out.replace("<WARP_PEER_PUBLIC_KEY>", peer_pub)
     out = out.replace("<PERSISTENT_KEEPALIVE>", str(persistent_keepalive))
     out = out.replace("<WARP_ENDPOINT>", chosen)
+
+    # I1-I5
+    if warp_obf_params.get("I1") is not None:
+        out = out.replace("<I1_LINE>", f"I1 = {warp_obf_params['I1']}\n")
+        out = out.replace("<I2_LINE>", f"I2 = {warp_obf_params['I2']}\n")
+        out = out.replace("<I3_LINE>", f"I3 = {warp_obf_params['I3']}\n")
+        out = out.replace("<I4_LINE>", f"I4 = {warp_obf_params['I4']}\n")
+        out = out.replace("<I5_LINE>", f"I5 = {warp_obf_params['I5']}\n")
+    else:
+        # Без I1-I5 для WG, AWG, AWG1.0 — удаляем всё включая переносы
+        out = out.replace("<I1_LINE>", "")
+        out = out.replace("<I2_LINE>", "")
+        out = out.replace("<I3_LINE>", "")
+        out = out.replace("<I4_LINE>", "")
+        out = out.replace("<I5_LINE>", "")
+    
+    # Table = off только для серверного WARP (любой версии)
+    out = out.replace("<TABLE_LINE>", "Table = off\n" if for_server else "")
+
     filename = f"{tun_name}warp{index}.conf"
     return out, filename
 
 
-def generate_warp_configs(tun_name: str, num_warps: int, mtu: int, proxy: str = "") -> List[str]:
+def generate_warp_configs(tun_name: str, num_warps: int, mtu: int, proxy: str = "", version: str = "AWG2.0", for_server: bool = True) -> List[str]:
     """
     Генерация N WARP-конфигов с попытками и откатом при неудаче.
+    
+    for_server=True  → Серверный WARP (с Table = off)
+    for_server=False → Клиентский WARP (без Table = off)
     """
     warp_configs: List[str] = []
     last_error = None  # Сохраняем последнюю ошибку
-    
+
     for i in range(num_warps):
         success = False
         for attempt in range(3):  # 3 попытки достаточно
             try:
-                conf_text, fname = generate_warp_config(tun_name, i, mtu, proxy)
+                conf_text, fname = generate_warp_config(tun_name, i, mtu, proxy, version, for_server)
                 path = pathlib.Path(g_main_config_fn).parent.joinpath(fname)
                 atomic_write_text(path, conf_text)
                 warp_configs.append(fname)
@@ -5064,12 +5422,10 @@ def parse_ipaddr_argument(ipaddr_str: str) -> Tuple[ipaddress.IPv4Network, Optio
     return ipaddr_ipv4, ipaddr_ipv6, ipaddr_display, ipaddr_display
 
 
-def handle_makecfg(opt) -> None:
-    global g_main_config_fn, g_main_config_type
+# ----------------- Вспомогательные функции для handle_makecfg -----------------
 
-    raw_input = opt.makecfg
-
-    # Логика "умного пути"
+def _process_interface_path(raw_input: str) -> Tuple[pathlib.Path, str]:
+    """Обработка пути к интерфейсу. Возвращает (target_path, tun_name)."""
     if os.sep not in raw_input:
         # Если слэшей нет, считаем это именем файла в /etc/amnezia/amneziawg/
         name = raw_input
@@ -5079,12 +5435,658 @@ def handle_makecfg(opt) -> None:
     else:
         # Если слэши есть, используем как путь
         target_path = pathlib.Path(raw_input)
-
+    
     tun_name = target_path.stem
+    return target_path, tun_name
+
+
+def _generate_warp_if_needed(tun_name: str, warp_count: int, mtu: int, proxy: str, 
+                              awg_version: str) -> List[str]:
+    """Генерация WARP конфигов если нужно. Возвращает список конфигов."""
+    warp_configs: List[str] = []
+    if warp_count > 0:
+        logger.info("🌀 Генерация %d WARP конфигов...", warp_count)
+        try:
+            warp_configs = generate_warp_configs(tun_name, warp_count, mtu, proxy, awg_version, for_server=True)
+        except RuntimeError as e:
+            error_msg = str(e)
+
+            # Проверяем тип ошибки по тексту
+            if "Не найден доступный endpoint" in error_msg:
+                logger.error("❌ Не удалось сгенерировать WARP: проблема с доступом к Cloudflare Endpoint")
+                logger.info("💡 Похоже WARP у вас не будет работать и лучше не используйте его, генерируйте интерфейс без флага --warp")
+            elif "timed out" in error_msg or "timeout" in error_msg.lower():
+                logger.error("❌ Не удалось сгенерировать WARP: таймаут подключения к Cloudflare API")
+                if not proxy:
+                    logger.info("💡 Попробуйте использовать прокси для обхода блокировок через флаг --proxy \"адрес прокси\"")
+                else:
+                    logger.info("💡 Попробуйте использовать другой прокси или запустите без --warp")
+            elif "SSLError" in error_msg or "wrong version" in error_msg:
+                logger.error("❌ Не удалось сгенерировать WARP: SSL ошибка (прокси не поддерживает HTTPS)")
+                logger.info("💡 Используйте HTTP прокси или попробуйте другой прокси")
+            elif "WARP API" in error_msg:
+                logger.error("❌ Не удалось сгенерировать WARP: проблема с Cloudflare API")
+                if not proxy:
+                    logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\"")
+                else:
+                    logger.info("💡 Попробуйте другой прокси или запустите без --warp")
+            else:
+                logger.error("❌ Не удалось сгенерировать WARP: что-то пошло не так")
+                logger.error("📝 Детали: %s", error_msg)
+                logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\", если не выйдет то без --warp")
+
+            raise RuntimeError("Генерация WARP не удалась — интерфейс не создан")
+
+        for c in warp_configs:
+            logger.info("📄 WARP конфиг: %s", c)
+        logger.info("✅ WARP конфиги сгенерированы")
+    
+    return warp_configs
+
+
+def _fill_obfuscation_params(out: str, obf_params: dict) -> str:
+    """Заполнение параметров обфускации в шаблоне."""
+    # Jc, Jmin, Jmax
+    if "_J_comment" in obf_params:
+        out = out.replace("<JC_LINE>", f"# Jc = {obf_params['Jc']}  # {obf_params['_J_comment']}\n")
+        out = out.replace("<JMIN_LINE>", f"# Jmin = {obf_params['Jmin']}  # {obf_params['_J_comment']}\n")
+        out = out.replace("<JMAX_LINE>", f"# Jmax = {obf_params['Jmax']}  # {obf_params['_J_comment']}\n")
+    else:
+        out = out.replace("<JC_LINE>", f"Jc = {obf_params['Jc']}\n")
+        out = out.replace("<JMIN_LINE>", f"Jmin = {obf_params['Jmin']}\n")
+        out = out.replace("<JMAX_LINE>", f"Jmax = {obf_params['Jmax']}\n")
+
+    # S1, S2
+    if "_S12_comment" in obf_params:
+        out = out.replace("<S1_LINE>", f"# S1 = {obf_params['S1']}  # {obf_params['_S12_comment']}\n")
+        out = out.replace("<S2_LINE>", f"# S2 = {obf_params['S2']}  # {obf_params['_S12_comment']}\n")
+    else:
+        out = out.replace("<S1_LINE>", f"S1 = {obf_params['S1']}\n")
+        out = out.replace("<S2_LINE>", f"S2 = {obf_params['S2']}\n")
+
+    # S3, S4
+    if "_S34_comment" in obf_params:
+        out = out.replace("<S3_LINE>", f"# S3 = {obf_params['S3']}  # {obf_params['_S34_comment']}\n")
+        out = out.replace("<S4_LINE>", f"# S4 = {obf_params['S4']}  # {obf_params['_S34_comment']}\n")
+    else:
+        out = out.replace("<S3_LINE>", f"S3 = {obf_params['S3']}\n")
+        out = out.replace("<S4_LINE>", f"S4 = {obf_params['S4']}\n")
+
+    # H1-H4
+    if "_H_comment" in obf_params:
+        out = out.replace("<H1_LINE>", f"# H1 = {obf_params['H1']}  # {obf_params['_H_comment']}\n")
+        out = out.replace("<H2_LINE>", f"# H2 = {obf_params['H2']}  # {obf_params['_H_comment']}\n")
+        out = out.replace("<H3_LINE>", f"# H3 = {obf_params['H3']}  # {obf_params['_H_comment']}\n")
+        out = out.replace("<H4_LINE>", f"# H4 = {obf_params['H4']}  # {obf_params['_H_comment']}\n")
+    else:
+        out = out.replace("<H1_LINE>", f"H1 = {obf_params['H1']}\n")
+        out = out.replace("<H2_LINE>", f"H2 = {obf_params['H2']}\n")
+        out = out.replace("<H3_LINE>", f"H3 = {obf_params['H3']}\n")
+        out = out.replace("<H4_LINE>", f"H4 = {obf_params['H4']}\n")
+
+    # I1-I5
+    if obf_params.get("I1") and not obf_params.get("_I_comment"):
+        # AWG1.5, AWG2.0 — активные I1-I5
+        out = out.replace("<I1_LINE>", f"I1 = {obf_params['I1']}\n")
+        out = out.replace("<I2_LINE>", f"I2 = {obf_params['I2']}\n")
+        out = out.replace("<I3_LINE>", f"I3 = {obf_params['I3']}\n")
+        out = out.replace("<I4_LINE>", f"I4 = {obf_params['I4']}\n")
+        out = out.replace("<I5_LINE>", f"I5 = {obf_params['I5']}\n")
+    elif obf_params.get("I1"):
+        # WG, AWG, AWG1.0 — закомментированные значения (без комментария версии)
+        out = out.replace("<I1_LINE>", f"# I1 = {obf_params['I1']}\n")
+        out = out.replace("<I2_LINE>", f"# I2 = {obf_params['I2']}\n")
+        out = out.replace("<I3_LINE>", f"# I3 = {obf_params['I3']}\n")
+        out = out.replace("<I4_LINE>", f"# I4 = {obf_params['I4']}\n")
+        out = out.replace("<I5_LINE>", f"# I5 = {obf_params['I5']}\n")
+    else:
+        # Клиент без I1-I5
+        out = out.replace("<I1_LINE>", "")
+        out = out.replace("<I2_LINE>", "")
+        out = out.replace("<I3_LINE>", "")
+        out = out.replace("<I4_LINE>", "")
+        out = out.replace("<I5_LINE>", "")
+
+    return out
+
+
+def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path: pathlib.Path,
+                    main_iface: str, tun_name: str, opt, normalized_string: str, 
+                    warp_configs: List[str]) -> None:
+    """Создание up.sh, down.sh и файла параметров."""
+    import shutil
+    
+    if warp_configs:
+        warp_list_str = "\n".join([f'  \"{pathlib.Path(cfg).stem}\"' for cfg in warp_configs])
+    else:
+        warp_list_str = '  "none=0.0.0.0/0,::/0"'
+
+    # Создаём файл параметров (.sh)
+    params_script = params_script_template
+    params_script = params_script.replace("<SERVER_PORT>", str(opt.port))
+    params_script = params_script.replace("<SERVER_IFACE>", main_iface)
+    params_script = params_script.replace("<SERVER_TUN>", tun_name)
+    params_script = params_script.replace("<SERVER_ADDR>", normalized_string)
+    params_script = params_script.replace("<RATE_LIMIT>", f"{opt.limit}")
+    params_script = params_script.replace("<WARP_LIST>", warp_list_str)
+
+    # up.sh и down.sh больше не используют плейсхолдеры — всё читается из файлов
+    up_script = up_script_template_warp
+    down_script = down_script_template_warp
+
+    # Резервное копирование существующих файлов
+    _backup_file(up_path, '.sh.bak')
+    _backup_file(down_path, '.sh.bak')
+    _backup_file(params_path, '.sh.bak')
+
+    atomic_write_text(params_path, params_script)
+    atomic_write_text(up_path, up_script)
+    atomic_write_text(down_path, down_script)
+    os.chmod(str(params_path), 0o755)
+    os.chmod(str(up_path), 0o755)
+    os.chmod(str(down_path), 0o755)
+
+
+# ----------------- Вспомогательные функции для handle_add/handle_confgen -----------------
+
+def _get_server_ip_info(srvcfg: str, net_ipv4, net_ipv6):
+    """Определение IP сервера и позиции в подсети."""
+    server_addr_ipv4 = srvcfg.split('[Peer]')[0]
+    
+    # IPv4
+    for line in server_addr_ipv4.split('\n'):
+        if line.strip().startswith('Address = '):
+            addr_part = line.split('=')[1].strip().split(',')[0].strip()
+            server_ip_int_ipv4 = int(ipaddress.IPv4Address(addr_part.split('/')[0]))
+            break
+    else:
+        server_ip_int_ipv4 = int(net_ipv4.network_address)
+    
+    server_on_network_ipv4 = (server_ip_int_ipv4 == int(net_ipv4.network_address))
+    
+    # IPv6
+    server_on_network_ipv6 = False
+    ipv6_server_ip_int = 0
+
+    if net_ipv6:
+        server_addr_ipv6 = srvcfg.split('[Peer]')[0]
+        for line in server_addr_ipv6.split('\n'):
+            if line.strip().startswith('Address = '):
+                addr_part = line.split('=')[1].strip()
+                if ',' in addr_part:
+                    addr_part = addr_part.split(',')[1].strip()
+                ipv6_server_ip_str = addr_part.split('/')[0]
+                ipv6_server_ip_int = int(ipaddress.IPv6Address(ipv6_server_ip_str))
+                break
+        else:
+            ipv6_server_ip_int = int(net_ipv6.network_address)
+
+        server_on_network_ipv6 = (ipv6_server_ip_int == int(net_ipv6.network_address))
+
+    return server_ip_int_ipv4, server_on_network_ipv4, ipv6_server_ip_int, server_on_network_ipv6
+
+
+def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_on_network_ipv6,
+                        server_ip_int_ipv4, ipv6_server_ip_int, broadcast_int_ipv4,
+                        used_ips_ipv4: set, used_ips_ipv6: set) -> Tuple[str, Optional[str]]:
+    """
+    Выделение IP адреса для клиента.
+    
+    Возвращает: (ipaddr_ipv4, ipaddr_ipv6)
+    """
+    ipaddr_ipv4 = None
+    ipaddr_ipv6 = None
+
+    if opt.ipaddr:
+        # --- РУЧНОЙ IP ---
+        raw_manual_ips = [s.strip() for s in opt.ipaddr.split(',')]
+
+        for manual_ip_str in raw_manual_ips:
+            manual_ip = ipaddress.ip_network(manual_ip_str, strict=False)
+
+            if isinstance(manual_ip, ipaddress.IPv4Network):
+                # Проверяем что IPv4 клиента в подсети сервера
+                if not manual_ip.subnet_of(net_ipv4):
+                    raise RuntimeError(f'IPv4 адрес {manual_ip_str} не в подсети сервера {net_ipv4}')
+
+                ip_int = int(manual_ip.network_address)
+                if ip_int in used_ips_ipv4:
+                    raise RuntimeError(f'IPv4 адрес {manual_ip_str} уже используется')
+
+                # Проверка: если сервер НЕ на network, broadcast работает и зарезервирован
+                if not server_on_network_ipv4 and ip_int == broadcast_int_ipv4:
+                    raise RuntimeError(f'IPv4 адрес {manual_ip_str} зарезервирован для broadcast')
+
+                ipaddr_ipv4 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
+            else:
+                # Проверяем что IPv6 клиента в подсети сервера (если IPv6 подсеть есть)
+                if net_ipv6 and not manual_ip.subnet_of(net_ipv6):
+                    raise RuntimeError(f'IPv6 адрес {manual_ip_str} не в подсети сервера {net_ipv6}')
+
+                ip_int = int(manual_ip.network_address)
+                if ip_int in used_ips_ipv6:
+                    raise RuntimeError(f'IPv6 адрес {manual_ip_str} уже используется')
+
+                # Проверка: если сервер НЕ на network, broadcast (multicast) работает и зарезервирован
+                if net_ipv6 and not server_on_network_ipv6 and ip_int == int(net_ipv6.broadcast_address):
+                    raise RuntimeError(f'IPv6 адрес {manual_ip_str} зарезервирован для multicast (broadcast)')
+
+                ipaddr_ipv6 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
+    else:
+        # --- АВТОМАТИЧЕСКИЙ IP ---
+        # Вычисляем маски клиентов и коэффициент кратности
+        ipv4_client_mask, ipv6_client_mask, ratio = calculate_client_masks(net_ipv4, net_ipv6)
+
+        # Вычисляем размеры блоков клиентов
+        ipv4_block_size = 2 ** (32 - ipv4_client_mask)
+        ipv6_block_size = 2 ** (128 - ipv6_client_mask)
+
+        # Начинаем с network_address для правильного выравнивания
+        ipv4_base = int(net_ipv4.network_address)
+        ipv6_base = int(net_ipv6.network_address) if net_ipv6 else 0
+
+        # Проходим по всем блокам IPv4
+        max_ipv4_blocks = (int(net_ipv4.broadcast_address) - ipv4_base + 1) // ipv4_block_size
+        server_on_network = server_on_network_ipv4
+
+        chosen_ipv4 = None
+        chosen_ipv6 = None
+
+        for block_idx in range(0, max_ipv4_blocks):
+            # Вычисляем начало IPv4 блока (выровнено!)
+            ipv4_block_start = ipv4_base + (block_idx * ipv4_block_size)
+            ipv4_block_end = ipv4_block_start + ipv4_block_size - 1
+
+            # Вычисляем начало IPv6 блока (выровнено!)
+            ipv6_block_start = 0
+            ipv6_block_end = 0
+            if net_ipv6:
+                ipv6_block_start = ipv6_base + (block_idx * ipv6_block_size)
+                ipv6_block_end = ipv6_block_start + ipv6_block_size - 1
+
+            # Пропускаем network address (первый блок)
+            if block_idx == 0:
+                continue
+
+            # Проверяем что блок не заканчивается на broadcast
+            if ipv4_block_end == int(net_ipv4.broadcast_address):
+                if not server_on_network:
+                    continue
+
+            # Проверяем IPv6 broadcast
+            if net_ipv6 and ipv6_block_end == int(net_ipv6.broadcast_address):
+                if not server_on_network:
+                    continue
+
+            # Проверяем что блок не содержит адрес сервера (IPv4)
+            if ipv4_block_start <= server_ip_int_ipv4 <= ipv4_block_end:
+                continue
+
+            # Проверяем что блок не содержит адрес сервера (IPv6)
+            if net_ipv6 and (ipv6_block_start <= ipv6_server_ip_int <= ipv6_block_end):
+                continue
+
+            # Проверяем что ОБА адреса в паре свободны!
+            ipv4_free = (ipv4_block_start not in used_ips_ipv4)
+            ipv6_free = True
+            if net_ipv6:
+                ipv6_free = (ipv6_block_start not in used_ips_ipv6)
+
+            # Пропускаем если ХОТЯ БЫ ОДИН занят!
+            if not ipv4_free or not ipv6_free:
+                continue
+
+            # Нашли пару! ОБА свободны!
+            chosen_ipv4 = ipv4_block_start
+            chosen_ipv6 = ipv6_block_start if net_ipv6 else None
+            break
+
+        if chosen_ipv4 is None:
+            raise RuntimeError('Нет свободных IPv4 адресов')
+
+        # Добавляем выделенные адреса в занятые
+        used_ips_ipv4.add(chosen_ipv4)
+        if chosen_ipv6:
+            used_ips_ipv6.add(chosen_ipv6)
+
+        # Формируем адрес с маской клиента
+        ipaddr_ipv4 = f"{str(ipaddress.IPv4Address(chosen_ipv4))}/{ipv4_client_mask}"
+
+        if net_ipv6 and chosen_ipv6 is not None:
+            ipaddr_ipv6 = f"{str(ipaddress.IPv6Address(chosen_ipv6))}/{ipv6_client_mask}"
+        elif net_ipv6:
+            logger.warning('⚠  Нет свободных пар IPv4+IPv6, выдаём только IPv4')
+            ipaddr_ipv6 = None
+
+    return ipaddr_ipv4, ipaddr_ipv6
+
+
+def _add_client_to_config(srv_path: pathlib.Path, c_name: str, ipaddr: str,
+                          persistent_keepalive: int) -> None:
+    """Добавление клиента в серверный конфиг."""
+    priv_key, pub_key = gen_pair_keys()
+    psk = gen_preshared_key()
+
+    srvcfg = srv_path.read_text(encoding='utf-8')
+    srvcfg += f'\n'
+    srvcfg += f'[Peer]\n'
+    srvcfg += f'#_Name = {c_name}\n'
+    srvcfg += f'#_GenKeyTime = {datetime.datetime.now().isoformat()}\n'
+    srvcfg += f'#_PrivateKey = {priv_key}\n'
+    srvcfg += f'PublicKey = {pub_key}\n'
+    srvcfg += f'PresharedKey = {psk}\n'
+    srvcfg += f'PersistentKeepalive = {persistent_keepalive}\n'
+    srvcfg += f'AllowedIPs = {ipaddr}\n'
+    atomic_write_text(srv_path, srvcfg)
+
+
+def _backup_file(path: pathlib.Path, suffix: str = '.bak') -> Optional[pathlib.Path]:
+    """
+    Создание резервной копии файла.
+    
+    Args:
+        path: Путь к файлу для резервного копирования
+        suffix: Суффикс для backup файла (по умолчанию '.bak')
+    
+    Returns:
+        Путь к backup файлу или None если файл не существовал
+    """
+    if not path.exists():
+        return None
+    
+    backup_path = path.with_suffix(path.suffix + suffix)
+    shutil.copy2(path, backup_path)
+    logger.info("📦 Создана резервная копия: %s", backup_path)
+    return backup_path
+
+
+def _generate_qr_image(conf_text: str, output_path: pathlib.Path) -> None:
+    """
+    Генерация QR-кода из текста конфига.
+    
+    Алгоритм:
+    1. Перебираем version 1-40 с error correction H (30%)
+    2. Если H не влез ни в один version — пробуем version 40 с L (7%)
+    
+    Args:
+        conf_text: Текст конфига для кодирования в QR
+        output_path: Путь для сохранения PNG файла
+    
+    Raises:
+        RuntimeError: Если QR не помещается даже с version=40 и error correction=L
+    """
+    if qrcode is None:
+        raise RuntimeError('Пакет qrcode не установлен')
+    
+    # Проверяем размер конфига
+    if len(conf_text) > 2048:
+        logger.warning('⚠  Конфиг >2KB, возможно QR не получится')
+    
+    # Шаг 1: Перебираем version 1-40 с H (30%)
+    for version in range(1, 41):
+        try:
+            qr = qrcode.QRCode(
+                version=version,
+                error_correction=qrcode.constants.ERROR_CORRECT_H,
+                box_size=10,
+                border=4
+            )
+            qr.add_data(conf_text)
+            qr.make(fit=False)
+            
+            # Успех!
+            img = qr.make_image(fill_color="black", back_color="white")
+            img.save(str(output_path))
+            return
+            
+        except (qrcode.exceptions.DataOverflowError, ValueError):
+            # Не влезло в эту версию — пробуем следующую
+            continue
+    
+    # Шаг 2: H не влез ни в один version — пробуем L (7%) с version 40
+    try:
+        qr = qrcode.QRCode(
+            version=40,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4
+        )
+        qr.add_data(conf_text)
+        qr.make(fit=False)
+        
+        # Успех!
+        img = qr.make_image(fill_color="black", back_color="white")
+        img.save(str(output_path))
+        #logger.info('✅ QR-код: %s (version=40, error_correction=L (7%%))', str(output_path))
+        return
+        
+    except (qrcode.exceptions.DataOverflowError, ValueError):
+        pass
+    
+    # Ни одно не сработало
+    raise RuntimeError(f"Конфиг слишком большой для QR кода (max version=40, min error_correction=L)")
+
+
+def _add_file_to_zip(zipf: zipfile.ZipFile, file_path: str, arcname: Optional[str] = None) -> bool:
+    """
+    Добавление файла в ZIP архив.
+    
+    Args:
+        zipf: ZIP файл для добавления
+        file_path: Путь к файлу
+        arcname: Имя файла в архиве (по умолчанию = file_path)
+    
+    Returns:
+        True если успешно, False если ошибка
+    """
+    try:
+        zipf.write(str(file_path), arcname=arcname if arcname else file_path)
+        return True
+    except Exception as e:
+        logger.warning("⚠  Не удалось добавить файл в архив: %s", e)
+        return False
+
+
+def _init_random_seed(extra_entropy: Optional[int] = None) -> None:
+    """
+    Инициализация генератора случайных чисел уникальным seed.
+    
+    Args:
+        extra_entropy: Дополнительная энтропия (например hash(peer_name))
+    """
+    seed = time.time_ns() ^ os.getpid()
+    if extra_entropy is not None:
+        seed ^= extra_entropy
+    random.seed(seed)
+
+
+def _generate_persistent_keepalive() -> int:
+    """
+    Генерация persistent_keepalive для WireGuard конфига.
+    
+    Возвращает случайное значение от 1 до 9 секунд.
+    Это предотвращает закрытие NAT session timeout.
+    """
+    return random.randint(1, 9)
+
+
+def _get_param_value(conf_text: str, param: str, version: str, min_version: str) -> Optional[str]:
+    """
+    Извлечь значение параметра из конфига.
+    Поддерживает как активные так и закомментированные параметры.
+
+    version: текущая версия протокола
+    min_version: минимальная версия для поддержки этого параметра
+
+    Возвращает None если версия < min_version.
+    """
+    # Проверяем поддержку параметра в данной версии
+    version_order = {"WG": 0, "AWG": 1, "AWG1.0": 2, "AWG1.5": 3, "AWG2.0": 4}
+    if version_order.get(version, 0) < version_order.get(min_version, 0):
+        return None  # Параметр не поддерживается в этой версии
+
+    for line in conf_text.split('\n'):
+        line = line.strip()
+        # Проверяем активный параметр: "S1 = 42"
+        if line.startswith(f'{param} = '):
+            return line.split('=')[1].strip()
+        # Проверяем закомментированный: "# S1 = 42  # AWG+"
+        if line.startswith(f'# {param} = '):
+            # Извлекаем значение между "# S1 = " и следующим "#"
+            value_part = line[2:]  # Убираем "# "
+            if '=' in value_part:
+                value = value_part.split('=')[1].strip()
+                # Убираем комментарий после значения
+                if '  #' in value:
+                    value = value.split('  #')[0].strip()
+                return value
+    return None
+
+
+def _get_server_params(server_conf_text: str, server_protocol: str) -> dict:
+    """Получение параметров сервера (S1-S4, H1-H4) из конфига."""
+    return {
+        'S1': _get_param_value(server_conf_text, 'S1', server_protocol, "AWG"),
+        'S2': _get_param_value(server_conf_text, 'S2', server_protocol, "AWG"),
+        'S3': _get_param_value(server_conf_text, 'S3', server_protocol, "AWG2.0"),
+        'S4': _get_param_value(server_conf_text, 'S4', server_protocol, "AWG2.0"),
+        'H1': _get_param_value(server_conf_text, 'H1', server_protocol, "AWG1.0"),
+        'H2': _get_param_value(server_conf_text, 'H2', server_protocol, "AWG1.0"),
+        'H3': _get_param_value(server_conf_text, 'H3', server_protocol, "AWG1.0"),
+        'H4': _get_param_value(server_conf_text, 'H4', server_protocol, "AWG1.0"),
+    }
+
+
+def _fix_client_allowed_ips(client_allowed_ips: str, srv_addr: str) -> str:
+    """
+    Исправление маски клиента на маску подсети сервера.
+    
+    Замена происходит ТОЛЬКО если broadcast работает (сервер НЕ на network address).
+    """
+    allowed_ips_list = [ip.strip() for ip in client_allowed_ips.split(',')]
+    fixed_allowed_ips = []
+    
+    # Получаем подсети сервера
+    raw_subnets = [s.strip() for s in srv_addr.split(',')]
+    net_ipv4 = None
+    net_ipv6 = None
+    
+    for subnet_str in raw_subnets:
+        net = ipaddress.ip_network(subnet_str, strict=False)
+        if isinstance(net, ipaddress.IPv4Network):
+            net_ipv4 = net
+        else:
+            net_ipv6 = net
+    
+    # Проверяем позицию сервера
+    server_ipv4_on_network = False
+    if net_ipv4:
+        srv_ipv4_part = srv_addr.split(',')[0].strip() if ',' in srv_addr else srv_addr.strip()
+        if '/' in srv_ipv4_part:
+            srv_ip_str = srv_ipv4_part.split('/')[0]
+            srv_ip_int = int(ipaddress.ip_address(srv_ip_str))
+            server_ipv4_on_network = (srv_ip_int == int(net_ipv4.network_address))
+    
+    server_ipv6_on_network = False
+    if net_ipv6:
+        srv_ipv6_part = srv_addr.split(',')[1].strip() if ',' in srv_addr else srv_addr.strip()
+        if '/' in srv_ipv6_part:
+            srv_ip_str = srv_ipv6_part.split('/')[0]
+            srv_ip_int = int(ipaddress.ip_address(srv_ip_str))
+            server_ipv6_on_network = (srv_ip_int == int(net_ipv6.network_address))
+    
+    # Исправляем маски
+    for ip_str in allowed_ips_list:
+        if '/' in ip_str:
+            ip_net = ipaddress.ip_network(ip_str, strict=False)
+            if isinstance(ip_net, ipaddress.IPv4Network):
+                if not server_ipv4_on_network:
+                    fixed_allowed_ips.append(f"{ip_net.network_address}/{net_ipv4.prefixlen}")
+                else:
+                    fixed_allowed_ips.append(ip_str)
+            elif net_ipv6:
+                if not server_ipv6_on_network:
+                    fixed_allowed_ips.append(f"{ip_net.network_address}/{net_ipv6.prefixlen}")
+                else:
+                    fixed_allowed_ips.append(ip_str)
+        else:
+            fixed_allowed_ips.append(ip_str)
+    
+    return ', '.join(fixed_allowed_ips)
+
+
+def _fill_client_obfuscation_params(out_base: str, client_obf_params: dict,
+                                     server_s1, server_s2, server_s3, server_s4,
+                                     server_h1, server_h2, server_h3, server_h4) -> str:
+    """Заполнение параметров обфускации в клиентском конфиге."""
+    # Jc, Jmin, Jmax
+    if client_obf_params.get("Jc") is not None:
+        out_base = out_base.replace("<JC_LINE>", f"Jc = {client_obf_params['Jc']}\n")
+        out_base = out_base.replace("<JMIN_LINE>", f"Jmin = {client_obf_params['Jmin']}\n")
+        out_base = out_base.replace("<JMAX_LINE>", f"Jmax = {client_obf_params['Jmax']}\n")
+    else:
+        out_base = out_base.replace("<JC_LINE>", "")
+        out_base = out_base.replace("<JMIN_LINE>", "")
+        out_base = out_base.replace("<JMAX_LINE>", "")
+
+    # S1, S2
+    if server_s1:
+        out_base = out_base.replace("<S1_LINE>", f"S1 = {server_s1}\n")
+        out_base = out_base.replace("<S2_LINE>", f"S2 = {server_s2}\n")
+    else:
+        out_base = out_base.replace("<S1_LINE>", "")
+        out_base = out_base.replace("<S2_LINE>", "")
+
+    # S3, S4
+    if server_s3:
+        out_base = out_base.replace("<S3_LINE>", f"S3 = {server_s3}\n")
+        out_base = out_base.replace("<S4_LINE>", f"S4 = {server_s4}\n")
+    else:
+        out_base = out_base.replace("<S3_LINE>", "")
+        out_base = out_base.replace("<S4_LINE>", "")
+
+    # H1-H4
+    if server_h1:
+        out_base = out_base.replace("<H1_LINE>", f"H1 = {server_h1}\n")
+        out_base = out_base.replace("<H2_LINE>", f"H2 = {server_h2}\n")
+        out_base = out_base.replace("<H3_LINE>", f"H3 = {server_h3}\n")
+        out_base = out_base.replace("<H4_LINE>", f"H4 = {server_h4}\n")
+    else:
+        out_base = out_base.replace("<H1_LINE>", "")
+        out_base = out_base.replace("<H2_LINE>", "")
+        out_base = out_base.replace("<H3_LINE>", "")
+        out_base = out_base.replace("<H4_LINE>", "")
+
+    # I1-I5
+    if client_obf_params.get("I1") is not None:
+        out_base = out_base.replace("<I1_LINE>", f"I1 = {client_obf_params['I1']}\n")
+        out_base = out_base.replace("<I2_LINE>", f"I2 = {client_obf_params['I2']}\n")
+        out_base = out_base.replace("<I3_LINE>", f"I3 = {client_obf_params['I3']}\n")
+        out_base = out_base.replace("<I4_LINE>", f"I4 = {client_obf_params['I4'] if client_obf_params['I4'] else ''}\n")
+        out_base = out_base.replace("<I5_LINE>", f"I5 = {client_obf_params['I5'] if client_obf_params['I5'] else ''}\n")
+    else:
+        out_base = out_base.replace("<I1_LINE>", "")
+        out_base = out_base.replace("<I2_LINE>", "")
+        out_base = out_base.replace("<I3_LINE>", "")
+        out_base = out_base.replace("<I4_LINE>", "")
+        out_base = out_base.replace("<I5_LINE>", "")
+    
+    return out_base
+
+
+# ----------------- Обработчики команд -----------------
+
+def handle_makecfg(opt) -> None:
+    global g_main_config_fn, g_main_config_type
+
+    raw_input = opt.makecfg
+
+    # Логика "умного пути"
+    target_path, tun_name = _process_interface_path(raw_input)
 
     init_interface_paths(tun_name)
 
-    # Создаем родительскую директорию (например /etc/amnezia/amneziawg), если её нет
+    # Создаем родительскую директорию, если её нет
     if not target_path.parent.exists():
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5113,87 +6115,41 @@ def handle_makecfg(opt) -> None:
     # Используем новую функцию для парсинга и валидации
     ipaddr_ipv4_net, ipaddr_ipv6_net, ipaddr_display, normalized_string = parse_ipaddr_argument(opt.ipaddr)
 
+    # Определяем версию протокола из флага --version
+    awg_version = getattr(opt, 'version', 'AWG1.0')
+
     # --- СНАЧАЛА ГЕНЕРИРУЕМ WARP (если нужен) ---
-    warp_configs: List[str] = []
-    if opt.warp > 0:
-        logger.info("🌀 Генерация %d WARP конфигов...", opt.warp)
-        try:
-            warp_configs = generate_warp_configs(tun_name, opt.warp, opt.mtu, opt.proxy)
-        except RuntimeError as e:
-            error_msg = str(e)
-
-            # Проверяем тип ошибки по тексту
-            if "Не найден доступный endpoint" in error_msg:
-                # Проблема с доступностью endpoint'ов
-                logger.error("❌ Не удалось сгенерировать WARP: проблема с доступом к Cloudflare Endpoint")
-                logger.info("💡 Похоже WARP у вас не будет работать и лучше не используйте его, генерируйте интерфейс без флага --warp")
-            elif "timed out" in error_msg or "timeout" in error_msg.lower():
-                # Таймаут — проблема с сетью или API недоступен
-                logger.error("❌ Не удалось сгенерировать WARP: таймаут подключения к Cloudflare API")
-                if not opt.proxy:
-                    logger.info("💡 Попробуйте использовать прокси для обхода блокировок через флаг --proxy \"адрес прокси\"")
-                else:
-                    logger.info("💡 Попробуйте использовать другой прокси или запустите без --warp")
-            elif "SSLError" in error_msg or "wrong version" in error_msg:
-                # SSL ошибка — прокси не поддерживает HTTPS
-                logger.error("❌ Не удалось сгенерировать WARP: SSL ошибка (прокси не поддерживает HTTPS)")
-                logger.info("💡 Используйте HTTP прокси или попробуйте другой прокси")
-            elif "WARP API" in error_msg:
-                # Другие ошибки API
-                logger.error("❌ Не удалось сгенерировать WARP: проблема с Cloudflare API")
-                if not opt.proxy:
-                    logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\"")
-                else:
-                    logger.info("💡 Попробуйте другой прокси или запустите без --warp")
-            else:
-                # Неизвестная ошибка
-                logger.error("❌ Не удалось сгенерировать WARP: что-то пошло не так")
-                logger.error("📝 Детали: %s", error_msg)
-                logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\", если не выйдет то без --warp")
-
-            raise RuntimeError("Генерация WARP не удалась — интерфейс не создан")
-
-        for c in warp_configs:
-            logger.info("📄 WARP конфиг: %s", c)
-        logger.info("✅ WARP конфиги сгенерированы")
+    warp_configs = _generate_warp_if_needed(tun_name, opt.warp, opt.mtu, opt.proxy, awg_version)
 
     # --- ТЕПЕРЬ СОЗДАЁМ СЕРВЕРНЫЙ КОНФИГ И СКРИПТЫ ---
     priv, pub = gen_pair_keys(mtype)
-    # Используем более случайное семя для предотвращения одинаковых значений при быстром запуске
-    random.seed(time.time_ns() ^ os.getpid())
-    jc = random.randint(80, 120)
-    jmin = random.randint(48, 64)
-    jmax = random.randint(jmin + 8, 80)
+
+    # Для сервера mtype должен соответствовать версии
+    if awg_version == "WG":
+        mtype = "WG"
+    else:
+        mtype = "AWG"
+
+    # Инициализируем random уникальным seed
+    _init_random_seed()
+
+    # Генерируем параметры обфускации для СЕРВЕРА (for_client=False, for_server=True)
+    obf_params = generate_all_params(awg_version, for_client=False, for_server=True)
 
     up_path = g_main_config_fn.parent.joinpath(f"{tun_name}up.sh")
     down_path = g_main_config_fn.parent.joinpath(f"{tun_name}down.sh")
 
     out = g_defserver_config
+    out = out.replace("<PROTOCOL>", awg_version)
     out = out.replace("<SERVER_KEY_TIME>", datetime.datetime.now().isoformat())
     out = out.replace("<SERVER_PRIVATE_KEY>", priv)
     out = out.replace("<SERVER_PUBLIC_KEY>", pub)
     out = out.replace("<SERVER_ADDR>", normalized_string)
     out = out.replace("<SERVER_PORT>", str(opt.port))
-    if mtype == "AWG":
-        out = out.replace("<JC>", str(jc))
-        out = out.replace("<JMIN>", str(jmin))
-        out = out.replace("<JMAX>", str(jmax))
-        out = out.replace("<S1>", str(random.randint(3, 127)))
-        out = out.replace("<S2>", str(random.randint(3, 127)))
-        out = out.replace("<H1>", str(random.randint(0x10000011, 0x7FFFFF00)))
-        out = out.replace("<H2>", str(random.randint(0x10000011, 0x7FFFFF00)))
-        out = out.replace("<H3>", str(random.randint(0x10000011, 0x7FFFFF00)))
-        out = out.replace("<H4>", str(random.randint(0x10000011, 0x7FFFFF00)))
-    else:
-        out = out.replace("\nJc = <", "\n# ")
-        out = out.replace("\nJmin = <", "\n# ")
-        out = out.replace("\nJmax = <", "\n# ")
-        out = out.replace("\nS1 = <", "\n# ")
-        out = out.replace("\nS2 = <", "\n# ")
-        out = out.replace("\nH1 = <", "\n# ")
-        out = out.replace("\nH2 = <", "\n# ")
-        out = out.replace("\nH3 = <", "\n# ")
-        out = out.replace("\nH4 = <", "\n# ")
+
+    # Заполняем параметры обфускации
+    out = _fill_obfuscation_params(out, obf_params)
+
     out = out.replace("<SERVER_IFACE>", main_iface)
     out = out.replace("<SERVER_TUN>", tun_name)
     out = out.replace("<SERVER_UP_SCRIPT>", str(up_path))
@@ -5203,59 +6159,18 @@ def handle_makecfg(opt) -> None:
     atomic_write_text(g_main_config_fn, out)
     logger.info("✅ Серверный конфиг создан: %s", g_main_config_fn)
 
-    if warp_configs:
-        warp_list_str = "\n".join([f'  \"{pathlib.Path(cfg).stem}\"' for cfg in warp_configs])
-    else:
-        warp_list_str = '  "none=0.0.0.0/0,::/0"'
-
-    # Создаём файл параметров (.sh)
-    params_script = params_script_template
-    params_script = params_script.replace("<SERVER_PORT>", str(opt.port))
-    params_script = params_script.replace("<SERVER_IFACE>", main_iface)
-    params_script = params_script.replace("<SERVER_TUN>", tun_name)
-    params_script = params_script.replace("<SERVER_ADDR>", normalized_string)
-    params_script = params_script.replace("<RATE_LIMIT>", f"{opt.limit}")
-    params_script = params_script.replace("<WARP_LIST>", warp_list_str)
-    
-    # Путь к файлу параметров (рядом со скриптами)
+    # Создаём скрипты
     params_path = up_path.parent / f"{tun_name}.sh"
+    _create_scripts(up_path, down_path, params_path, main_iface, tun_name, opt, normalized_string, warp_configs)
 
-    # up.sh и down.sh больше не используют плейсхолдеры — всё читается из файлов
-    up_script = up_script_template_warp
-    down_script = down_script_template_warp
-
-    # Резервное копирование существующих файлов
-    if up_path.exists():
-        backup_path = up_path.with_suffix('.sh.bak')
-        import shutil
-        shutil.copy2(up_path, backup_path)
-        logger.info("📦 Создана резервная копия: %s", backup_path)
-    if down_path.exists():
-        backup_path = down_path.with_suffix('.sh.bak')
-        import shutil
-        shutil.copy2(down_path, backup_path)
-        logger.info("📦 Создана резервная копия: %s", backup_path)
-    if params_path.exists():
-        backup_path = params_path.with_suffix('.sh.bak')
-        import shutil
-        shutil.copy2(params_path, backup_path)
-        logger.info("📦 Создана резервная копия: %s", backup_path)
-
-    atomic_write_text(params_path, params_script)
-    atomic_write_text(up_path, up_script)
-    atomic_write_text(down_path, down_script)
-    os.chmod(str(params_path), 0o755)
-    os.chmod(str(up_path), 0o755)
-    os.chmod(str(down_path), 0o755)
-    
     atomic_write_text(g_main_config_src, str(g_main_config_fn))
-    
+
     try:
         _ensure_endpoint_file_exists(str(get_ext_ipaddr()))
         ensure_allowedips_config(g_allowedips_config_fn)
     except Exception as e:
         logger.warning("⚠  Не удалось создать вспомогательные файлы: %s", e)
-        
+
     sys.exit(0)
 
 
@@ -5337,21 +6252,8 @@ def handle_add(opt) -> None:
     first_usable_int_ipv4 = int(net_ipv4.network_address) + 1
     broadcast_int_ipv4 = int(net_ipv4.broadcast_address)
 
-    # Реальный IP сервера из конфига (Address = ...)
-    # Парсим "10.10.0.0/16" → 10.10.0.0
-    server_addr_ipv4 = srvcfg.split('[Peer]')[0]  # Только [Interface] секция
-    for line in server_addr_ipv4.split('\n'):
-        if line.strip().startswith('Address = '):
-            addr_part = line.split('=')[1].strip().split(',')[0].strip()
-            server_ip_int_ipv4 = int(ipaddress.IPv4Address(addr_part.split('/')[0]))
-            break
-    else:
-        # Не нашли Address, используем network
-        server_ip_int_ipv4 = int(net_ipv4.network_address)
-
-    # Определяем: занимает ли сервер NETWORK адрес (а не первый usable!)
-    # Это важно для определения доступности broadcast адреса
-    server_on_network_ipv4 = (server_ip_int_ipv4 == int(net_ipv4.network_address))
+    # Получаем информацию о сервере
+    server_ip_int_ipv4, server_on_network_ipv4, ipv6_server_ip_int, server_on_network_ipv6 = _get_server_ip_info(srvcfg, net_ipv4, net_ipv6)
 
     # Добавляем IP сервера в занятые!
     used_ips_ipv4.add(server_ip_int_ipv4)
@@ -5363,33 +6265,14 @@ def handle_add(opt) -> None:
     else:
         # Сервер НЕ на network (на первом usable или другом) → broadcast РАБОТАЕТ → зарезервирован
         last_usable_int_ipv4 = broadcast_int_ipv4 - 1
-    
+
     # --- Вычисляем первый/последний IP для IPv6 ---
     first_usable_int_ipv6 = None
     last_usable_int_ipv6 = None
 
     if net_ipv6:
         first_usable_int_ipv6 = int(net_ipv6.network_address) + 1
-
-        # Реальный IP сервера из конфига (Address = ...)
-        # Парсим "fd00::/112" → fd00::
-        server_addr_ipv6 = srvcfg.split('[Peer]')[0]  # Только [Interface] секция
-        for line in server_addr_ipv6.split('\n'):
-            if line.strip().startswith('Address = '):
-                addr_part = line.split('=')[1].strip()
-                # Ищем IPv6 адрес (после запятой если есть)
-                if ',' in addr_part:
-                    addr_part = addr_part.split(',')[1].strip()
-                ipv6_server_ip_str = addr_part.split('/')[0]
-                ipv6_server_ip_int = int(ipaddress.IPv6Address(ipv6_server_ip_str))
-                break
-        else:
-            # Не нашли Address, используем network
-            ipv6_server_ip_int = int(net_ipv6.network_address)
-
-        # Определяем: занимает ли сервер NETWORK адрес (а не первый usable!)
-        server_on_network_ipv6 = (ipv6_server_ip_int == int(net_ipv6.network_address))
-
+        
         # Добавляем IP сервера в занятые!
         used_ips_ipv6.add(ipv6_server_ip_int)
 
@@ -5414,170 +6297,26 @@ def handle_add(opt) -> None:
                 f'или НЕ на network address в обеих подсетях!'
             )
 
-    # --- Обработка ручного IP ---
-    ipaddr_ipv4 = None
-    ipaddr_ipv6 = None
-    
-    if opt.ipaddr:
-        # Поддержка формата "10.1.0.5/32" или "10.1.0.5/32, fd00::5/128"
-        raw_manual_ips = [s.strip() for s in opt.ipaddr.split(',')]
-        
-        for manual_ip_str in raw_manual_ips:
-            manual_ip = ipaddress.ip_network(manual_ip_str, strict=False)
+    # --- Обработка ручного IP или автоматический выбор ---
+    ipaddr_ipv4, ipaddr_ipv6 = _allocate_client_ip(
+        opt, net_ipv4, net_ipv6, 
+        server_on_network_ipv4, server_on_network_ipv6,
+        server_ip_int_ipv4, ipv6_server_ip_int, broadcast_int_ipv4,
+        used_ips_ipv4, used_ips_ipv6
+    )
 
-            if isinstance(manual_ip, ipaddress.IPv4Network):
-                # Проверяем что IPv4 клиента в подсети сервера
-                if not manual_ip.subnet_of(net_ipv4):
-                    raise RuntimeError(f'IPv4 адрес {manual_ip_str} не в подсети сервера {net_ipv4}')
-                
-                ip_int = int(manual_ip.network_address)
-                if ip_int in used_ips_ipv4:
-                    raise RuntimeError(f'IPv4 адрес {manual_ip_str} уже используется')
-
-                # Проверка: если сервер НЕ на network, broadcast работает и зарезервирован
-                if not server_on_network_ipv4 and ip_int == broadcast_int_ipv4:
-                    raise RuntimeError(f'IPv4 адрес {manual_ip_str} зарезервирован для broadcast')
-
-                ipaddr_ipv4 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
-            else:
-                # Проверяем что IPv6 клиента в подсети сервера (если IPv6 подсеть есть)
-                if net_ipv6 and not manual_ip.subnet_of(net_ipv6):
-                    raise RuntimeError(f'IPv6 адрес {manual_ip_str} не в подсети сервера {net_ipv6}')
-
-                ip_int = int(manual_ip.network_address)
-                if ip_int in used_ips_ipv6:
-                    raise RuntimeError(f'IPv6 адрес {manual_ip_str} уже используется')
-
-                # Проверка: если сервер НЕ на network, broadcast (multicast) работает и зарезервирован
-                if net_ipv6 and not server_on_network_ipv6 and ip_int == int(net_ipv6.broadcast_address):
-                    raise RuntimeError(f'IPv6 адрес {manual_ip_str} зарезервирован для multicast (broadcast)')
-
-                ipaddr_ipv6 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
-    else:
-        # --- Автоматический выбор IP с учётом кратности подсетей ---
-        # Вычисляем маски клиентов и коэффициент кратности
-        ipv4_client_mask, ipv6_client_mask, ratio = calculate_client_masks(net_ipv4, net_ipv6)
-
-        # Вычисляем размеры блоков клиентов
-        ipv4_block_size = 2 ** (32 - ipv4_client_mask)
-        ipv6_block_size = 2 ** (128 - ipv6_client_mask)
-
-        # IPv4
-        chosen_ipv4 = None
-        chosen_ipv6 = None
-
-        # Начинаем с network_address для правильного выравнивания
-        ipv4_base = int(net_ipv4.network_address)
-        ipv6_base = int(net_ipv6.network_address) if net_ipv6 else 0
-
-        # Проходим по всем блокам IPv4 (выровнены по границе!)
-        # Используем полный диапазон подсети
-        max_ipv4_blocks = (int(net_ipv4.broadcast_address) - ipv4_base + 1) // ipv4_block_size
-
-        # Определяем позицию сервера (оба на network или оба НЕ на network)
-        server_on_network = server_on_network_ipv4  # Предполагаем что IPv6 совпадает (проверено выше)
-
-        for block_idx in range(0, max_ipv4_blocks):
-            # Вычисляем начало IPv4 блока (выровнено!)
-            ipv4_block_start = ipv4_base + (block_idx * ipv4_block_size)
-            ipv4_block_end = ipv4_block_start + ipv4_block_size - 1
-
-            # Вычисляем начало IPv6 блока (выровнено!)
-            ipv6_block_start = 0
-            ipv6_block_end = 0
-            if net_ipv6:
-                ipv6_block_start = ipv6_base + (block_idx * ipv6_block_size)
-                ipv6_block_end = ipv6_block_start + ipv6_block_size - 1
-
-            # Пропускаем network address (первый блок)
-            if block_idx == 0:
-                continue
-
-            # Проверяем что блок не заканчивается на broadcast
-            # ВАЖНО: broadcast существует ТОЛЬКО если сервер НЕ на network address!
-            if ipv4_block_end == int(net_ipv4.broadcast_address):
-                if not server_on_network:
-                    continue
-            
-            # Проверяем IPv6 broadcast
-            if net_ipv6 and ipv6_block_end == int(net_ipv6.broadcast_address):
-                if not server_on_network:
-                    continue
-
-            # Проверяем что блок не содержит адрес сервера (IPv4)
-            if ipv4_block_start <= server_ip_int_ipv4 <= ipv4_block_end:
-                continue
-            
-            # Проверяем что блок не содержит адрес сервера (IPv6)
-            if net_ipv6 and (ipv6_block_start <= ipv6_server_ip_int <= ipv6_block_end):
-                continue
-
-            # ВАЖНО: Проверяем что ОБА адреса в паре свободны!
-            # Если IPv4 занят — пропускаем (IPv6 тоже не выдаём!)
-            ipv4_free = (ipv4_block_start not in used_ips_ipv4)
-            
-            # Если IPv6 есть — проверяем и его
-            ipv6_free = True
-            if net_ipv6:
-                ipv6_free = (ipv6_block_start not in used_ips_ipv6)
-            
-            # Пропускаем если ХОТЯ БЫ ОДИН занят!
-            if not ipv4_free or not ipv6_free:
-                continue
-
-            # Нашли пару! ОБА свободны!
-            chosen_ipv4 = ipv4_block_start
-            chosen_ipv6 = ipv6_block_start if net_ipv6 else None
-            
-            # Выходим — нашли первую свободную пару!
-            break
-
-        if chosen_ipv4 is None:
-            raise RuntimeError('Нет свободных IPv4 адресов')
-
-        # Вычисляем первый IP в блоке для IPv4 (уже выровнен!)
-        chosen_ipv4_aligned = chosen_ipv4
-
-        # Вычисляем первый IP в блоке для IPv6 (уже выровнен!)
-        chosen_ipv6_aligned = chosen_ipv6 if chosen_ipv6 else 0
-
-        # Добавляем выделенные адреса в занятые
-        used_ips_ipv4.add(chosen_ipv4_aligned)
-        if chosen_ipv6_aligned:
-            used_ips_ipv6.add(chosen_ipv6_aligned)
-
-        # Формируем адрес с маской клиента
-        ipaddr_ipv4 = f"{str(ipaddress.IPv4Address(chosen_ipv4_aligned))}/{ipv4_client_mask}"
-
-        # IPv6 (если есть подсеть и мы нашли пару)
-        if net_ipv6 and chosen_ipv6 is not None:
-            ipaddr_ipv6 = f"{str(ipaddress.IPv6Address(chosen_ipv6_aligned))}/{ipv6_client_mask}"
-        elif net_ipv6:
-            # IPv6 подсеть есть, но не нашли пару — выдаём только IPv4 с предупреждением
-            logger.warning('⚠  Нет свободных пар IPv4+IPv6, выдаём только IPv4')
-            ipaddr_ipv6 = None
-    
     # Формируем итоговый AllowedIPs
     if ipaddr_ipv6:
         ipaddr = f"{ipaddr_ipv4}, {ipaddr_ipv6}"
     else:
         ipaddr = ipaddr_ipv4
-    
-    priv_key, pub_key = gen_pair_keys()
-    psk = gen_preshared_key()
-    persistent_keepalive = random.randint(1, 9)
+
+    persistent_keepalive = _generate_persistent_keepalive()
     srv_path = pathlib.Path(g_main_config_fn)
-    srvcfg = srv_path.read_text(encoding='utf-8')
-    srvcfg += f'\n'
-    srvcfg += f'[Peer]\n'
-    srvcfg += f'#_Name = {c_name}\n'
-    srvcfg += f'#_GenKeyTime = {datetime.datetime.now().isoformat()}\n'
-    srvcfg += f'#_PrivateKey = {priv_key}\n'
-    srvcfg += f'PublicKey = {pub_key}\n'
-    srvcfg += f'PresharedKey = {psk}\n'
-    srvcfg += f'PersistentKeepalive = {persistent_keepalive}\n'
-    srvcfg += f'AllowedIPs = {ipaddr}\n'
-    atomic_write_text(srv_path, srvcfg)
+
+    # Добавляем клиента в конфиг
+    _add_client_to_config(srv_path, c_name, ipaddr, persistent_keepalive)
+    
     logger.info('✅ Пользователь "%s" создан. IP=%s PersistentKeepalive=%s', c_name, ipaddr, persistent_keepalive)
 
 
@@ -5632,6 +6371,115 @@ def handle_delete(opt) -> None:
     logger.info('✅ Удалён "%s". Освобождён IP=%s', p_name, ipaddr)
 
 
+def handle_warp_gen(opt, need_conf: bool = True, need_qr: bool = False, want_zip: bool = False) -> None:
+    """
+    Автономная генерация WARP конфигов (без серверного интерфейса).
+    Сохраняет в папку WARP/ рядом со скриптом.
+    Поддерживает -c, -q, -z как для клиентских конфигов.
+    
+    Args:
+        opt: аргументы командной строки
+        need_conf: нужны ли конфиги (True если -c или -q или -z)
+        need_qr: нужны ли QR (True если -q или -z)
+        want_zip: нужен ли ZIP (True если -z)
+    """
+    # Определяем версию протокола
+    awg_version = getattr(opt, 'version', 'AWG2.0')
+    
+    # Создаём папку WARP/ рядом со скриптом
+    warp_dir = SCRIPT_DIR.joinpath("WARP")
+    warp_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("📁 Папка WARP: %s", warp_dir)
+
+    # Очистка старых WARP конфигов, QR и ZIP
+    for fn in glob.glob(str(warp_dir.joinpath("warp*.conf"))):
+        try:
+            os.remove(fn)
+        except Exception:
+            pass
+    for fn in glob.glob(str(warp_dir.joinpath("warp*.png"))):
+        try:
+            os.remove(fn)
+        except Exception:
+            pass
+    for fn in glob.glob(str(warp_dir.joinpath("warp*.zip"))):
+        try:
+            os.remove(fn)
+        except Exception:
+            pass
+
+    # Генерируем WARP конфиги
+    num_warps = opt.warp if opt.warp > 0 else 1
+    logger.info("🌀 Генерация %d WARP конфигов (версия: %s)...", num_warps, awg_version)
+    
+    warp_configs: List[str] = []
+    last_error = None
+    
+    for i in range(num_warps):
+        success = False
+        for attempt in range(3):
+            try:
+                conf_text, fname = generate_warp_config(
+                    tun_name="",  # Без префикса интерфейса
+                    index=i,
+                    mtu=opt.mtu,
+                    proxy=opt.proxy if hasattr(opt, 'proxy') else "",
+                    version=awg_version,
+                    for_server=False  # Клиентский WARP (без Table = off)
+                )
+                # Сохраняем в папку WARP/
+                path = warp_dir.joinpath(f"warp{i}.conf")
+                atomic_write_text(path, conf_text)
+                warp_configs.append(str(path))
+                success = True
+                break
+            except Exception as e:
+                last_error = str(e)
+                time.sleep(1 + attempt)
+                continue
+        
+        if not success:
+            logger.error("❌ Не удалось сгенерировать WARP %d", i)
+            if last_error:
+                logger.error("📝 Ошибка: %s", last_error)
+    
+    if warp_configs:
+        logger.info("✅ Сгенерировано WARP конфигов: %d", len(warp_configs))
+
+        # Генерация QR-кодов если нужно (как в клиентских конфигах: need_qr = want_qr or want_zip)
+        if need_qr:
+            logger.info("📱 Генерация QR-кодов для WARP...")
+            for conf_path in warp_configs:
+                try:
+                    # Читаем конфиг
+                    conf_text = pathlib.Path(conf_path).read_text(encoding='utf-8')
+
+                    # Генерируем QR
+                    png_path = pathlib.Path(conf_path).with_suffix('.png')
+                    _generate_qr_image(conf_text, png_path)
+
+                except Exception as e:
+                    logger.error("❌ Ошибка генерации QR для %s: %s", conf_path, e)
+
+        # Создание ZIP-архивов если нужно
+        if want_zip:
+            logger.info("📦 Создание ZIP-архивов для WARP...")
+            for conf_path in warp_configs:
+                try:
+                    base_name = pathlib.Path(conf_path).stem
+                    zip_path = warp_dir.joinpath(f"{base_name}.zip")
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        _add_file_to_zip(zipf, conf_path, f"{base_name}.conf")
+                        # Добавляем QR если есть
+                        png_path = pathlib.Path(conf_path).with_suffix('.png')
+                        if png_path.exists():
+                            _add_file_to_zip(zipf, png_path, f"{base_name}.png")
+                except Exception as e:
+                    logger.error("❌ Ошибка создания ZIP для %s: %s", conf_path, e)
+    else:
+        raise RuntimeError("Не удалось сгенерировать WARP конфиги")
+
+
 def handle_confgen(opt) -> Set[str]:
     """
     Генерирует конфиги.
@@ -5647,19 +6495,20 @@ def handle_confgen(opt) -> Set[str]:
     if not g_defclient_config_fn.exists():
         logger.info('Шаблон не найден, создаю стандартный шаблон в %s...', g_defclient_config_fn)
         out = g_defclient_config
-        if g_main_config_type != 'AWG':
-            out = out.replace('\nJc = <', '\n# ')
-            out = out.replace('\nJmin = <', '\n# ')
-            out = out.replace('\nJmax = <', '\n# ')
-            out = out.replace('\nS1 = <', '\n# ')
-            out = out.replace('\nS2 = <', '\n# ')
-            out = out.replace('\nH1 = <', '\n# ')
-            out = out.replace('\nH2 = <', '\n# ')
-            out = out.replace('\nH3 = <', '\n# ')
-            out = out.replace('\nH4 = <', '\n# ')
         atomic_write_text(g_defclient_config_fn, out)
-    
+
     tmpcfg = g_defclient_config_fn.read_text(encoding='utf-8')
+    
+    # Читаем версию протокола из серверного конфига
+    server_protocol = "AWG1.0"  # По умолчанию
+    try:
+        server_conf_text = g_main_config_fn.read_text(encoding='utf-8')
+        for line in server_conf_text.split('\n'):
+            if line.startswith('# Protocol:'):
+                server_protocol = line.split(':')[1].strip()
+                break
+    except Exception as e:
+        logger.warning("⚠  Не удалось прочитать версию протокола: %s", e)
 
     # Очистка
     for fn in glob.glob(str(g_conf_dir.joinpath("*.conf"))):
@@ -5671,9 +6520,10 @@ def handle_confgen(opt) -> Set[str]:
         try:
             os.remove(fn)
         except Exception: pass
-    
-    random.seed()
-    
+
+    # Инициализируем random уникальным seed
+    _init_random_seed()
+
     # Загрузка и парсинг AllowedIPs с поддержкой QR-флага
     ensure_allowedips_config(g_allowedips_config_fn)
     try:
@@ -5744,11 +6594,24 @@ def handle_confgen(opt) -> Set[str]:
         if 'PresharedKey' not in peer:
             cfg.set_param(peer_name, 'PresharedKey', psk)
             psk_added = True
-        jc = random.randint(80, 120)
-        jmin = random.randint(48, 64)
-        jmax = random.randint(jmin + 8, 80)
-        persistent_keepalive = random.randint(1, 9)
+
+        # Инициализируем random уникальным seed для каждого клиента
+        # time.time_ns() ^ os.getpid() ^ hash(peer_name) = уникальный seed даже для пакетной генерации
+        _init_random_seed(hash(peer_name))
+
+        # Генерируем параметры для КЛИЕНТА через общую функцию
+        # for_client=True — генерировать I1-I5 для клиента
+        # for_server=False — S1, S2, S3, S4, H1-H4 будут None (клиент читает из серверного конфига)
+        client_obf_params = generate_all_params(server_protocol, for_client=True, for_server=False)
+
+        persistent_keepalive = _generate_persistent_keepalive()
         mtu = srv.get('MTU', str(opt.mtu))
+
+        # Читаем серверный конфиг для получения параметров S1, S2, S3, S4, H1-H4
+        server_conf_text = g_main_config_fn.read_text(encoding='utf-8')
+
+        # Получаем параметры сервера
+        server_params = _get_server_params(server_conf_text, server_protocol)
 
         for idx, ep in enumerate(endpoints, start=1):
             host = ep.get('host', '')
@@ -5764,87 +6627,29 @@ def handle_confgen(opt) -> Set[str]:
             out_base = out_base.replace('<MTU>', mtu)
             out_base = out_base.replace('<CLIENT_PRIVATE_KEY>', peer['PrivateKey'])
 
-            # Исправляем маску клиента на маску подсети сервера ТОЛЬКО если broadcast работает
-            # (сервер НЕ на network address) — это нужно для работы broadcast/multicast
+            # Исправляем маску клиента на маску подсети сервера
             client_allowed_ips = peer['AllowedIPs']
             try:
-                # Парсим AllowedIPs и проверяем позицию сервера
-                allowed_ips_list = [ip.strip() for ip in client_allowed_ips.split(',')]
-                fixed_allowed_ips = []
-                
-                # Получаем подсети сервера из srv['Address']
                 srv_addr_line = srv.get('Address', '')
-                raw_subnets = [s.strip() for s in srv_addr_line.split(',')]
-                net_ipv4 = None
-                net_ipv6 = None
-                for subnet_str in raw_subnets:
-                    net = ipaddress.ip_network(subnet_str, strict=False)
-                    if isinstance(net, ipaddress.IPv4Network):
-                        net_ipv4 = net
-                    else:
-                        net_ipv6 = net
-                
-                # Проверяем занимает ли сервер network address (broadcast НЕ работает)
-                # Сервер на network если его ФАКТИЧЕСКИЙ IP (из конфига) == network_address подсети
-                server_ipv4_on_network = False
-                if net_ipv4:
-                    if ',' in srv_addr_line:
-                        srv_ipv4_part = srv_addr_line.split(',')[0].strip()
-                    else:
-                        srv_ipv4_part = srv_addr_line.strip()
-                    if '/' in srv_ipv4_part:
-                        # Получаем ФАКТИЧЕСКИЙ IP адрес (не network!)
-                        srv_ip_str = srv_ipv4_part.split('/')[0]
-                        srv_ip_int = int(ipaddress.ip_address(srv_ip_str))
-                        # Сравниваем фактический IP с network_address подсети
-                        server_ipv4_on_network = (srv_ip_int == int(net_ipv4.network_address))
-
-                server_ipv6_on_network = False
-                if net_ipv6:
-                    if ',' in srv_addr_line:
-                        srv_ipv6_part = srv_addr_line.split(',')[1].strip()
-                    else:
-                        srv_ipv6_part = srv_addr_line.strip()
-                    if '/' in srv_ipv6_part:
-                        # Получаем ФАКТИЧЕСКИЙ IP адрес (не network!)
-                        srv_ip_str = srv_ipv6_part.split('/')[0]
-                        srv_ip_int = int(ipaddress.ip_address(srv_ip_str))
-                        # Сравниваем фактический IP с network_address подсети
-                        server_ipv6_on_network = (srv_ip_int == int(net_ipv6.network_address))
-                
-                for ip_str in allowed_ips_list:
-                    if '/' in ip_str:
-                        ip_net = ipaddress.ip_network(ip_str, strict=False)
-                        if isinstance(ip_net, ipaddress.IPv4Network):
-                            # Для IPv4: заменяем маску на серверную ТОЛЬКО если broadcast работает
-                            if not server_ipv4_on_network:
-                                fixed_allowed_ips.append(f"{ip_net.network_address}/{net_ipv4.prefixlen}")
-                            else:
-                                fixed_allowed_ips.append(ip_str)
-                        elif net_ipv6:
-                            # Для IPv6: заменяем маску на серверную ТОЛЬКО если multicast работает
-                            if not server_ipv6_on_network:
-                                fixed_allowed_ips.append(f"{ip_net.network_address}/{net_ipv6.prefixlen}")
-                            else:
-                                fixed_allowed_ips.append(ip_str)
-                    else:
-                        fixed_allowed_ips.append(ip_str)
-                client_allowed_ips = ', '.join(fixed_allowed_ips)
+                client_allowed_ips = _fix_client_allowed_ips(client_allowed_ips, srv_addr_line)
             except Exception as e:
                 logger.error('❌ Ошибка замены маски: %s', e)
                 pass  # Если ошибка, оставляем как есть
 
+            out_base = out_base.replace('<PROTOCOL>', server_protocol)
+            out_base = out_base.replace('<MTU>', mtu)
+            out_base = out_base.replace('<CLIENT_PRIVATE_KEY>', peer['PrivateKey'])
             out_base = out_base.replace('<CLIENT_TUNNEL_IP>', client_allowed_ips)
-            out_base = out_base.replace('<JC>', str(jc))
-            out_base = out_base.replace('<JMIN>', str(jmin))
-            out_base = out_base.replace('<JMAX>', str(jmax))
-            out_base = out_base.replace('<S1>', srv.get('S1', ''))
-            out_base = out_base.replace('<S2>', srv.get('S2', ''))
-            out_base = out_base.replace('<H1>', srv.get('H1', ''))
-            out_base = out_base.replace('<H2>', srv.get('H2', ''))
-            out_base = out_base.replace('<H3>', srv.get('H3', ''))
-            out_base = out_base.replace('<H4>', srv.get('H4', ''))
-            
+
+            # Заполняем параметры обфускации
+            out_base = _fill_client_obfuscation_params(
+                out_base, client_obf_params,
+                server_params['S1'], server_params['S2'],
+                server_params['S3'], server_params['S4'],
+                server_params['H1'], server_params['H2'],
+                server_params['H3'], server_params['H4']
+            )
+
             host_for_cfg = host
             if ':' in host and not host.startswith('['):
                 host_for_cfg = f'[{host}]'
@@ -5927,21 +6732,6 @@ def generate_qr_codes(qr_filter: Optional[Set[str]] = None) -> None:
     if not flst:
         logger.warning('⚠  Нет файлов, подходящих под QR фильтр: %s', qr_filter)
         return
-    
-    def generate_qr(conf, fn):
-        if os.path.getsize(fn) > 2048:
-            logger.warning('⚠  Конфиг %s >2KB, возможно QR не получится', fn)
-        max_version = 40
-        error_correction = qrcode.constants.ERROR_CORRECT_L
-        for version in range(1, max_version + 1):
-            try:
-                qr = qrcode.QRCode(version=version, error_correction=error_correction, box_size=10, border=4)
-                qr.add_data(conf)
-                qr.make(fit=False)
-                return qr.make_image(fill="black", back_color="white")
-            except (qrcode.exceptions.DataOverflowError, ValueError):
-                continue
-        raise ValueError("⚠  Данных слишком много для QR")
 
     for fn in flst:
         with open(fn, 'r', encoding='utf-8') as file:
@@ -5949,8 +6739,8 @@ def generate_qr_codes(qr_filter: Optional[Set[str]] = None) -> None:
         name = os.path.splitext(os.path.basename(fn))[0]
         png_path = g_conf_dir.joinpath(f"{name}.png")
         try:
-            img = generate_qr(conf, fn)
-            img.save(str(png_path))
+            _generate_qr_image(conf, png_path)
+            #logger.info("✅ QR-код: %s", png_path)
         except Exception as e:
             logger.error('❌ Ошибка генерации QR для %s: %s', fn, e)
 
@@ -5979,11 +6769,8 @@ def zip_client_files(client_name: str) -> None:
             if not file.is_file():
                 continue
             if pattern_file.match(file.name):
-                try:
-                    zipf.write(str(file), arcname=file.name)
-                except Exception as e:
-                    logger.warning("⚠  Не удалось добавить %s в %s: %s", file, zip_filename, e)
-        
+                _add_file_to_zip(zipf, str(file), file.name)
+
         if g_file_dir.exists() and g_file_dir.is_dir():
             for root, dirs, files in os.walk(g_file_dir):
                 rel_root = os.path.relpath(root, g_file_dir)
@@ -6061,6 +6848,7 @@ parser.add_argument("-i", "--ipaddr", default="", help="IP адрес")
 parser.add_argument("-p", "--port", type=int, default=4455, help="Порт")
 parser.add_argument("-l", "--limit", type=int, default=0, help="Limit (Mbit)")
 parser.add_argument("-f", "--iface", default="", help="Сетевой интерфейс (например ens3)")
+parser.add_argument("-v", "--version", type=str, default="AWG2.0", choices=["WG", "AWG", "AWG1.0", "AWG1.5", "AWG2.0"], help="Версия протокола")
 parser.add_argument("--make", dest="makecfg", default="", help="Создать серверный конфиг")
 parser.add_argument("--mtu", type=int, default=1388, help="MTU")
 parser.add_argument("--warp", type=int, default=0, help="WARP конфиги")
@@ -6181,6 +6969,34 @@ def main() -> None:
     need_conf = want_conf or want_qr or want_zip
     need_qr = want_qr or want_zip
 
+    # Автономная генерация WARP конфигов (без серверного интерфейса)
+    if opt.warp > 0 and not opt.makecfg and not opt.server_cfg:
+        handle_warp_gen(opt, need_conf=need_conf, need_qr=need_qr, want_zip=want_zip)
+        
+        # Очистка лишних файлов после генерации (для WARP своя логика)
+        warp_dir = SCRIPT_DIR.joinpath("WARP")
+        
+        # Для WARP: -z сохраняет только .zip, -q сохраняет .conf+.png, -c сохраняет .conf
+        if want_zip and not opt.qrcode and not opt.confgen:
+            # Только -z → удаляем .conf и .png
+            for f in os.listdir(warp_dir):
+                if f.endswith('.conf') or f.endswith('.png'):
+                    try:
+                        os.remove(warp_dir.joinpath(f))
+                    except Exception:
+                        pass
+        elif opt.qrcode and not want_zip and not opt.confgen:
+            # Только -q → удаляем .zip (если есть)
+            for f in os.listdir(warp_dir):
+                if f.endswith('.zip'):
+                    try:
+                        os.remove(warp_dir.joinpath(f))
+                    except Exception:
+                        pass
+        # В остальных случаях оставляем всё
+        
+        return
+
     if opt.makecfg:
         handle_makecfg(opt)
         return
@@ -6197,25 +7013,25 @@ def main() -> None:
     if opt.delete:
         handle_delete(opt)
         return
-        
+
     # Сначала генерируем конфиги (если нужно),
     # и получаем список имен для QR
     qr_filter = None
     if need_conf:
         qr_filter = handle_confgen(opt)
-        
+
     if need_qr:
         # Передаем полученный фильтр
         generate_qr_codes(qr_filter)
-        
+
     if want_zip:
         zip_all()
-        
+
     only_list = get_only_list()
     allowed_names = None
     if only_list:
         allowed_names = clients_for_zip if clients_for_zip else only_list
-        
+
     clean_confdir_types(
         keep_conf=want_conf,
         keep_qr=want_qr,
