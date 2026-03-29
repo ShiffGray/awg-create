@@ -3985,6 +3985,7 @@ def generate_cps_packet(
     random_ascii: int = 0,
     random_ascii_range: int = 0,  # Если > 0, то random_ascii будет случайным в диапазоне
     random_digits: int = 0,
+    random_digits_range: int = 0,  # Если > 0, то random_digits будет случайным в диапазоне
 ) -> str:
     """
     Генерация CPS-пакета (I1-I5) для маскировки под легитимные UDP протоколы.
@@ -4016,28 +4017,34 @@ def generate_cps_packet(
 
     if use_timestamp:
         parts.append("<t>")
-    
+
     # Если указан диапазон, генерируем случайное значение
     if random_bytes_range > 0:
         actual_random_bytes = random.randint(random_bytes, random_bytes + random_bytes_range)
     else:
         actual_random_bytes = random_bytes
-    
+
     if actual_random_bytes > 0:
         parts.append(f"<r {actual_random_bytes}>")
-    
+
     # Если указан диапазон, генерируем случайное значение
     if random_ascii_range > 0:
         actual_random_ascii = random.randint(random_ascii, random_ascii + random_ascii_range)
     else:
         actual_random_ascii = random_ascii
-    
+
     if actual_random_ascii > 0:
         parts.append(f"<rc {actual_random_ascii}>")
-    
-    if random_digits > 0:
-        parts.append(f"<rd {random_digits}>")
-    
+
+    # Если указан диапазон, генерируем случайное значение для цифр
+    if random_digits_range > 0:
+        actual_random_digits = random.randint(random_digits, random_digits + random_digits_range)
+    else:
+        actual_random_digits = random_digits
+
+    if actual_random_digits > 0:
+        parts.append(f"<rd {actual_random_digits}>")
+
     return "".join(parts)
 
 
@@ -4185,7 +4192,8 @@ def _generate_i_params() -> Dict[str, str]:
             random_bytes_range=40,
             random_ascii=80,              # Доменное имя + query (80-160 символов)
             random_ascii_range=80,
-            random_digits=6,              # Transaction ID (6 цифр)
+            random_digits=6,              # Transaction ID (6-10 цифр)
+            random_digits_range=4,        # Вариативность transaction ID
         ),
         
         # I2: QUIC (порт 443) — QUIC Initial packet
@@ -4199,7 +4207,8 @@ def _generate_i_params() -> Dict[str, str]:
             random_bytes_range=100,
             random_ascii=250,             # HTTP/3 заголовки + crypto data (250-500 символов)
             random_ascii_range=250,
-            random_digits=15,             # Version, packet numbers, stream IDs (15 цифр)
+            random_digits=15,             # Version, packet numbers, stream IDs (15-22 цифр)
+            random_digits_range=7,        # Вариативность полей
         ),
         
         # I3: DTLS 1.2 (порт 443) — DTLS ClientHello
@@ -4213,21 +4222,23 @@ def _generate_i_params() -> Dict[str, str]:
             random_bytes_range=100,
             random_ascii=350,             # Сертификаты (PEM base64), расширения (350-750 символов)
             random_ascii_range=400,
-            random_digits=10,             # Version, sequence numbers, cipher suite IDs (10 цифр)
+            random_digits=10,             # Version, sequence numbers, cipher suite IDs (10-16 цифр)
+            random_digits_range=6,        # Вариативность полей
         ),
         
         # I4: NTP (порт 123) — NTP пакет
-        # Реальный NTP пакет: ровно 48 байт
-        # Структура: LI+VN+Mode (1) + Stratum (1) + Poll (1) + Precision (1) + Timestamps (32) + ...
+        # Реальный NTP пакет: 48-56 байт (NTPv4 с расширениями)
+        # Структура: LI+VN+Mode (1) + Stratum (1) + Poll (1) + Precision (1) + Timestamps (32) + Extension Fields + ...
         "I4": generate_cps_packet(
             static_bytes="0x1B",          # LEAP=0, Version=3, Mode=3 (клиент)
-            static_bytes_range=0,         # Фиксировано 1 байт (NTP строгий формат)
+            static_bytes_range=3,         # 1-4 байта (база + NTP расширения)
             use_timestamp=True,           # NTP основан на timestamp (время отправки)
             random_bytes=0,               # В NTP нет случайных байт
             random_bytes_range=0,
             random_ascii=0,               # В NTP нет текстовых полей
             random_ascii_range=0,
-            random_digits=42,             # Stratum, poll, precision, timestamps, root delay/dispersion (42 цифры + 1 байт + 4 timestamp + 1 байт = 48 байт)
+            random_digits=42,             # Stratum, poll, precision, timestamps (42-48 цифр)
+            random_digits_range=6,        # NTPv4 расширения (дополнительные цифры)
         ),
         
         # I5: DTLS 1.3 (порт 443) — DTLS 1.3 ClientHello
@@ -4241,7 +4252,8 @@ def _generate_i_params() -> Dict[str, str]:
             random_bytes_range=70,
             random_ascii=180,             # Сертификаты, расширения (180-400 символов)
             random_ascii_range=220,
-            random_digits=10,             # Version, sequence numbers, cipher suite IDs (10 цифр)
+            random_digits=10,             # Version, sequence numbers, cipher suite IDs (10-16 цифр)
+            random_digits_range=6,        # Вариативность полей
         ),
     }
 
