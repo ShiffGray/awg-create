@@ -4004,9 +4004,14 @@ def generate_cps_packet(
     # Генерируем static_bytes с рандомной длиной если указан диапазон
     if static_bytes:
         if static_bytes_range > 0:
-            # Генерируем случайную длину в байтах (не в hex!)
-            actual_length = random.randint(len(static_bytes)//2, len(static_bytes)//2 + static_bytes_range)
-            static_bytes = f"0x{secrets.token_hex(actual_length)}"
+            # Сохраняем базовую сигнатуру и добавляем случайные байты (расширения)
+            base_hex = static_bytes[2:]  # Убираем "0x", оставляем hex (например "01" из "0x01")
+            # Генерируем случайное количество дополнительных байт (0 до static_bytes_range)
+            extra_bytes = random.randint(0, static_bytes_range)
+            if extra_bytes > 0:
+                extra_hex = secrets.token_hex(extra_bytes)
+                static_bytes = f"0x{base_hex}{extra_hex}"
+            # Иначе оставляем базовую сигнатуру без изменений
         parts.append(f"<b {static_bytes}>")
 
     if use_timestamp:
@@ -4145,18 +4150,99 @@ def _generate_h_params_ranges() -> Tuple[str, str, str, str]:
 def _generate_i_params() -> Dict[str, str]:
     """Генерация I1-I5 (CPS-пакеты для маскировки под критическую инфраструктуру).
 
+    I1-I5 — это ОТДЕЛЬНЫЕ пакеты-приманки (decoy packets) которые отправляются
+    ПЕРЕД настоящим WireGuard handshake для обхода DPI.
+
     I1: DNS (порт 53)
     I2: QUIC (порт 443) — Google, YouTube, Chrome
     I3: DTLS 1.2 (порт 443) — WebRTC, Zoom, Teams
     I4: NTP (порт 123) — синхронизация времени
     I5: DTLS 1.3 (порт 443)
+
+    Используются все теги CPS по документации AmneziaWG:
+    - <b 0xHEX> — static bytes (сигнатура протокола, базовая + расширения)
+    - <t> — timestamp (4 байта Unix time)
+    - <r N> — N случайных байт (бинарные данные)
+    - <rc N> — N случайных букв/цифр [A-Za-z0-9]
+    - <rd N> — N случайных цифр [0-9]
+
+    Параметры подобраны для максимального сходства с реальными протоколами:
+    - DNS: 80-200 байт (реальный DNS запрос 50-512 байт)
+    - QUIC: 300-900 байт (реальный QUIC Initial 200-1200 байт)
+    - DTLS 1.2: 400-1000 байт (реальный DTLS ClientHello 300-1200 байт)
+    - NTP: 48 байт (фиксировано, как в реальности)
+    - DTLS 1.3: 300-700 байт (реальный DTLS 1.3 ClientHello 200-600 байт)
     """
     return {
-        "I1": generate_cps_packet(static_bytes="0x01", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
-        "I2": generate_cps_packet(static_bytes="0xc7", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
-        "I3": generate_cps_packet(static_bytes="0x16FEFD", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
-        "I4": generate_cps_packet(static_bytes="0x1B", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
-        "I5": generate_cps_packet(static_bytes="0x16FEFF", static_bytes_range=75, use_timestamp=True, random_ascii=50, random_ascii_range=100, random_bytes=50, random_bytes_range=100),
+        # I1: DNS (порт 53) — DNS запрос
+        # Реальный DNS запрос: 50-512 байт (в среднем 150-300 байт)
+        # Структура: Header (12) + Question (домен + тип) + Additional records
+        "I1": generate_cps_packet(
+            static_bytes="0x01",          # DNS query ID (первый байт)
+            static_bytes_range=15,        # 1-16 байт (база + расширения EDNS)
+            use_timestamp=False,          # DNS не всегда использует timestamp
+            random_bytes=40,              # Padding + дополнительные байты (40-80)
+            random_bytes_range=40,
+            random_ascii=80,              # Доменное имя + query (80-160 символов)
+            random_ascii_range=80,
+            random_digits=6,              # Transaction ID (6 цифр)
+        ),
+        
+        # I2: QUIC (порт 443) — QUIC Initial packet
+        # Реальный QUIC Initial: 200-1200 байт (в среднем 500-900 байт)
+        # Структура: Header (1) + Version (4) + Connection ID (8-20) + Token + Crypto data
+        "I2": generate_cps_packet(
+            static_bytes="0xc7",          # QUIC Initial packet type + version
+            static_bytes_range=30,        # 1-31 байт (header + version + extensions)
+            use_timestamp=True,           # QUIC использует timestamp для защиты от replay
+            random_bytes=150,             # Connection ID + token (150-250 байт)
+            random_bytes_range=100,
+            random_ascii=250,             # HTTP/3 заголовки + crypto data (250-500 символов)
+            random_ascii_range=250,
+            random_digits=15,             # Version, packet numbers, stream IDs (15 цифр)
+        ),
+        
+        # I3: DTLS 1.2 (порт 443) — DTLS ClientHello
+        # Реальный DTLS ClientHello: 300-1200 байт (в среднем 600-1000 байт)
+        # Структура: Handshake (1) + Version (2) + Length (2) + Random (32) + Session ID + Cipher Suites + Certificates
+        "I3": generate_cps_packet(
+            static_bytes="0x16FEFD",      # Handshake (0x16) + DTLS 1.2 version (0xFEFD)
+            static_bytes_range=20,        # 3-23 байта (handshake + version + extensions)
+            use_timestamp=True,           # DTLS использует timestamp в handshake
+            random_bytes=100,             # ClientHello random + session ID (100-200 байт)
+            random_bytes_range=100,
+            random_ascii=350,             # Сертификаты (PEM base64), расширения (350-750 символов)
+            random_ascii_range=400,
+            random_digits=10,             # Version, sequence numbers, cipher suite IDs (10 цифр)
+        ),
+        
+        # I4: NTP (порт 123) — NTP пакет
+        # Реальный NTP пакет: ровно 48 байт
+        # Структура: LI+VN+Mode (1) + Stratum (1) + Poll (1) + Precision (1) + Timestamps (32) + ...
+        "I4": generate_cps_packet(
+            static_bytes="0x1B",          # LEAP=0, Version=3, Mode=3 (клиент)
+            static_bytes_range=0,         # Фиксировано 1 байт (NTP строгий формат)
+            use_timestamp=True,           # NTP основан на timestamp (время отправки)
+            random_bytes=0,               # В NTP нет случайных байт
+            random_bytes_range=0,
+            random_ascii=0,               # В NTP нет текстовых полей
+            random_ascii_range=0,
+            random_digits=42,             # Stratum, poll, precision, timestamps, root delay/dispersion (42 цифры + 1 байт + 4 timestamp + 1 байт = 48 байт)
+        ),
+        
+        # I5: DTLS 1.3 (порт 443) — DTLS 1.3 ClientHello
+        # Реальный DTLS 1.3 ClientHello: 200-600 байт (в среднем 350-550 байт)
+        # Структура: Handshake (1) + Version (2) + Random (32) + Session ID + Cipher Suites + Extensions
+        "I5": generate_cps_packet(
+            static_bytes="0x16FEFF",      # Handshake (0x16) + DTLS 1.3 version (0xFEFF)
+            static_bytes_range=20,        # 3-23 байта (handshake + version + extensions)
+            use_timestamp=True,           # DTLS 1.3 использует timestamp
+            random_bytes=70,              # ClientHello random + session ID (70-140 байт)
+            random_bytes_range=70,
+            random_ascii=180,             # Сертификаты, расширения (180-400 символов)
+            random_ascii_range=220,
+            random_digits=10,             # Version, sequence numbers, cipher suite IDs (10 цифр)
+        ),
     }
 
 
@@ -6852,8 +6938,38 @@ parser.add_argument("-v", "--version", type=str, default="AWG2.0", choices=["WG"
 parser.add_argument("--make", dest="makecfg", default="", help="Создать серверный конфиг")
 parser.add_argument("--mtu", type=int, default=1388, help="MTU")
 parser.add_argument("--warp", type=int, default=0, help="WARP конфиги")
-parser.add_argument("--proxy", default="", help="Proxy сервер для WARP API (например http://proxy:8080 или socks5://127.0.0.1:9050)")
+parser.add_argument("--proxy", default="", help="Proxy сервер для WARP API (например http://proxy:8080, socks5://127.0.0.1:9050, или 'tor' для авто)")
 opt = parser.parse_args()
+
+
+# ----------------- Нормализация прокси -----------------
+def normalize_proxy(proxy: str) -> str:
+    """
+    Нормализует строку прокси:
+    - 'tor' → 'socks5://127.0.0.1:9050'
+    - '127.0.0.1:9050' → 'socks5://127.0.0.1:9050' (автоподстановка socks5://)
+    - 'proxy:8080' → 'socks5://proxy:8080' (если нет схемы)
+    - 'http://...' или 'socks5://...' → без изменений
+    """
+    if not proxy:
+        return ""
+    
+    proxy = proxy.strip()
+    
+    # Алиас 'tor'
+    if proxy.lower() == "tor":
+        return "socks5://127.0.0.1:9050"
+    
+    # Если уже есть схема (http://, https://, socks4://, socks5://)
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", proxy):
+        return proxy
+    
+    # Нет схемы — подставляем socks5:// по умолчанию
+    return f"socks5://{proxy}"
+
+
+# Применяем нормализацию к прокси
+opt.proxy = normalize_proxy(opt.proxy)
 
 
 def get_only_list() -> List[str]:
