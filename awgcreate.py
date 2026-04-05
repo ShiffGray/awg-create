@@ -679,67 +679,17 @@ SERVER_OCCUPIES_FIRST_IPV6=0
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   LOCAL_SERVER_IP_IPV6="$(echo "$LOCAL_SUBNETS_IPV6" | cut -d'/' -f1)"
 
-  # Вычисляем первый usable IP для IPv6
-  FIRST_IP_IPV6=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
-print(str(net.network_address + 1))
-" 2>/dev/null) || {
-    echo "❌ Ошибка: не удалось вычислить FIRST_IP для IPv6"
-    exit 1
-  }
-
-  # Последний usable зависит от позиции сервера (сравниваем как IP адреса!)
-  if python3 -c "
-import ipaddress
-import sys
-try:
-    server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP_IPV6')
-    first_ip = ipaddress.ip_address('$FIRST_IP_IPV6')
-    if server_ip == first_ip:
-        sys.exit(0)
-    sys.exit(1)
-except:
-    sys.exit(1)
-" 2>/dev/null; then
-    # Сервер на первом usable → последний зарезервирован
-    LAST_IP_IPV6=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
-print(str(net.network_address + net.num_addresses - 2))
-" 2>/dev/null) || {
-      echo "❌ Ошибка: не удалось вычислить LAST_IP для IPv6"
-      exit 1
-    }
-    SERVER_OCCUPIES_FIRST_IPV6=1
-    echo "📍 IPv6: Сервер на первом usable IP ($LOCAL_SERVER_IP_IPV6)"
-  else
-    # Сервер на network/другом адресе → все доступны
-    LAST_IP_IPV6=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
-print(str(net.network_address + net.num_addresses - 1))
-" 2>/dev/null) || {
-      echo "❌ Ошибка: не удалось вычислить LAST_IP для IPv6"
-      exit 1
-    }
-    SERVER_OCCUPIES_FIRST_IPV6=0
-    echo "📍 IPv6: Сервер на network/другом адресе ($LOCAL_SERVER_IP_IPV6)"
-  fi
-  
-  # Проверяем, занимает ли сервер NETWORK адрес для IPv6 (сравниваем как IP адреса!)
+  # Проверяем, занимает ли сервер адрес сети (для multicast)
   if python3 -c "
 import ipaddress
 import sys
 try:
     server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP_IPV6')
     net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
-    # Сравниваем как целые числа для точности
     if int(server_ip) == int(net.network_address):
         sys.exit(0)
     sys.exit(1)
-except Exception as e:
-    # При ошибке считаем что сервер НЕ на network адресе
+except:
     sys.exit(1)
 "; then
     SERVER_ON_NETWORK_IPV6=1
