@@ -901,7 +901,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
 
   # Используем flock для предотвращения race condition
   (
-    flock -x -w 3 200 || {
+    flock -x -w 1 200 || {
       echo "⚠️ Не удалось получить блокировку для $warp, продолжаем без неё..."
     }
 
@@ -3286,7 +3286,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
 
   # Используем flock для предотвращения race condition
   (
-    flock -x -w 3 200 || {
+    flock -x -w 1 200 || {
       echo "⚠️ Не удалось получить блокировку для $warp, продолжаем без неё..."
     }
 
