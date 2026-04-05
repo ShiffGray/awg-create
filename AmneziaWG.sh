@@ -415,7 +415,7 @@ install_go_mode() {
     fi
 
     # 2. Проверяем версию
-    GO_VER_STR=$(go version 2>/dev/null)
+    GO_VER_STR=$(go version 2>/dev/null || true)
     if [ -z "$GO_VER_STR" ]; then
         log_info "Go не найден в системе."
         INSTALL_GO=true
