@@ -4,7 +4,7 @@
 - Большенство действий выполняеться под root!!!
 - Чтобы скачать AmneziaWG и скрипт, используйте эту команду:
 ```sh
-curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/awgcreate.sh | bash
+bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/awgcreate.sh)
 ```
 
 ---
