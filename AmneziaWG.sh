@@ -177,6 +177,26 @@ unlock_dpkg() {
     }
 }
 
+# Подготовка модулей ядра
+setup_kernel_modules() {
+    log_info "Проверка модулей ядра..."
+
+    # Модуль ifb нужен для Ingress Shaping (tc)
+    if ! lsmod | grep -q "^ifb " 2>/dev/null; then
+        log_info "Загрузка модуля ifb (для лимитов скорости)..."
+        if modprobe ifb 2>/dev/null; then
+            log_success "Модуль ifb загружен"
+            # Добавляем в автозагрузку
+            mkdir -p /etc/modules-load.d
+            echo "ifb" > /etc/modules-load.d/ifb.conf
+        else
+            log_warning "Модуль ifb недоступен (лимиты входящей скорости могут не работать)"
+        fi
+    else
+        log_success "Модуль ifb уже загружен"
+    fi
+}
+
 # Обновление и установка зависимостей
 install_deps() {
     log_info "Обновление и установка зависимостей..."
@@ -754,14 +774,15 @@ main() {
     disable_systemd_resolved
     purge_resolvconf
     unlock_dpkg
-    install_deps           # 1. СНАЧАЛА apt update + зависимости
-    install_resolvconf     # 2. ПОТОМ openresolv/resolvconf
-    setup_dns              # 3. DNS
-    add_repo "$codename"   # 4. Репозиторий Amnezia
-    install_amneziawg      # 5. AmneziaWG
-    restore_resolvconf     # 6. Восстановление resolv.conf
-    verify                 # 7. Проверка
-    print_info             # 8. Вывод
+    setup_kernel_modules   # 1. ПОДГОТОВКА МОДУЛЕЙ ЯДРА (ifb для лимитов)
+    install_deps           # 2. apt update + зависимости
+    install_resolvconf     # 3. openresolv/resolvconf
+    setup_dns              # 4. DNS
+    add_repo "$codename"   # 5. Репозиторий Amnezia
+    install_amneziawg      # 6. AmneziaWG
+    restore_resolvconf     # 7. Восстановление resolv.conf
+    verify                 # 8. Проверка
+    print_info             # 9. Вывод
 }
 
 main "$@"
