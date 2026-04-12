@@ -850,10 +850,11 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   WARP_ACTIVE_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.active"
 
   # Используем flock для предотвращения race condition
+  # Ждём 1 секунду. Если не получилось — всё равно выполняем код (без блокировки)
+  # Это нужно для случаев когда Go-амнезия держит туннель после перезагрузки
+  WARP_LOCK_TIMEOUT=1
   (
-    flock -x -w 1 200 || {
-      echo "⚠️ Не удалось получить блокировку для $warp, продолжаем без неё..."
-    }
+    flock -x -w $WARP_LOCK_TIMEOUT 200 || echo "⚠️ Блокировка $warp не получена за ${WARP_LOCK_TIMEOUT}с — выполняем без неё..." >&2
 
     # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
     WARP_RUNNING=0
@@ -898,7 +899,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
       echo "⚠️  WARP $warp уже запущен но .ref не найден — создаём .ref=1"
       echo "1" > "$WARP_REF_FILE"
     fi
-    
+
     # ВАЖНО: Устанавливаем .active флаг ВНУТРИ блокировки
     if [ -f "$WARP_REF_FILE" ]; then
       touch "$WARP_ACTIVE_FILE"
@@ -3222,6 +3223,7 @@ done
 # Останавливаем каждый уникальный WARP интерфейс
 # Reference counting + ПРЯМАЯ ПРОВЕРКА реального состояния интерфейса
 WARP_ACTIVE=0
+WARP_LOCK_TIMEOUT=1
 
 # СОХРАНЯЕМ список WARP интерфейсов ДО остановки (для последующей очистки!)
 declare -A STOPPED_WARP_INTERFACES
@@ -3235,10 +3237,10 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   WARP_LOCK_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.lock"
 
   # Используем flock для предотвращения race condition
+  # Ждём 1 секунду. Если не получилось — всё равно выполняем код (без блокировки)
+  # Это нужно для случаев когда Go-амнезия держит туннель после перезагрузки
   (
-    flock -x -w 1 200 || {
-      echo "⚠️ Не удалось получить блокировку для $warp, продолжаем без неё..."
-    }
+    flock -x -w $WARP_LOCK_TIMEOUT 200 || echo "⚠️ Блокировка $warp не получена за ${WARP_LOCK_TIMEOUT}с — выполняем без неё..." >&2
 
     # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
     WARP_RUNNING=0
@@ -3261,7 +3263,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
         else
           echo "⚠️  WARP $warp не запущен (ref=$ref_count) — очистка..."
         fi
-        
+
         # Очищаем таблицу маршрутизации (только если последний пользователь)
         TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
         if [ -n "$TABLE_ID" ]; then
@@ -3269,7 +3271,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
           sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
           echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
         fi
-        
+
         rm -f "$WARP_REF_FILE"
       else
         # Уменьшаем счётчик — таблица остаётся для других
@@ -3285,7 +3287,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
         else
           echo "Ошибка остановки $warp: $?"
         fi
-        
+
         # Очищаем таблицу маршрутизации
         TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
         if [ -n "$TABLE_ID" ]; then
