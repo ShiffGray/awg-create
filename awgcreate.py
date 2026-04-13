@@ -153,7 +153,7 @@ PORT_FORWARDING_RULES=(
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   # --- Настройка логирования ---
   SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-  LOG_DIR="$SCRIPT_DIR/.state/.log"
+  LOG_DIR="$SCRIPT_DIR/.data/log"
   mkdir -p "$LOG_DIR" 2>/dev/null || true
   LOG_FILE="$LOG_DIR/${TUN}.log"
   
@@ -416,11 +416,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 
   # --- 10. WARP reference count ---
   echo "🔢 WARP Reference Count:"
-  WARP_DIR="$(dirname "$(readlink -f "$0")")/.state/.warp"
+  WARP_DIR="$(dirname "$(readlink -f "$0")")/.data/warp"
   if [ -d "$WARP_DIR" ]; then
-    for ref_file in "$WARP_DIR"/warp_*.ref; do
+    for ref_file in "$WARP_DIR"/*.ref; do
       if [ -f "$ref_file" ]; then
-        warp_name=$(basename "$ref_file" .ref | sed 's/warp_//')
+        warp_name=$(basename "$ref_file" .ref)
         ref_count=$(cat "$ref_file" 2>/dev/null)
         echo "   • $warp_name: ref=$ref_count"
       fi
@@ -506,7 +506,7 @@ else
 fi
 
 # --- Настройка логирования ---
-LOG_DIR="$SCRIPT_DIR/.state/.log"
+LOG_DIR="$SCRIPT_DIR/.data/log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG_FILE="$LOG_DIR/${TUN}up.log"
 # Открываем файл-дескриптор для логов (FD 3)
@@ -528,49 +528,6 @@ INPUT_CHAIN="INPUT_${TUN_SAFE}"
 HAIRPIN_CHAIN="HAIRPIN_${TUN_SAFE}"
 
 echo "————————————————————————————————"
-
-# --- Функция: найти туннель по подсети в .conf файлах ---
-find_tunnel_by_subnet_in_configs() {
-  local target_subnet="$1"
-  local script_dir="$(dirname "$(readlink -f "$0")")"
-
-  for conf_file in "$script_dir"/*.conf; do
-    [ -f "$conf_file" ] || continue
-    local conf_name="$(basename "$conf_file" .conf)"
-    [[ "$conf_name" == *warp* ]] && continue
-    local conf_subnet=$(grep -E "^Address = " "$conf_file" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d ' ')
-    [ -z "$conf_subnet" ] && continue
-    IFS=',' read -ra SUBNETS <<< "$conf_subnet"
-    for subnet in "${SUBNETS[@]}"; do
-      subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-      [ -z "$subnet" ] && continue
-      if [ "$subnet" = "$target_subnet" ]; then
-        echo "$conf_name"
-        return 0
-      fi
-      if python3 -c "
-import ipaddress
-try:
-    ip = ipaddress.ip_network('$target_subnet', strict=False)
-    conf_net = ipaddress.ip_network('$subnet', strict=False)
-    ip_first = int(ip.network_address)
-    ip_last = int(ip.broadcast_address)
-    conf_first = int(conf_net.network_address)
-    conf_last = int(conf_net.broadcast_address)
-    if ip_first <= conf_last and conf_first <= ip_last:
-        exit(0)
-    exit(1)
-except:
-    exit(1)
-" 2>/dev/null; then
-        echo "$conf_name"
-        return 0
-      fi
-    done
-  done
-  echo ""
-  return 1
-}
 
 # --- Включаем IP forwarding если выключен ---
 if [ $(sysctl -n net.ipv4.ip_forward) -eq 1 ]; then
@@ -733,22 +690,8 @@ find_table_id() {
   echo "0"
 }
 
-# --- Функция: определить версию IP и вернуть команду iptables/ip6tables ---
-# Использование: IPT_CMD="$(get_ipt_cmd "$subnet")"
-#              $IPT_CMD -t mangle -A ... -d "$subnet" ...
-get_ipt_cmd() {
-  local addr="$1"
-  # Проверяем, содержит ли адрес двоеточие (IPv6)
-  if [[ "$addr" == *:* ]]; then
-    echo "ip6tables"
-  else
-    echo "iptables"
-  fi
-}
-
-# --- Helper функции для парсинга WARP_LIST ---
+# --- Helper функция для парсинга WARP_LIST ---
 # Использование: interfaces="$(parse_warp_interfaces "$entry")"
-#              subnets="$(parse_warp_subnets "$entry")"
 parse_warp_interfaces() {
   local entry="$1"
   # Если есть "=" — возвращаем часть до "=", иначе всю запись
@@ -759,54 +702,6 @@ parse_warp_interfaces() {
   fi
 }
 
-parse_warp_subnets() {
-  local entry="$1"
-  # Если есть "=" — возвращаем часть после "=", иначе пусто
-  if [[ "$entry" == *"="* ]]; then
-    echo "${entry#*=}"
-  else
-    echo ""
-  fi
-}
-
-# --- Helper функция для применения правил к IPv4 и IPv6 ---
-# Использование: apply_rule_both "$CHAIN" "-j RETURN" "$IPV4_SUBNET" "$IPV6_SUBNET"
-apply_rule_both() {
-  local chain="$1"
-  local rule="$2"
-  local ipv4_subnet="$3"
-  local ipv6_subnet="$4"
-  
-  # Применяем правило для IPv4 если подсеть указана
-  if [ -n "$ipv4_subnet" ]; then
-    iptables -t mangle -A "$chain" -s "$ipv4_subnet" $rule 2>/dev/null || true
-  fi
-  
-  # Применяем правило для IPv6 если подсеть указана
-  if [ -n "$ipv6_subnet" ]; then
-    ip6tables -t mangle -A "$chain" -s "$ipv6_subnet" $rule 2>/dev/null || true
-  fi
-}
-
-# --- Helper функция для очистки правил IPv4 и IPv6 ---
-# Использование: cleanup_rule_both "$CHAIN" "-j RETURN" "$IPV4_SUBNET" "$IPV6_SUBNET"
-cleanup_rule_both() {
-  local chain="$1"
-  local rule="$2"
-  local ipv4_subnet="$3"
-  local ipv6_subnet="$4"
-  
-  # Очищаем правило для IPv4 если подсеть указана
-  if [ -n "$ipv4_subnet" ]; then
-    iptables -t mangle -D "$chain" -s "$ipv4_subnet" $rule 2>/dev/null || true
-  fi
-  
-  # Очищаем правило для IPv6 если подсеть указана
-  if [ -n "$ipv6_subnet" ]; then
-    ip6tables -t mangle -D "$chain" -s "$ipv6_subnet" $rule 2>/dev/null || true
-  fi
-}
-
 # --- Запуск WARP-интерфейсов (дополнительные WireGuard-интерфейсы для мульти-WARP) ---
 # Пропускаем, если WARP_LIST пустой или содержит только "none"
 # Используем счётчик ссылок для поддержки общих WARP между туннелями
@@ -814,10 +709,10 @@ cleanup_rule_both() {
 WARP_ACTIVE=0
 
 # Создаём ОБЩУЮ папку для всех WARP файлов (ОБЩАЯ ДЛЯ ВСЕХ ИНТЕРФЕЙСОВ!)
-# Файлы хранятся рядом с up.sh/down.sh скриптом в .state/.warp/
-STATE_BASE_DIR="$(dirname "$(readlink -f "$0")")/.state"
+# Файлы хранятся рядом с up.sh/down.sh скриптом в .data/warp/
+STATE_BASE_DIR="$(dirname "$(readlink -f "$0")")/.data"
 mkdir -p "$STATE_BASE_DIR" 2>/dev/null || true
-mkdir -p "$STATE_BASE_DIR/.warp" 2>/dev/null || true
+mkdir -p "$STATE_BASE_DIR/warp" 2>/dev/null || true
 
 # Собираем все уникальные WARP интерфейсы из всех записей WARP_LIST
 declare -A ALL_WARP_INTERFACES
@@ -840,71 +735,120 @@ for entry in "${WARP_LIST[@]}"; do
   done
 done
 
+# Функция: атомарное обновление .ref файла через mkdir (гарантированно атомарен в POSIX)
+# Если не удалось получить блокировку за 1 сек — всё равно выполняет операцию
+atomic_ref_update() {
+  local ref_file="$1"
+  local operation="$2"  # "inc", "dec", "set", "get", "get_inc", "get_dec"
+  local value="${3:-}"  # для "set"
+  local lock_dir="${ref_file}.d"
+  local attempts=0
+
+  # Пытаемся захватить блокировку (10 попыток по 0.1с = 1 сек макс)
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 10 ]; then
+      echo "⚠️ Блокировка $ref_file не получена за 1с — выполняем без неё..." >&2
+      break
+    fi
+    sleep 0.1
+  done
+
+  # Выполняем операцию (всегда выполняется, даже если не получили блокировку)
+  local result=""
+  case "$operation" in
+    "inc")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result=$((cur + 1))
+      echo "$result" > "$ref_file"
+      ;;
+    "dec")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result=$((cur - 1))
+      echo "$result" > "$ref_file"
+      ;;
+    "get_inc")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result="$cur:$((cur + 1))"
+      echo "$((cur + 1))" > "$ref_file"
+      ;;
+    "get_dec")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result="$cur:$((cur - 1))"
+      echo "$((cur - 1))" > "$ref_file"
+      ;;
+    "set")
+      echo "$value" > "$ref_file"
+      result="$value"
+      ;;
+    "get")
+      result=$(cat "$ref_file" 2>/dev/null || echo "0")
+      ;;
+  esac
+
+  # Освобождаем блокировку
+  rmdir "$lock_dir" 2>/dev/null || true
+
+  # Возвращаем результат
+  echo "$result"
+}
+
 # Запускаем каждый уникальный WARP интерфейс
 # Reference counting + ПРЯМАЯ ПРОВЕРКА реального состояния интерфейса
 WARP_ACTIVE=0
 for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   echo "🚀 Запуск WARP-туннеля: $warp"
-  WARP_REF_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.ref"
-  WARP_LOCK_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.lock"
-  WARP_ACTIVE_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.active"
+  WARP_REF_FILE="$STATE_BASE_DIR/warp/${warp}.ref"
+  WARP_ACTIVE_FILE="$STATE_BASE_DIR/warp/${warp}.active"
 
-  # Используем flock для предотвращения race condition
-  # Ждём 1 секунду. Если не получилось — всё равно выполняем код (без блокировки)
-  # Это нужно для случаев когда Go-амнезия держит туннель после перезагрузки
-  WARP_LOCK_TIMEOUT=1
-  (
-    flock -x -w $WARP_LOCK_TIMEOUT 200 || echo "⚠️ Блокировка $warp не получена за ${WARP_LOCK_TIMEOUT}с — выполняем без неё..." >&2
+  # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
+  WARP_RUNNING=0
+  if ip link show "$warp" &>/dev/null; then
+    WARP_RUNNING=1
+  fi
 
-    # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
-    WARP_RUNNING=0
-    if ip link show "$warp" &>/dev/null; then
-      WARP_RUNNING=1
-    fi
+  # Проверяем состояние WARP интерфейса и .ref файла
+  # Логика:
+  # 1. Нет интерфейса + Нет .ref → Запускаем интерфейс, создаём .ref=1
+  # 2. Нет интерфейса + Есть .ref → Запускаем интерфейс, пересоздаём .ref=1
+  # 3. Есть интерфейс + Есть .ref → Увеличиваем .ref += 1
+  # 4. Есть интерфейс + Нет .ref → Создаём .ref=1
 
-    # Проверяем состояние WARP интерфейса и .ref файла
-    # Логика:
-    # 1. Нет интерфейса + Нет .ref → Запускаем интерфейс, создаём .ref=1
-    # 2. Нет интерфейса + Есть .ref → Запускаем интерфейс, пересоздаём .ref=1
-    # 3. Есть интерфейс + Есть .ref → Увеличиваем .ref += 1
-    # 4. Есть интерфейс + Нет .ref → Создаём .ref=1
-
-    if [ "$WARP_RUNNING" -eq 0 ] && [ ! -f "$WARP_REF_FILE" ]; then
-      # Случай 1: Нет интерфейса + Нет .ref → Запускаем интерфейс, создаём .ref=1
-      echo "🔧 Запуск WARP: $warp (интерфейс не активен, .ref не найден)"
-      if awg-quick up "$warp" 2>/dev/null; then
-        echo "1" > "$WARP_REF_FILE"
-        echo "✅ WARP $warp запущен (ref=1)"
-      else
-        echo "❌ Ошибка запуска $warp: $?"
-      fi
-    elif [ "$WARP_RUNNING" -eq 0 ] && [ -f "$WARP_REF_FILE" ]; then
-      # Случай 2: Нет интерфейса + Есть .ref → Запускаем интерфейс, пересоздаём .ref=1
-      ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
-      echo "🔧 Перезапуск WARP: $warp (интерфейс не активен, ref=$ref_count)"
-      rm -f "$WARP_REF_FILE"
-      if awg-quick up "$warp" 2>/dev/null; then
-        echo "1" > "$WARP_REF_FILE"
-        echo "✅ WARP $warp перезапущен (ref=1)"
-      else
-        echo "❌ Ошибка запуска $warp: $?"
-      fi
-    elif [ "$WARP_RUNNING" -eq 1 ] && [ -f "$WARP_REF_FILE" ]; then
-      # Случай 3: Есть интерфейс + Есть .ref → Увеличиваем .ref += 1
-      ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
-      echo "✅ WARP $warp уже запущен (ref=$ref_count → $((ref_count + 1)))"
-      echo $((ref_count + 1)) > "$WARP_REF_FILE"
+  if [ "$WARP_RUNNING" -eq 0 ] && [ ! -f "$WARP_REF_FILE" ]; then
+    # Случай 1: Нет интерфейса + Нет .ref → Запускаем интерфейс, создаём .ref=1
+    echo "🔧 Запуск WARP: $warp (интерфейс не активен, .ref не найден)"
+    if awg-quick up "$warp" 2>/dev/null; then
+      atomic_ref_update "$WARP_REF_FILE" "set" "1" >/dev/null
+      echo "✅ WARP $warp запущен (ref=1)"
     else
-      # Случай 4: Есть интерфейс + Нет .ref → Создаём .ref=1
-      echo "⚠️  WARP $warp уже запущен но .ref не найден — создаём .ref=1"
-      echo "1" > "$WARP_REF_FILE"
+      echo "❌ Ошибка запуска $warp: $?"
     fi
+  elif [ "$WARP_RUNNING" -eq 0 ] && [ -f "$WARP_REF_FILE" ]; then
+    # Случай 2: Нет интерфейса + Есть .ref → Запускаем интерфейс, пересоздаём .ref=1
+    ref_count=$(atomic_ref_update "$WARP_REF_FILE" "get")
+    echo "🔧 Перезапуск WARP: $warp (интерфейс не активен, ref=$ref_count)"
+    if awg-quick up "$warp" 2>/dev/null; then
+      atomic_ref_update "$WARP_REF_FILE" "set" "1" >/dev/null
+      echo "✅ WARP $warp перезапущен (ref=1)"
+    else
+      echo "❌ Ошибка запуска $warp: $?"
+    fi
+  elif [ "$WARP_RUNNING" -eq 1 ] && [ -f "$WARP_REF_FILE" ]; then
+    # Случай 3: Есть интерфейс + Есть .ref → Увеличиваем .ref += 1 (атомарно get+inc)
+    ref_info=$(atomic_ref_update "$WARP_REF_FILE" "get_inc")
+    ref_count="${ref_info%%:*}"
+    new_count="${ref_info##*:}"
+    echo "✅ WARP $warp уже запущен (ref=$ref_count → $new_count)"
+  else
+    # Случай 4: Есть интерфейс + Нет .ref → Создаём .ref=1
+    echo "⚠️  WARP $warp уже запущен но .ref не найден — создаём .ref=1"
+    atomic_ref_update "$WARP_REF_FILE" "set" "1" >/dev/null
+  fi
 
-    # ВАЖНО: Устанавливаем .active флаг ВНУТРИ блокировки
-    if [ -f "$WARP_REF_FILE" ]; then
-      touch "$WARP_ACTIVE_FILE"
-    fi
-  ) 200>"$WARP_LOCK_FILE"
+  # ВАЖНО: Устанавливаем .active флаг
+  if [ -f "$WARP_REF_FILE" ]; then
+    touch "$WARP_ACTIVE_FILE"
+  fi
 
   # Проверяем .active файл (надёжнее чем .ref из-за гонки)
   if [ -f "$WARP_ACTIVE_FILE" ]; then
@@ -1737,9 +1681,9 @@ fi
 # --- Сохраняем ВСЕ параметры туннеля в один временный файл ---
 # Это нужно для поиска туннелей по подсети и очистки в down.sh
 # Храним: параметры, WARP_LIST, LAN_ALLOW, INTERFACE_MAP
-TUNNELS_STATE_DIR="$STATE_BASE_DIR/.tunnels"
+TUNNELS_STATE_DIR="$STATE_BASE_DIR/params"
 mkdir -p "$TUNNELS_STATE_DIR" 2>/dev/null || true
-TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${TUN}.params"
+TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${TUN}"
 
 # --- Собираем карту интерфейсов и подсетей для всех IP в LAN_ALLOW ---
 # Это нужно чтобы down.sh мог очистить правила даже если интерфейс больше не существует
@@ -1918,44 +1862,21 @@ done
 # Удаляем дубликаты из INTERFACE_MAP
 INTERFACE_MAP_UNIQUE=($(printf '%s\n' "${INTERFACE_MAP[@]}" | sort -u))
 
-# Записываем ВСЕ параметры включая INTERFACE_MAP чистыми bash массивами
+# Сохраняем параметры для down.sh: копируем awg0.sh + дописываем динамические
+mkdir -p "$TUNNELS_STATE_DIR" 2>/dev/null || true
+cp "$PARAMS_FILE" "$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh" 2>/dev/null || true
 {
-  echo "# Параметры туннеля ${TUN}"
-  echo "TUN=\"$TUN\""
-  echo "IFACE=\"$IFACE\""
-  echo "PORT=\"$PORT\""
-  echo "LOCAL_SUBNETS=\"$LOCAL_SUBNETS\""
+  echo ""
   echo "MARK_BASE=\"$MARK_BASE\""
-  echo "TUNNELS_STATE_DIR=\"$TUNNELS_STATE_DIR\""
   echo ""
-  echo "# WARP_LIST"
-  echo "WARP_LIST=("
-  for item in "${WARP_LIST[@]}"; do
-    # Экранируем специальные символы для безопасного чтения в bash
-    escaped_item=$(echo "$item" | sed 's/"/\\"/g')
-    echo "  \"$escaped_item\""
-  done
-  echo ")"
-  echo ""
-  echo "# LAN_ALLOW"
-  echo "LAN_ALLOW=("
-  for item in "${LAN_ALLOW[@]}"; do
-    # LAN_ALLOW содержит только подсети (IPv4/IPv6) - экранирование не нужно
-    echo "  \"$item\""
-  done
-  echo ")"
-  echo ""
-  echo "# INTERFACE_MAP"
   echo "INTERFACE_MAP=("
   for item in "${INTERFACE_MAP_UNIQUE[@]}"; do
-    # INTERFACE_MAP содержит "имя=подсеть" - экранирование не нужно
     echo "  \"$item\""
   done
   echo ")"
-} > "$TUNNEL_PARAMS_FILE" 2>/dev/null || true
+} >> "$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh" 2>/dev/null || true
 
-# INTERFACE_MAP сохранён в .params файле — отдельный файл не нужен
-# LAN_ALLOW_FILE больше не создаётся
+# --- Добавление правил для каждого проброса ---
 
 # --- Broadcast/Multicast трафик (для игр и service discovery) ---
 # Работает ТОЛЬКО если сервер НЕ занимает ПЕРВЫЙ IP в подсети
@@ -2046,27 +1967,6 @@ fi
 # --- Добавление правил для каждого проброса ---
 
 # --- Вспомогательные функции для разбора правил проброски портов ---
-# Функция проверки является ли поле протоколом
-is_proto() {
-  local s="$1"
-  local s_upper
-  s_upper=$(echo "$s" | tr '[:lower:]' '[:upper:]')
-  if [ "$s_upper" = "TCP" ] || [ "$s_upper" = "UDP" ]; then
-    return 0
-  fi
-  if [[ "$s_upper" == *","* ]]; then
-    IFS=',' read -ra proto_parts <<< "$s_upper"
-    for p in "${proto_parts[@]}"; do
-      p="${p// /}"
-      if [ "$p" != "TCP" ] && [ "$p" != "UDP" ]; then
-        return 1
-      fi
-    done
-    return 0
-  fi
-  return 1
-}
-
 # Функция проверки является ли поле валидным именем интерфейса
 is_valid_interface() {
   local s="$1"
@@ -2076,27 +1976,6 @@ is_valid_interface() {
   if [ "$s_upper" = "SNAT" ]; then return 1; fi
   if ! [[ "$s" =~ [a-zA-Z] ]]; then return 1; fi
   if [[ "$s" =~ ^[a-zA-Z0-9_]+$ ]]; then return 0; fi
-  return 1
-}
-
-# Функция проверки является ли поле FLAGS
-is_flags() {
-  local s="$1"
-  local s_upper
-  s_upper=$(echo "$s" | tr '[:lower:]' '[:upper:]')
-  if [ "$s_upper" = "SNAT" ]; then return 0; fi
-  if [[ "$s" == *","* ]]; then
-    IFS=',' read -ra flag_parts <<< "$s"
-    for part in "${flag_parts[@]}"; do
-      part="${part// /}"
-      local part_upper
-      part_upper=$(echo "$part" | tr '[:lower:]' '[:upper:]')
-      if [ "$part_upper" = "SNAT" ]; then continue; fi
-      if ! is_valid_interface "$part"; then return 1; fi
-    done
-    return 0
-  fi
-  if is_valid_interface "$s"; then return 0; fi
   return 1
 }
 
@@ -2627,11 +2506,10 @@ except Exception as e:
     fi
   done
   
-  # Если все правила отфильтрованы — выходим
+  # Если все правила отфильтрованы — пропускаем этот блок
   if [ ${#VALID_SUBNETS_LIMITS[@]} -eq 0 ]; then
     echo "ℹ️  Лимиты скорости отключены (нет валидных правил)"
-    return
-  fi
+  else
   
   # Используем валидные правила вместо исходных
   SUBNETS_LIMITS=("${VALID_SUBNETS_LIMITS[@]}")
@@ -2945,9 +2823,7 @@ print(aligned)
       fi
   done
   echo "✅ Лимиты скорости настроены"
-else
-  echo "ℹ️  Лимиты скорости отключены (SUBNETS_LIMITS пуст)"
-fi
+  fi
 echo "————————————————————————————————"
 '''
 
@@ -2959,9 +2835,9 @@ SCRIPT_DIR="$(dirname "$DOWN_SCRIPT_PATH")"
 SCRIPT_NAME="$(basename "$DOWN_SCRIPT_PATH" down.sh)"
 
 # --- Чтение параметров из файла сохранённого up.sh ---
-STATE_BASE_DIR="$SCRIPT_DIR/.state"
-TUNNELS_STATE_DIR="$STATE_BASE_DIR/.tunnels"
-TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${SCRIPT_NAME}.params"
+STATE_BASE_DIR="$SCRIPT_DIR/.data"
+TUNNELS_STATE_DIR="$STATE_BASE_DIR/params"
+TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh"
 
 # Инициализируем переменные
 TUN=""
@@ -2973,57 +2849,10 @@ WARP_LIST=()
 LAN_ALLOW=()
 INTERFACE_MAP=()
 
-# Читаем параметры из файла если он существует
+# Читаем параметры — файл содержит копию awg0.sh + MARK_BASE + INTERFACE_MAP
 if [ -f "$TUNNEL_PARAMS_FILE" ]; then
-  # Читаем файл построчно и парсим вручную (без source!)
-  current_array=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    # Пропускаем комментарии и пустые строки
-    [[ "$line" =~ ^#.*$ ]] && continue
-    [[ -z "${line// }" ]] && continue
-
-    # Проверяем начало массива
-    if [[ "$line" =~ ^WARP_LIST=\( ]]; then
-      current_array="warp_list"
-      continue
-    elif [[ "$line" =~ ^LAN_ALLOW=\( ]]; then
-      current_array="lan_allow"
-      continue
-    elif [[ "$line" =~ ^INTERFACE_MAP=\( ]]; then
-      current_array="interface_map"
-      continue
-    elif [[ "$line" =~ ^\) ]]; then
-      current_array=""
-      continue
-    fi
-
-    # Заполняем массивы
-    case "$current_array" in
-      warp_list)
-        value=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
-        [ -n "$value" ] && WARP_LIST+=("$value")
-        ;;
-      lan_allow)
-        value=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
-        [ -n "$value" ] && LAN_ALLOW+=("$value")
-        ;;
-      interface_map)
-        value=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
-        [ -n "$value" ] && INTERFACE_MAP+=("$value")
-        ;;
-    esac
-  done < "$TUNNEL_PARAMS_FILE"
-fi
-
-# Читаем простые переменные через grep
-if [ -f "$TUNNEL_PARAMS_FILE" ]; then
-  TUN=$(grep "^TUN=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
-  IFACE=$(grep "^IFACE=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
-  PORT=$(grep "^PORT=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
-  LOCAL_SUBNETS=$(grep "^LOCAL_SUBNETS=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
-  MARK_BASE=$(grep "^MARK_BASE=" "$TUNNEL_PARAMS_FILE" | cut -d'=' -f2 | tr -d '"')
+  source "$TUNNEL_PARAMS_FILE"
 else
-  # .params файл не найден — пытаемся восстановить из имени скрипта
   echo "⚠️  Файл параметров не найден: $TUNNEL_PARAMS_FILE"
   echo "   Восстановление параметров из имени скрипта..."
   TUN="$SCRIPT_NAME"
@@ -3033,7 +2862,7 @@ else
 fi
 
 # --- Настройка логирования ---
-LOG_DIR="$SCRIPT_DIR/.state/.log"
+LOG_DIR="$SCRIPT_DIR/.data/log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG_FILE="$LOG_DIR/${TUN}down.log"
 # Открываем файл-дескриптор для логов (FD 3)
@@ -3041,6 +2870,64 @@ exec 3>"$LOG_FILE"
 # Направляем set -x ТОЛЬКО в лог (через FD 3)
 BASH_XTRACEFD=3
 set -x
+
+# Функция: атомарное обновление .ref файла через mkdir (гарантированно атомарен в POSIX)
+# Если не удалось получить блокировку за 1 сек — всё равно выполняет операцию
+atomic_ref_update() {
+  local ref_file="$1"
+  local operation="$2"  # "inc", "dec", "set", "get", "get_inc", "get_dec"
+  local value="${3:-}"  # для "set"
+  local lock_dir="${ref_file}.d"
+  local attempts=0
+
+  # Пытаемся захватить блокировку (10 попыток по 0.1с = 1 сек макс)
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 10 ]; then
+      echo "⚠️ Блокировка $ref_file не получена за 1с — выполняем без неё..." >&2
+      break
+    fi
+    sleep 0.1
+  done
+
+  # Выполняем операцию (всегда выполняется, даже если не получили блокировку)
+  local result=""
+  case "$operation" in
+    "inc")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result=$((cur + 1))
+      echo "$result" > "$ref_file"
+      ;;
+    "dec")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result=$((cur - 1))
+      echo "$result" > "$ref_file"
+      ;;
+    "get_inc")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result="$cur:$((cur + 1))"
+      echo "$((cur + 1))" > "$ref_file"
+      ;;
+    "get_dec")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result="$cur:$((cur - 1))"
+      echo "$((cur - 1))" > "$ref_file"
+      ;;
+    "set")
+      echo "$value" > "$ref_file"
+      result="$value"
+      ;;
+    "get")
+      result=$(cat "$ref_file" 2>/dev/null || echo "0")
+      ;;
+  esac
+
+  # Освобождаем блокировку
+  rmdir "$lock_dir" 2>/dev/null || true
+
+  # Возвращаем результат
+  echo "$result"
+}
 
 # --- Парсинг LOCAL_SUBNETS (IPv4 + IPv6) ---
 LOCAL_SUBNETS_IPV4=""
@@ -3125,42 +3012,6 @@ HAIRPIN_CHAIN="HAIRPIN_${TUN_SAFE}"
 
 echo "————————————————————————————————"
 
-# --- Функция: определить версию IP и вернуть команду iptables/ip6tables ---
-# Использование: IPT_CMD="$(get_ipt_cmd "$subnet")"
-#              $IPT_CMD -t mangle -A ... -d "$subnet" ...
-get_ipt_cmd() {
-  local addr="$1"
-  # Проверяем, содержит ли адрес двоеточие (IPv6)
-  if [[ "$addr" == *:* ]]; then
-    echo "ip6tables"
-  else
-    echo "iptables"
-  fi
-}
-
-# --- Helper функции для парсинга WARP_LIST (те же что в up.sh) ---
-# parse_warp_interfaces: извлекает ТОЛЬКО имена интерфейсов (до '=')
-# Пример: "awg10warp0=8.8.8.8, 8.8.4.4" → "awg10warp0"
-parse_warp_interfaces() {
-  local entry="$1"
-  if [[ "$entry" == *"="* ]]; then
-    echo "${entry%%=*}"
-  else
-    echo "$entry"
-  fi
-}
-
-# parse_warp_subnets: извлекает подсети (после '=')
-# Пример: "awg10warp0=8.8.8.8, 8.8.4.4" → "8.8.8.8, 8.8.4.4"
-parse_warp_subnets() {
-  local entry="$1"
-  if [[ "$entry" == *"="* ]]; then
-    echo "${entry#*=}"
-  else
-    echo ""
-  fi
-}
-
 # MARK специфичен для туннеля — берем небольшой оффсет от имени туннеля
 # Должен совпадать с расчётом из up скрипта (диапазон 1000-9990)
 # Используем cksum (более доступен чем od) или md5sum как fallback
@@ -3177,18 +3028,7 @@ fi
 MARK_BASE=$((1000 + (TUN_HASH % 900) * 10))
 
 # --- Остановка WARP-туннелей ---
-# Читаем WARP_LIST из .params файла сохранённого up скриптом
-TUNNELS_STATE_DIR="$STATE_BASE_DIR/.tunnels"
-TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${TUN}.params"
-
-WARP_LIST=()
-if [ -f "$TUNNEL_PARAMS_FILE" ]; then
-  source "$TUNNEL_PARAMS_FILE" 2>/dev/null || true
-fi
-
-# Пропускаем, если WARP_LIST пустой или содержит только "none"
-# Используем счётчик ссылок для поддержки общих WARP между туннелями
-# Парсим формат: "warp0,warp1=subnet1, subnet2" или "warp0,warp1"
+# WARP_LIST уже доступен из source выше
 WARP_ACTIVE=0
 
 # Собираем все уникальные WARP интерфейсы из всех записей WARP_LIST
@@ -3223,7 +3063,6 @@ done
 # Останавливаем каждый уникальный WARP интерфейс
 # Reference counting + ПРЯМАЯ ПРОВЕРКА реального состояния интерфейса
 WARP_ACTIVE=0
-WARP_LOCK_TIMEOUT=1
 
 # СОХРАНЯЕМ список WARP интерфейсов ДО остановки (для последующей очистки!)
 declare -A STOPPED_WARP_INTERFACES
@@ -3233,73 +3072,65 @@ done
 
 for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   echo "🛑 Остановка WARP-туннеля: $warp"
-  WARP_REF_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.ref"
-  WARP_LOCK_FILE="$STATE_BASE_DIR/.warp/warp_${warp}.lock"
+  WARP_REF_FILE="$STATE_BASE_DIR/warp/${warp}.ref"
 
-  # Используем flock для предотвращения race condition
-  # Ждём 1 секунду. Если не получилось — всё равно выполняем код (без блокировки)
-  # Это нужно для случаев когда Go-амнезия держит туннель после перезагрузки
-  (
-    flock -x -w $WARP_LOCK_TIMEOUT 200 || echo "⚠️ Блокировка $warp не получена за ${WARP_LOCK_TIMEOUT}с — выполняем без неё..." >&2
+  # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
+  WARP_RUNNING=0
+  if ip link show "$warp" &>/dev/null; then
+    WARP_RUNNING=1
+  fi
 
-    # ПРЯМАЯ ПРОВЕРКА: запущен ли интерфейс реально
-    WARP_RUNNING=0
-    if ip link show "$warp" &>/dev/null; then
-      WARP_RUNNING=1
-    fi
+  # Проверяем .ref файл
+  if [ -f "$WARP_REF_FILE" ]; then
+    ref_count=$(atomic_ref_update "$WARP_REF_FILE" "get")
 
-    # Проверяем .ref файл
-    if [ -f "$WARP_REF_FILE" ]; then
-      ref_count=$(cat "$WARP_REF_FILE" 2>/dev/null || echo "0")
-
-      if [ "$ref_count" -le 1 ]; then
-        # Последний пользователь — закрываем WARP (если он запущен)
-        if [ "$WARP_RUNNING" -eq 1 ]; then
-          if awg-quick down "$warp" 2>/dev/null; then
-            : # WARP остановлен
-          else
-            echo "Ошибка остановки $warp: $?"
-          fi
-        else
-          echo "⚠️  WARP $warp не запущен (ref=$ref_count) — очистка..."
-        fi
-
-        # Очищаем таблицу маршрутизации (только если последний пользователь)
-        TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
-        if [ -n "$TABLE_ID" ]; then
-          ip route flush table "$TABLE_ID" 2>/dev/null || true
-          sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
-          echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
-        fi
-
-        rm -f "$WARP_REF_FILE"
-      else
-        # Уменьшаем счётчик — таблица остаётся для других
-        echo $((ref_count - 1)) > "$WARP_REF_FILE"
-        echo "📋 WARP $warp используется другими туннелями (ref=$ref_count → $((ref_count - 1)))"
-      fi
-    else
-      # .ref нет — проверяем запущен ли WARP и закрываем если да
+    if [ "$ref_count" -le 1 ]; then
+      # Последний пользователь — закрываем WARP (если он запущен)
       if [ "$WARP_RUNNING" -eq 1 ]; then
-        echo "⚠️  WARP $warp запущен но .ref не найден — очистка..."
         if awg-quick down "$warp" 2>/dev/null; then
           : # WARP остановлен
         else
           echo "Ошибка остановки $warp: $?"
         fi
-
-        # Очищаем таблицу маршрутизации
-        TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
-        if [ -n "$TABLE_ID" ]; then
-          ip route flush table "$TABLE_ID" 2>/dev/null || true
-          sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
-          echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
-        fi
       else
-        echo "⚠️  WARP $warp не запущен и .ref не найден — пропускаем"
+        echo "⚠️  WARP $warp не запущен (ref=$ref_count) — очистка..."
       fi
+
+      # Очищаем таблицу маршрутизации (только если последний пользователь)
+      TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+      if [ -n "$TABLE_ID" ]; then
+        ip route flush table "$TABLE_ID" 2>/dev/null || true
+        sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
+        echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
+      fi
+
+      rm -f "$WARP_REF_FILE"
+    else
+      # Уменьшаем счётчик — таблица остаётся для других
+      new_count=$(atomic_ref_update "$WARP_REF_FILE" "dec")
+      echo "📋 WARP $warp используется другими туннелями (ref=$ref_count → $new_count)"
     fi
-  ) 200>"$WARP_LOCK_FILE"
+  else
+    # .ref нет — проверяем запущен ли WARP и закрываем если да
+    if [ "$WARP_RUNNING" -eq 1 ]; then
+      echo "⚠️  WARP $warp запущен но .ref не найден — очистка..."
+      if awg-quick down "$warp" 2>/dev/null; then
+        : # WARP остановлен
+      else
+        echo "Ошибка остановки $warp: $?"
+      fi
+
+      # Очищаем таблицу маршрутизации
+      TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+      if [ -n "$TABLE_ID" ]; then
+        ip route flush table "$TABLE_ID" 2>/dev/null || true
+        sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
+        echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
+      fi
+    else
+      echo "⚠️  WARP $warp не запущен и .ref не найден — пропускаем"
+    fi
+  fi
 
   # Очищаем FORWARD и NAT правила для этого WARP
   # ВАЖНО: Правила созданы С -i "$TUN" для каждого туннеля!
@@ -3312,73 +3143,15 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   ip6tables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
 
   # Удаляем .active файл (используется для отслеживания в up.sh)
-  rm -f "$STATE_BASE_DIR/.warp/warp_${warp}.active" 2>/dev/null || true
+  rm -f "$STATE_BASE_DIR/warp/${warp}.active" 2>/dev/null || true
 done
 
-# --- ЧИТАЕМ ПАРАМЕТРЫ СРАЗУ (до удаления .params)! ---
-# Это нужно для очистки LAN_ALLOW и других правил
-# ВАЖНО: НЕ используем source — читаем и парсим вручную чтобы избежать проблем с пробелами!
-TUNNELS_STATE_DIR="$STATE_BASE_DIR/.tunnels"
-TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${TUN}.params"
+# Все переменные (TUN, IFACE, PORT, LOCAL_SUBNETS, WARP_LIST, LAN_ALLOW, INTERFACE_MAP, MARK_BASE)
+# уже загружены через source в начале скрипта.
 
-# Инициализируем переменные
-LAN_ALLOW=()
-WARP_LIST=()
-INTERFACE_MAP=()
-LOCAL_SUBNETS=""
+# Разбираем LOCAL_SUBNETS на IPv4 и IPv6
 LOCAL_SUBNETS_IPV4=""
 LOCAL_SUBNETS_IPV6=""
-
-# Читаем параметры из файла если он существует
-if [ -f "$TUNNEL_PARAMS_FILE" ]; then
-  # Читаем файл построчно и парсим вручную
-  current_array=""
-  while IFS= read -r line || [ -n "$line" ]; do
-    # Пропускаем пустые строки и комментарии
-    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-    
-    # Проверяем начало массива
-    if [[ "$line" =~ ^WARP_LIST=\( ]]; then
-      current_array="WARP_LIST"
-      continue
-    elif [[ "$line" =~ ^LAN_ALLOW=\( ]]; then
-      current_array="LAN_ALLOW"
-      continue
-    elif [[ "$line" =~ ^INTERFACE_MAP=\( ]]; then
-      current_array="INTERFACE_MAP"
-      continue
-    fi
-    
-    # Проверяем конец массива
-    if [[ "$line" =~ ^\) ]]; then
-      current_array=""
-      continue
-    fi
-    
-    # Читаем элементы массива
-    if [ -n "$current_array" ]; then
-      # Извлекаем значение из строки вида '  "значение"'
-      value=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/^"//;s/"$//')
-      if [ -n "$value" ]; then
-        case "$current_array" in
-          WARP_LIST) WARP_LIST+=("$value") ;;
-          LAN_ALLOW) LAN_ALLOW+=("$value") ;;
-          INTERFACE_MAP) INTERFACE_MAP+=("$value") ;;
-        esac
-      fi
-      continue
-    fi
-    
-    # Читаем простые переменные
-    if [[ "$line" =~ ^TUN= ]]; then
-      TUN=$(echo "$line" | cut -d'=' -f2 | sed 's/^"//;s/"$//')
-    elif [[ "$line" =~ ^LOCAL_SUBNETS= ]]; then
-      LOCAL_SUBNETS=$(echo "$line" | cut -d'=' -f2 | sed 's/^"//;s/"$//')
-    fi
-  done < "$TUNNEL_PARAMS_FILE"
-fi
-
-# Разбираем LOCAL_SUBNETS на IPv4 и IPv6 если нужно
 if [ -n "$LOCAL_SUBNETS" ]; then
   IFS=',' read -ra RAW_SUBNETS <<< "$LOCAL_SUBNETS"
   for subnet in "${RAW_SUBNETS[@]}"; do
@@ -3394,11 +3167,11 @@ if [ -n "$LOCAL_SUBNETS" ]; then
 fi
 
 # Удаляем файлы активности WARP
-rm -f "$STATE_BASE_DIR/.warp/warp_*.active" 2>/dev/null || true
+rm -f "$STATE_BASE_DIR/warp/*.active" 2>/dev/null || true
 
 # --- Очистка маршрутизации и таблиц для WARP ---
 # Очищаем ВСЕГДА для всех WARP интерфейсов которые были остановлены
-# Используем STOPPED_WARP_INTERFACES (сохранён ДО чтения .params!)
+# Используем STOPPED_WARP_INTERFACES (сохранён ДО чтения файла параметров!)
 if [ ${#STOPPED_WARP_INTERFACES[@]} -gt 0 ]; then
   # --- Сначала собираем все интерфейсы БЕЗ подсетей в одну группу ---
   DEFAULT_WARP_GROUP=()
@@ -3723,7 +3496,7 @@ ip6tables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
 ip6tables -t filter -X "$INPUT_CHAIN" 2>/dev/null || true
 
 # Очищаем правило локальной сети (из up скрипта) (IPv4 + IPv6)
-# LAN_ALLOW уже прочитан выше из .params файла!
+# LAN_ALLOW уже прочитан выше из файла параметров!
 
 # Функция: найти имя интерфейса из INTERFACE_MAP по IP/подсети
 # ВАЖНО: Используем ТОЛЬКО INTERFACE_MAP (не ip命令) так как интерфейс может быть уже удалён!
@@ -3760,7 +3533,7 @@ except Exception as e:
 }
 
 # Получаем имя туннеля из INTERFACE_MAP (для очистки правил)
-# ВАЖНО: Делаем это ДО удаления .params файла!
+# ВАЖНО: Делаем это ДО удаления файла параметров!
 MAIN_TUN=""
 if [ ${#INTERFACE_MAP[@]} -gt 0 ]; then
   # Берём первый элемент INTERFACE_MAP и извлекаем имя туннеля
@@ -3881,7 +3654,7 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
     done
   done
 
-  # LAN_ALLOW_FILE больше не используется — всё в .params
+  # LAN_ALLOW_FILE больше не используется — всё в файле параметров
 fi
 
 # Удаляем DROP правило межклиентского трафика (оно было добавлено в up.sh)
@@ -3893,7 +3666,7 @@ iptables -D FORWARD -i "$TUN" -o "$TUN" -j ACCEPT 2>/dev/null || true
 ip6tables -D FORWARD -i "$TUN" -o "$TUN" -j ACCEPT 2>/dev/null || true
 
 # Очищаем правила FORWARD для трафика напрямую через внешний интерфейс
-# IFACE может быть пустым если .params файл не найден
+# IFACE может быть пустым если файл параметров не найден
 if [ -n "$IFACE" ]; then
   iptables -D FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
