@@ -188,6 +188,35 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   INPUT_CHAIN="INPUT_${TUN_SAFE}"
   HAIRPIN_CHAIN="HAIRPIN_${TUN_SAFE}"
 
+  # --- Парсинг LOCAL_SUBNETS на IPv4 и IPv6 (точно как в up.sh) ---
+  LOCAL_SUBNETS_IPV4=""
+  LOCAL_SUBNETS_IPV6=""
+
+  IFS=',' read -ra RAW_SUBNETS <<< "$LOCAL_SUBNETS"
+  for subnet in "${RAW_SUBNETS[@]}"; do
+    subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -n "$subnet" ]; then
+      if [[ "$subnet" == *:* ]]; then
+        LOCAL_SUBNETS_IPV6="$subnet"
+      else
+        LOCAL_SUBNETS_IPV4="$subnet"
+      fi
+    fi
+  done
+
+  # --- Вычисление BROADCAST_ADDR (только из IPv4, как в up.sh) ---
+  BROADCAST_ADDR=""
+  if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+    BROADCAST_ADDR=$(python3 -c "
+import ipaddress
+try:
+    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
+    print(str(net.broadcast_address))
+except:
+    print('')
+" 2>/dev/null)
+  fi
+
   # --- 1. INPUT цепочка (IPv4 + IPv6) ---
   echo "📥 INPUT цепочка ($INPUT_CHAIN):"
   echo "   Порт: $PORT/UDP"
@@ -237,17 +266,35 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   # --- 2.1. Общие правила PREROUTING и FORWARD ---
   echo "🔗 Общие правила (ссылки на цепочки):"
   echo "   PREROUTING → $RANDOM_WARP_CHAIN (WARP маркировка):"
-  iptables -t mangle -L PREROUTING -n -v 2>/dev/null | grep -E "$RANDOM_WARP_CHAIN|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t mangle -L PREROUTING -n -v 2>/dev/null | grep -E "$RANDOM_WARP_CHAIN" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t mangle -L PREROUTING -n -v 2>/dev/null | grep -E "$RANDOM_WARP_CHAIN" || echo "     (нет правил)"
   echo "   PREROUTING → $PF_CHAIN_NAT (проброс портов NAT):"
-  iptables -t nat -L PREROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_NAT|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t nat -L PREROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_NAT" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t nat -L PREROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_NAT" || echo "     (нет правил)"
   echo "   FORWARD → $PF_CHAIN_FILTER (проброс портов FILTER):"
-  iptables -t filter -L FORWARD -n -v 2>/dev/null | grep -E "$PF_CHAIN_FILTER|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t filter -L FORWARD -n -v 2>/dev/null | grep -E "$PF_CHAIN_FILTER" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t filter -L FORWARD -n -v 2>/dev/null | grep -E "$PF_CHAIN_FILTER" || echo "     (нет правил)"
   echo "   POSTROUTING → $PF_CHAIN_SNAT (проброс портов SNAT):"
-  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_SNAT|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_SNAT" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_SNAT" || echo "     (нет правил)"
   echo "   POSTROUTING → $HAIRPIN_CHAIN (Hairpin NAT):"
-  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$HAIRPIN_CHAIN|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$HAIRPIN_CHAIN" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$HAIRPIN_CHAIN" || echo "     (нет правил)"
   echo "   INPUT → $INPUT_CHAIN (вход):"
-  iptables -t filter -L INPUT -n -v 2>/dev/null | grep -E "$INPUT_CHAIN|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t filter -L INPUT -n -v 2>/dev/null | grep -E "$INPUT_CHAIN" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t filter -L INPUT -n -v 2>/dev/null | grep -E "$INPUT_CHAIN" || echo "     (нет правил)"
   echo ""
 
   # --- 3. Таблицы маршрутизации и ip rule ---
@@ -258,10 +305,50 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   fi
   echo ""
   echo "   ip rule (fwmark → table):"
-  echo "   IPv4:"
-  ip rule show 2>/dev/null | grep -E "fwmark $MARK_BASE" || echo "     (нет правил с fwmark $MARK_BASE)"
-  echo "   IPv6:"
-  ip -6 rule show 2>/dev/null | grep -E "fwmark $MARK_BASE" || echo "     (нет правил с fwmark $MARK_BASE)"
+  # MARK_BASE используется для WARP маркировки (CONNMARK) и ip rule
+  # Проверяем все диапазоны за один вызов python3
+  python3 << PYEOF
+import subprocess, sys
+
+warp_start = int("$MARK_BASE")
+warp_end = warp_start + 999
+bc_start = warp_start + 1000
+bc_end = warp_start + 1099
+
+def get_rules(ip_ver):
+    """Получить ip rule для IPv4 или IPv6"""
+    try:
+        cmd = ['ip'] + (['-6'] if ip_ver == 6 else []) + ['rule', 'show']
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        lines = []
+        for line in result.stdout.strip().split('\n'):
+            if not line: continue
+            parts = line.split()
+            for i, p in enumerate(parts):
+                if p == 'fwmark' and i+1 < len(parts):
+                    v = parts[i+1]
+                    m = int(v, 0) if v.startswith('0x') else int(v)
+                    lines.append((line, m))
+        return lines
+    except:
+        return []
+
+def print_matching(rules, start, end, label_v4, label_v6):
+    """Вывести правила в диапазоне для IPv4 и IPv6"""
+    for lines, label in [(rules[4], label_v4), (rules[6], label_v6)]:
+        print(f'   {label}:')
+        found = False
+        for line, m in lines:
+            if start <= m <= end:
+                print(f'       {line}')
+                found = True
+        if not found:
+            print('       (нет правил)')
+
+rules = {4: get_rules(4), 6: get_rules(6)}
+print_matching(rules, warp_start, warp_end, 'WARP марки (маркировка + маршрутизация) IPv4', 'WARP марки (маркировка + маршрутизация) IPv6')
+print_matching(rules, bc_start, bc_end, 'Broadcast/Multicast марки IPv4', 'Broadcast/Multicast марки IPv6')
+PYEOF
   echo ""
   echo "   Маршруты по таблицам WARP:"
   for warp_entry in "${WARP_LIST[@]}"; do
@@ -304,7 +391,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   # Проверка tc фильтров на TUN (перенаправление на IFB)
   echo "   🔍 Фильтры перенаправления (на $TUN):"
   echo "   IPv4 фильтры:"
-  ipv4_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -c "mirred" || echo "0")
+  ipv4_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -c "mirred")
+  ipv4_filter_count=${ipv4_filter_count:-0}
   if [ "$ipv4_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ipv4_filter_count IPv4 фильтров"
     tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
@@ -312,7 +400,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ❌ IPv4 фильтры не найдены"
   fi
   echo "   IPv6 фильтры:"
-  ipv6_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -c "mirred" || echo "0")
+  ipv6_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -c "mirred")
+  ipv6_filter_count=${ipv6_filter_count:-0}
   if [ "$ipv6_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ipv6_filter_count IPv6 фильтров"
     tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
@@ -320,12 +409,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ❌ IPv6 фильтры не найдены"
   fi
   echo ""
-  
+
   # Проверка tc классов на IFB
   echo "   📊 Классы HTB ($IFB_OUT):"
-  total_classes=$(tc class show dev "$IFB_OUT" 2>/dev/null | grep -c "rate" || echo "0")
-  active_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -E "Sent [1-9]" | wc -l)
+  total_classes=$(tc class show dev "$IFB_OUT" 2>/dev/null | grep -c "rate")
+  total_classes=${total_classes:-0}
+  active_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -cE "Sent [1-9]")
+  active_classes=${active_classes:-0}
   total_overlimits=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep "overlimits" | grep -oE "[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+  total_overlimits=${total_overlimits:-0}
 
   if [ "$total_classes" -gt 0 ]; then
     echo "   ✅ Создано HTB классов: $total_classes"
@@ -344,7 +436,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   
   # Проверка ingress фильтров (для входящего трафика)
   echo "   🔍 Ingress фильтры (на $TUN):"
-  ingress_filter_count=$(tc -s filter show dev "$TUN" parent ffff: 2>/dev/null | grep -c "mirred" || echo "0")
+  ingress_filter_count=$(tc -s filter show dev "$TUN" parent ffff: 2>/dev/null | grep -c "mirred")
+  ingress_filter_count=${ingress_filter_count:-0}
   if [ "$ingress_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ingress_filter_count ingress фильтров"
   else
@@ -398,10 +491,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 
   # --- 8. MARK диапазоны ---
   echo "📈 MARK диапазоны:"
-  echo "   MARK_BASE: $MARK_BASE (tc/htb)"
-  echo "   Диапазон tc: $MARK_BASE .. $((MARK_BASE + 899))"
-  echo "   WARP марки: $((MARK_BASE)) .. $((MARK_BASE + 99))"
-  echo "   Broadcast/Multicast: $((MARK_BASE + 1000)) .. $((MARK_BASE + 1099))"
+  echo "   MARK_BASE: $MARK_BASE (база для всех марок туннеля)"
+  echo "   WARP марки (CONNMARK + ip rule): $MARK_BASE .. $((MARK_BASE + 999))"
+  echo "   Broadcast/Multicast марки: $((MARK_BASE + 1000)) .. $((MARK_BASE + 1099))"
+  echo "   Примечание: tc/htb использует classid (major:minor), НЕ fwmark"
   echo ""
 
   # --- 9. Состояние интерфейса TUN ---
@@ -414,15 +507,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   fi
   echo ""
 
-  # --- 10. WARP reference count ---
-  echo "🔢 WARP Reference Count:"
+  # --- 10. WARP reference count + active status ---
+  echo "🔢 WARP Reference Count + Active Status:"
   WARP_DIR="$(dirname "$(readlink -f "$0")")/.data/warp"
   if [ -d "$WARP_DIR" ]; then
+    # Показываем все .ref файлы с ref count и active статусом
     for ref_file in "$WARP_DIR"/*.ref; do
       if [ -f "$ref_file" ]; then
         warp_name=$(basename "$ref_file" .ref)
         ref_count=$(cat "$ref_file" 2>/dev/null)
-        echo "   • $warp_name: ref=$ref_count"
+        active_file="$WARP_DIR/${warp_name}.active"
+        if [ -f "$active_file" ]; then
+          active_status="✅ active"
+        else
+          active_status="❌ не active"
+        fi
+        # Проверяем реальный статус интерфейса
+        if ip link show "$warp_name" &>/dev/null; then
+          iface_status="✅ интерфейс поднят"
+        else
+          iface_status="❌ интерфейс не найден"
+        fi
+        echo "   • $warp_name: ref=$ref_count | $active_status | $iface_status"
       fi
     done
   else
@@ -439,13 +545,20 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "   FORWARD для WARP интерфейсов:"
   for entry in "${WARP_LIST[@]}"; do
     if [ "$entry" != "none" ] && [ -n "$entry" ]; then
-      warp_iface=$(echo "$entry" | cut -d'=' -f1 | sed 's/[[:space:]]//g')
-      if [[ "$warp_iface" != *","* ]]; then
+      # Разбиваем группу интерфейсов (точно как parse_warp_interfaces в up.sh)
+      interfaces_part="$entry"
+      if [[ "$entry" == *"="* ]]; then
+        interfaces_part="${entry%%=*}"
+      fi
+      IFS=',' read -ra RAW_IFACES <<< "$interfaces_part"
+      for warp_iface in "${RAW_IFACES[@]}"; do
+        warp_iface="$(echo "$warp_iface" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "$warp_iface" ] && continue
         echo "   IPv4: $TUN → $warp_iface:"
         iptables -L FORWARD -n -v 2>/dev/null | grep -E "$TUN.*$warp_iface" || echo "     (нет правил)"
         echo "   IPv6: $TUN → $warp_iface:"
         ip6tables -L FORWARD -n -v 2>/dev/null | grep -E "$TUN.*$warp_iface" || echo "     (нет правил)"
-      fi
+      done
     fi
   done
   echo ""
@@ -466,9 +579,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 
   echo "   Broadcast/Multicast mark правила:"
   echo "   IPv4 (mangle):"
-  iptables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*$BROADCAST_ADDR|MARK.*255.255.255.255" | head -5 || echo "   (нет правил)"
+  if [ -n "$BROADCAST_ADDR" ]; then
+    iptables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*$BROADCAST_ADDR|MARK.*255.255.255.255" | head -5 || echo "     (нет правил)"
+  else
+    echo "     (broadcast не вычислен — нет IPv4 подсети)"
+  fi
   echo "   IPv6 (mangle):"
-  ip6tables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*ff02::1" | head -5 || echo "   (нет правил)"
+  ip6tables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*ff02::1" | head -5 || echo "     (нет правил)"
   echo ""
 
   echo "   NAT POSTROUTING (MASQUERADE):"
