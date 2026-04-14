@@ -1473,201 +1473,127 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
         IPV6_UNIQUE[$part]=1
       done
 
-      # Обрабатываем IPv4 группу отдельно
-      if [ ${#IPV4_PARTS[@]} -gt 0 ]; then
-        # Создаём unicast правила для ВСЕХ пар участников (включая один туннель!)
-        echo "   Создание unicast правил для IPv4 пар..."
-        for ((i=0; i<${#IPV4_PARTS[@]}; i++)); do
-          for ((j=i+1; j<${#IPV4_PARTS[@]}; j++)); do
-            SRC="${IPV4_PARTS[$i]}"
-            DST="${IPV4_PARTS[$j]}"
-            
-            # Убираем маску /32 для правил
-            SRC_CLEAN="${SRC%/*}"
-            DST_CLEAN="${DST%/*}"
-            
-            echo "    $SRC_CLEAN ↔ $DST_CLEAN"
-            iptables -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
-            iptables -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
-          done
-        done
-        
-        # Intra-subnet разрешён если:
-        # 1. Участник только ОДИН (нет с кем общаться на inter-subnet)
-        # 2. ИЛИ участник встречается >1 раза (явно указан дубль)
-        if [ ${#IPV4_PARTS[@]} -eq 1 ]; then
-          # Только один IPv4 участник — разрешаем intra-subnet
-          SUBNET="${IPV4_PARTS[0]}"
-          if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-            SUBNET_TUN="$TUN"
+      # Универсальная функция обработки LAN_ALLOW группы для одного типа IP
+      # Вызов: lan_allow_group 4 IPV4_PARTS IPV4_UNIQUE  или  lan_allow_group 6 IPV6_PARTS IPV6_UNIQUE
+      lan_allow_group() {
+          local ip_ver="$1"
+          local -n _parts="$2"
+          local -n _unique="$3"
+          local IPT_CMD=""
+          local LABEL=""
+          if [ "$ip_ver" -eq 4 ]; then
+              IPT_CMD="iptables"
+              LABEL="IPv4"
           else
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                SUBNET_TUN="$TUN"
-              else
-                SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-              fi
-            else
-              SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-              [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-            fi
+              IPT_CMD="ip6tables"
+              LABEL="IPv6"
           fi
-          [ -n "$SUBNET_TUN" ] && iptables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-        else
-          # Участников >1 — intra-subnet только для дублей
-          for SUBNET in "${!IPV4_UNIQUE[@]}"; do
-            COUNT=0
-            for part in "${IPV4_PARTS[@]}"; do
-              [ "$part" = "$SUBNET" ] && ((COUNT++))
-            done
-            if [ $COUNT -gt 1 ]; then
-              # Этот участник встречается >1 раза — разрешаем intra-subnet
-              if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-                SUBNET_TUN="$TUN"
-              else
-                if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-                  if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                    SUBNET_TUN="$TUN"
-                  else
-                    SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                    [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-                  fi
-                else
-                  SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                  [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-                fi
-              fi
-              [ -n "$SUBNET_TUN" ] && iptables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-            fi
-          done
-        fi
-      fi
-      unset IPV4_UNIQUE
 
-      # Обрабатываем IPv6 группу отдельно
-      if [ ${#IPV6_PARTS[@]} -gt 0 ]; then
-        # Создаём unicast правила для ВСЕХ пар участников (включая один туннель!)
-        echo "   Создание unicast правил для IPv6 пар..."
-        for ((i=0; i<${#IPV6_PARTS[@]}; i++)); do
-          for ((j=i+1; j<${#IPV6_PARTS[@]}; j++)); do
-            SRC="${IPV6_PARTS[$i]}"
-            DST="${IPV6_PARTS[$j]}"
-            
-            # Убираем маску /124 для правил
-            SRC_CLEAN="${SRC%/*}"
-            DST_CLEAN="${DST%/*}"
-            
-            echo "    $SRC_CLEAN ↔ $DST_CLEAN"
-            ip6tables -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
-            ip6tables -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
+          [ ${#_parts[@]} -eq 0 ] && return
+
+          # 1. Unicast правила для ВСЕХ пар участников
+          echo "   Создание unicast правил для $LABEL пар..."
+          for ((i=0; i<${#_parts[@]}; i++)); do
+              for ((j=i+1; j<${#_parts[@]}; j++)); do
+                  local SRC="${_parts[$i]}"
+                  local DST="${_parts[$j]}"
+                  local SRC_CLEAN="${SRC%/*}"
+                  local DST_CLEAN="${DST%/*}"
+                  echo "    $SRC_CLEAN ↔ $DST_CLEAN"
+                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
+                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
+              done
           done
-        done
-        
-        # Intra-subnet разрешён если:
-        # 1. Участник только ОДИН (нет с кем общаться на inter-subnet)
-        # 2. ИЛИ участник встречается >1 раза (явно указан дубль)
-        if [ ${#IPV6_PARTS[@]} -eq 1 ]; then
-          # Только один IPv6 участник — разрешаем intra-subnet
-          SUBNET="${IPV6_PARTS[0]}"
-          if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-            SUBNET_TUN="$TUN"
-          else
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                SUBNET_TUN="$TUN"
-              else
-                SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-              fi
-            else
-              SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-              [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-            fi
-          fi
-          [ -n "$SUBNET_TUN" ] && ip6tables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-        else
-          # Участников >1 — intra-subnet только для дублей
-          for SUBNET in "${!IPV6_UNIQUE[@]}"; do
-            COUNT=0
-            for part in "${IPV6_PARTS[@]}"; do
-              [ "$part" = "$SUBNET" ] && ((COUNT++))
-            done
-            if [ $COUNT -gt 1 ]; then
-              # Этот участник встречается >1 раза — разрешаем intra-subnet
-              if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-                SUBNET_TUN="$TUN"
-              else
-                if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+
+          # Вспомогательная: найти туннель для подсети
+          _find_subnet_tun() {
+              local subnet="$1"
+              if [ "$subnet" = "$LOCAL_SUBNETS_IPV4" ] || [ "$subnet" = "$LOCAL_SUBNETS_IPV6" ]; then
+                  echo "$TUN"
+              elif [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
                   if python3 -c "
-import ipaddress
-import sys
+import ipaddress, sys
 try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
+    ip = ipaddress.ip_network('$subnet', strict=False)
     tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
     tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
     if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
+        sys.exit(0)
+    sys.exit(1)
 except Exception as e:
     print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
+    sys.exit(1)
 " 2>&1; then
-                    SUBNET_TUN="$TUN"
+                      echo "$TUN"
                   else
-                    SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                    [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
+                      local t=$(find_tun_for_ip "$subnet")
+                      [ -z "$t" ] && t=$(find_tunnel_by_subnet_in_configs "$subnet")
+                      echo "$t"
                   fi
-                else
-                  SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                  [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-                fi
+              else
+                  local t=$(find_tun_for_ip "$subnet")
+                  [ -z "$t" ] && t=$(find_tunnel_by_subnet_in_configs "$subnet")
+                  echo "$t"
               fi
-              [ -n "$SUBNET_TUN" ] && ip6tables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-            fi
-          done
-        fi
-      fi
-      unset IPV6_UNIQUE
+          }
+
+          # 2. Intra-subnet разрешён если один участник ИЛИ участник дубль
+          if [ ${#_parts[@]} -eq 1 ]; then
+              # Один участник — разрешаем intra-subnet
+              local SUBNET="${_parts[0]}"
+              local SUBNET_TUN=$(_find_subnet_tun "$SUBNET")
+              [ -n "$SUBNET_TUN" ] && $IPT_CMD -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
+          else
+              # Участников >1 — intra-subnet только для дублей
+              for SUBNET in "${!_unique[@]}"; do
+                  local COUNT=0
+                  for part in "${_parts[@]}"; do
+                      [ "$part" = "$SUBNET" ] && ((COUNT++))
+                  done
+                  if [ $COUNT -gt 1 ]; then
+                      local SUBNET_TUN=$(_find_subnet_tun "$SUBNET")
+                      [ -n "$SUBNET_TUN" ] && $IPT_CMD -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
+                  fi
+              done
+          fi
+      }
+
+      # Обрабатываем IPv4 и IPv6 через одну функцию
+      lan_allow_group 4 IPV4_PARTS IPV4_UNIQUE
+      lan_allow_group 6 IPV6_PARTS IPV6_UNIQUE
+      unset IPV4_UNIQUE IPV6_UNIQUE
+
+      # Универсальная функция: найти туннель для подсети (inter-subnet)
+      _find_inter_tun() {
+          local target="$1"
+          if [ "$target" = "$LOCAL_SUBNETS_IPV4" ] || [ "$target" = "$LOCAL_SUBNETS_IPV6" ]; then
+              echo "$TUN"
+          elif [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+              if python3 -c "
+import ipaddress, sys
+try:
+    ip = ipaddress.ip_network('$target', strict=False)
+    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
+    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
+    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
+        sys.exit(0)
+    sys.exit(1)
+except Exception as e:
+    print(f'ERROR: {e}', file=sys.stderr)
+    sys.exit(1)
+" 2>&1; then
+                  echo "$TUN"
+              else
+                  local t=$(find_tun_for_ip "$target")
+                  [ -z "$t" ] && t=$(find_tunnel_by_subnet_in_configs "$target")
+                  echo "$t"
+              fi
+          else
+              local t=$(find_tun_for_ip "$target")
+              [ -z "$t" ] && t=$(find_tunnel_by_subnet_in_configs "$target")
+              echo "$t"
+          fi
+      }
 
       # Проходим по каждой паре участников ОДНОГО ТИПА и создаём правила
       # IPv4 и IPv6 не могут общаться друг с другом — не создаём бесполезные правила
@@ -1690,96 +1616,25 @@ except Exception as e:
           # Пропускаем если это одинаковые подсети (для них есть intra-subnet)
           [ "$SRC" = "$DST" ] && continue
 
-          # Автоматически определяем туннель для источника
-          # Если это подсеть текущего туннеля — используем $TUN
-          if [ "$SRC" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SRC" = "$LOCAL_SUBNETS_IPV6" ]; then
-            SRC_TUN="$TUN"
-          else
-            # Проверяем, принадлежит ли подсеть текущему туннелю (пересекается ли)
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SRC', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    # Проверяем что LAN_ALLOW подсеть пересекается с серверной
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                SRC_TUN="$TUN"
-              else
-                # Сначала ищем среди активных интерфейсов
-                SRC_TUN=$(find_tun_for_ip "$SRC")
-                # Если не нашли — ищем в .conf файлах (даже если туннель не активен)
-                if [ -z "$SRC_TUN" ]; then
-                  SRC_TUN=$(find_tunnel_by_subnet_in_configs "$SRC")
-                fi
-              fi
-            else
-              # Нет локальных подсетей — ищем в других интерфейсах
-              SRC_TUN=$(find_tun_for_ip "$SRC")
-              if [ -z "$SRC_TUN" ]; then
-                SRC_TUN=$(find_tunnel_by_subnet_in_configs "$SRC")
-              fi
-            fi
-          fi
+          # Определяем туннель для источника и получателя (универсальная функция)
+          SRC_TUN=$(_find_inter_tun "$SRC")
+          DST_TUN=$(_find_inter_tun "$DST")
 
-          # Если не нашли туннель для SRC — пропускаем эту пару
+          # Если не нашли туннель — пропускаем эту пару
           if [ -z "$SRC_TUN" ]; then
             echo "    ⚠️  Пропущено: $SRC (туннель не найден)"
             continue
           fi
-
-          # Автоматически определяем туннель для получателя
-          # Если это подсеть текущего туннеля — используем $TUN
-          if [ "$DST" = "$LOCAL_SUBNETS_IPV4" ] || [ "$DST" = "$LOCAL_SUBNETS_IPV6" ]; then
-            DST_TUN="$TUN"
-          else
-            # Проверяем, принадлежит ли подсеть текущему туннелю (пересекается ли)
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$DST', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    # Проверяем что LAN_ALLOW подсеть пересекается с серверной
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                DST_TUN="$TUN"
-              else
-                # Сначала ищем среди активных интерфейсов
-                DST_TUN=$(find_tun_for_ip "$DST")
-                # Если не нашли — ищем в .conf файлах (даже если туннель не активен)
-                if [ -z "$DST_TUN" ]; then
-                  DST_TUN=$(find_tunnel_by_subnet_in_configs "$DST")
-                fi
-              fi
-            else
-              # Нет локальных подсетей — ищем в других интерфейсах
-              DST_TUN=$(find_tun_for_ip "$DST")
-              if [ -z "$DST_TUN" ]; then
-                DST_TUN=$(find_tunnel_by_subnet_in_configs "$DST")
-              fi
-            fi
-          fi
-
-          # Если не нашли туннель для DST — пропускаем эту пару
           if [ -z "$DST_TUN" ]; then
             echo "    ⚠️  Пропущено: $DST (туннель не найден)"
             continue
+          fi
+
+          # Определяем iptables/ip6tables по типу
+          if [[ "$SRC" == *:* ]]; then
+              IPT_CMD="ip6tables"
+          else
+              IPT_CMD="iptables"
           fi
 
           # Разрешаем SRC → DST (в НАЧАЛО цепи, поверх DROP!)
