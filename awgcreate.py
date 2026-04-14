@@ -744,11 +744,11 @@ atomic_ref_update() {
   local lock_dir="${ref_file}.d"
   local attempts=0
 
-  # Пытаемся захватить блокировку (10 попыток по 0.1с = 1 сек макс)
+  # Пытаемся захватить блокировку (30 попыток по 0.1с = 3 сек макс)
   while ! mkdir "$lock_dir" 2>/dev/null; do
     attempts=$((attempts + 1))
-    if [ "$attempts" -ge 10 ]; then
-      echo "⚠️ Блокировка $ref_file не получена за 1с — выполняем без неё..." >&2
+    if [ "$attempts" -ge 30 ]; then
+      echo "⚠️ Блокировка $ref_file не получена за 3с — выполняем без неё..." >&2
       break
     fi
     sleep 0.1
@@ -2881,11 +2881,11 @@ atomic_ref_update() {
   local lock_dir="${ref_file}.d"
   local attempts=0
 
-  # Пытаемся захватить блокировку (10 попыток по 0.1с = 1 сек макс)
+  # Пытаемся захватить блокировку (30 попыток по 0.1с = 3 сек макс)
   while ! mkdir "$lock_dir" 2>/dev/null; do
     attempts=$((attempts + 1))
-    if [ "$attempts" -ge 10 ]; then
-      echo "⚠️ Блокировка $ref_file не получена за 1с — выполняем без неё..." >&2
+    if [ "$attempts" -ge 30 ]; then
+      echo "⚠️ Блокировка $ref_file не получена за 3с — выполняем без неё..." >&2
       break
     fi
     sleep 0.1
