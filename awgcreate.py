@@ -2519,18 +2519,17 @@ except Exception as e:
   tc qdisc add dev "$IFB_IN" root handle 1: htb default 2
 
   # Функция для создания новой иерархии tc классов при переполнении minor_id
-  # ВАЖНО: 1: используется ТОЛЬКО для BRIDGE (1:2 до 1:9999)
-  # Клиенты создаются в 2:, 3:, ... до 9999: (по 9999 клиентов на иерархию)
+  # ВАЖНО: Каждая иерархия (2:, 3:, ... 9999:) привязана К КОРНЮ (1:) через свой мост
+  # Структура: 1:2→2:1-9999, 1:3→3:1-9999, 1:4→4:1-9999 ... 1:9999→9999:1-9999
   # ИТОГО: 9998 иерархий × 9999 клиентов = ~100 миллионов клиентов!
   create_tc_hierarchy() {
     major_class=$((major_class + 1))
-    minor_id=1  # ← Начинаем с 1 для 2:, 3:, etc. (экономим 999 классов!)
-    tc class add dev "$IFB_OUT" parent $((major_class - 1)): classid $((major_class - 1)):1 htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc class add dev "$IFB_OUT" parent $((major_class - 1)):1 classid $((major_class - 1)):${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc qdisc add dev "$IFB_OUT" parent $((major_class - 1)):${major_class} handle ${major_class}: htb default $((major_class + 1))
-    tc class add dev "$IFB_IN" parent $((major_class - 1)): classid $((major_class - 1)):1 htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc class add dev "$IFB_IN" parent $((major_class - 1)):1 classid $((major_class - 1)):${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc qdisc add dev "$IFB_IN" parent $((major_class - 1)):${major_class} handle ${major_class}: htb default $((major_class + 1))
+    minor_id=1  # ← Начинаем с 1 для клиентов новой иерархии
+    # Мост от корня (1:) к новой иерархии ($major_class:)
+    tc class add dev "$IFB_OUT" parent 1: classid 1:${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT" 2>/dev/null || true
+    tc qdisc add dev "$IFB_OUT" parent 1:${major_class} handle ${major_class}: htb default $((major_class + 1))
+    tc class add dev "$IFB_IN" parent 1: classid 1:${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT" 2>/dev/null || true
+    tc qdisc add dev "$IFB_IN" parent 1:${major_class} handle ${major_class}: htb default $((major_class + 1))
   }
 
   major_class=1
@@ -2597,8 +2596,8 @@ PY
                   tc filter add dev "$IFB_OUT" protocol $IP_VERSION parent ${major_class}: prio 2 u32 match $PROTO_MATCH dst $ip flowid $classid 2>/dev/null || true
                   tc filter add dev "$IFB_IN" protocol $IP_VERSION parent ${major_class}: prio 2 u32 match $PROTO_MATCH src $ip flowid $classid 2>/dev/null || true
               else
-                  tc filter add dev "$IFB_OUT" protocol $IP_VERSION parent ${major_class}: prio 1 u32 match $PROTO_MATCH dst $ip flowid $classid
-                  tc filter add dev "$IFB_IN" protocol $IP_VERSION parent ${major_class}: prio 1 u32 match $PROTO_MATCH src $ip flowid $classid
+                  tc filter add dev "$IFB_OUT" protocol $IP_VERSION parent ${major_class}: prio 1 u32 match $PROTO_MATCH dst $ip flowid $classid 2>/dev/null || true
+                  tc filter add dev "$IFB_IN" protocol $IP_VERSION parent ${major_class}: prio 1 u32 match $PROTO_MATCH src $ip flowid $classid 2>/dev/null || true
               fi
               tc qdisc add dev "$IFB_OUT" parent $classid fq_codel
               tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
@@ -2608,93 +2607,70 @@ PY
           echo "$SUBNET -> ${LIM}mbit"
       else
           # Несколько подсетей — поддерживаем кратные соотношения
-          # Сначала получаем количество адресов и префиксы каждой подсети
-          SUBNET_INFO=()
-          for subnet in "${SUBNET_ARRAY[@]}"; do
-              INFO=$(python3 -c "
-import ipaddress
-try:
-    net = ipaddress.ip_network('${subnet}', strict=False)
-    print(f'{net.num_addresses}:{net.prefixlen}')
-except:
-    print('0:0')
-")
-              SUBNET_INFO+=("$INFO")
-          done
-
-          # Определяем типы подсетей (IPv4 или IPv6)
-          SUBNET_TYPES=()
-          for subnet in "${SUBNET_ARRAY[@]}"; do
-              if [[ "$subnet" == *:* ]]; then
-                  SUBNET_TYPES+=("ipv6")
-              else
-                  SUBNET_TYPES+=("ipv4")
-              fi
-          done
-
           # Вычисляем соотношение подсетей через Python
-          # Возвращает: ipv4_count, ipv6_count, ipv4_client_mask, ipv6_client_mask, ratio_step
+          # Поддерживает ЛЮБОЕ количество подсетей любого типа (IPv4 и/или IPv6)
+          # Логика: находим подсеть с минимальным кол-вом IP = "1", остальные = N
+          # Возвращает: num_classes:step1:step2:...:mask1:mask2:...
           SHAPING_INFO=$(python3 - <<PY
-import ipaddress, math
+import ipaddress
 
 subnets = '${SUBNETS_PART}'.split(',')
-ipv4_nets = []
-ipv6_nets = []
+nets = []
 
 for s in subnets:
     s = s.strip()
     if not s:
         continue
     net = ipaddress.ip_network(s, strict=False)
-    if isinstance(net, ipaddress.IPv4Network):
-        ipv4_nets.append(net)
-    else:
-        ipv6_nets.append(net)
+    nets.append(net)
 
-# Если есть и IPv4 и IPv6
-if ipv4_nets and ipv6_nets:
-    # Берём первую IPv4 и первую IPv6 для расчёта соотношения
-    ipv4_net = ipv4_nets[0]
-    ipv6_net = ipv6_nets[0]
-    
-    ipv4_total = 2 ** (32 - ipv4_net.prefixlen)
-    ipv6_total = 2 ** (128 - ipv6_net.prefixlen)
-    ratio = ipv6_total / ipv4_total
-    
-    if ratio >= 1:
-        # 1 IPv4 : N IPv6
-        ipv4_client_mask = 32
-        ipv6_per_ipv4 = int(ratio)
-        # Используем bit_length() вместо log2() для правильных масок!
-        ipv6_bits = (ipv6_per_ipv4 - 1).bit_length() if ipv6_per_ipv4 > 0 else 0
-        ipv6_client_mask = 128 - ipv6_bits
-        ipv4_step = 1
-        ipv6_step = int(ratio)
-        # Количество классов = количество IPv4 адресов
-        num_classes = ipv4_total
-    else:
-        # N IPv4 : 1 IPv6
-        ipv6_client_mask = 128
-        ipv4_per_ipv6 = int(1 / ratio)
-        # Используем bit_length() вместо log2() для правильных масок!
-        ipv4_bits = (ipv4_per_ipv6 - 1).bit_length() if ipv4_per_ipv6 > 0 else 0
-        ipv4_client_mask = 32 - ipv4_bits
-        ipv4_step = int(1 / ratio)
-        ipv6_step = 1
-        # Количество классов = количество IPv6 адресов
-        num_classes = ipv6_total
-    
-    print(f'{num_classes}:{ipv4_step}:{ipv6_step}:{ipv4_client_mask}:{ipv6_client_mask}')
+if not nets:
+    print('0:')
 else:
-    # Только один тип подсетей
-    print('0:1:1:32:128')
+    # Считаем количество адресов в каждой подсети
+    counts = [int(2 ** (net.max_prefixlen - net.prefixlen)) for net in nets]
+
+    # Находим минимум → это "1" в соотношении
+    min_count = min(counts)
+
+    # Для каждой подсети: step = её_count / min_count
+    steps = [c // min_count for c in counts]
+
+    # Вычисляем маску для каждой подсети (граница блока для выравнивания)
+    masks = []
+    for i, net in enumerate(nets):
+        if steps[i] == 1:
+            masks.append(net.max_prefixlen)  # полная маска
+        else:
+            # step=N → маска уменьшает блок в N раз
+            # bits = log2(step)
+            bits = (steps[i] - 1).bit_length()
+            masks.append(net.max_prefixlen - bits)
+
+    # num_classes = min_count (количество классов = кол-во IP в минимальной подсети)
+    num_classes = min_count
+
+    # Формат: num_classes:step1:step2:step3:mask1:mask2:mask3
+    steps_str = ':'.join(str(s) for s in steps)
+    masks_str = ':'.join(str(m) for m in masks)
+    print(f'{num_classes}:{steps_str}:{masks_str}')
 PY
 )
+          # Парсим результат
           NUM_CLASSES=$(echo "$SHAPING_INFO" | cut -d':' -f1)
-          IPV4_STEP=$(echo "$SHAPING_INFO" | cut -d':' -f2)
-          IPV6_STEP=$(echo "$SHAPING_INFO" | cut -d':' -f3)
-          IPV4_CLIENT_MASK=$(echo "$SHAPING_INFO" | cut -d':' -f4)
-          IPV6_CLIENT_MASK=$(echo "$SHAPING_INFO" | cut -d':' -f5)
+          n_subnets=${#SUBNET_ARRAY[@]}
+
+          # Извлекаем steps
+          SUBNET_STEPS=()
+          for i in $(seq 1 $n_subnets); do
+              SUBNET_STEPS+=($(echo "$SHAPING_INFO" | cut -d':' -f$((i+1))))
+          done
+
+          # Извлекаем masks
+          SUBNET_MASKS=()
+          for i in $(seq 1 $n_subnets); do
+              SUBNET_MASKS+=($(echo "$SHAPING_INFO" | cut -d':' -f$((n_subnets + 1 + i))))
+          done
 
           # Генерируем IP для каждой подсети
           ALL_IPS_ARRAYS=()
@@ -2729,60 +2705,53 @@ PY
               tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
 
               # Добавляем фильтры для каждой подсети
+              # Для каждой подсети берём БЛОК IP (step штук) в один класс
               for i in "${!SUBNET_ARRAY[@]}"; do
                   subnet="${SUBNET_ARRAY[$i]}"
-                  ip_type="${SUBNET_TYPES[$i]}"
                   ips_str="${ALL_IPS_ARRAYS[$i]}"
 
-                  # Определяем шаг для этого типа подсети
-                  if [ "$ip_type" = "ipv6" ]; then
-                      STEP="$IPV6_STEP"
-                  else
-                      STEP="$IPV4_STEP"
-                  fi
+                  # Шаг для этой подсети
+                  STEP="${SUBNET_STEPS[$i]}"
+                  MASK="${SUBNET_MASKS[$i]}"
 
-                  # Вычисляем индекс с учётом шага
-                  REAL_IDX=$((idx * STEP + 1))
+                  # Берём БЛОК IP: от idx*step до (idx+1)*step - 1
+                  for j in $(seq 0 $((STEP - 1))); do
+                      REAL_IDX=$((idx * STEP + j + 1))
 
-                  # Получаем IP по индексу
-                  target_ip=$(echo "$ips_str" | sed -n "${REAL_IDX}p")
+                      # Получаем IP по индексу
+                      target_ip=$(echo "$ips_str" | sed -n "${REAL_IDX}p")
 
-                  # Выравниваем по границе блока (как в Python скрипте)
-                  if [ -n "$target_ip" ]; then
-                      if [ "$ip_type" = "ipv6" ] && [ "$IPV6_CLIENT_MASK" -lt 128 ]; then
-                          # Выравниваем IPv6 по границе блока
-                          target_ip=$(python3 -c "
+                      # Выравниваем по границе блока (только если маска меньше max_prefixlen)
+                      if [ -n "$target_ip" ]; then
+                          # Определяем max_prefixlen по адресу
+                          if [[ "$target_ip" == *:* ]]; then
+                              MAX_PREFIXLEN=128
+                          else
+                              MAX_PREFIXLEN=32
+                          fi
+                          if [ "$MASK" -lt "$MAX_PREFIXLEN" ] 2>/dev/null; then
+                              target_ip=$(python3 -c "
 import ipaddress
-ip = ipaddress.IPv6Address('$target_ip')
-mask = $IPV6_CLIENT_MASK
-block_size = 2 ** (128 - mask)
+ip = ipaddress.ip_address('$target_ip')
+mask = $MASK
+block_size = 2 ** ($MAX_PREFIXLEN - mask)
 aligned_int = int(ip) & ~(block_size - 1)
-aligned = ipaddress.IPv6Address(aligned_int)
-print(aligned)
+print(ipaddress.ip_address(aligned_int))
 ")
-                      elif [ "$ip_type" = "ipv4" ] && [ "$IPV4_CLIENT_MASK" -lt 32 ]; then
-                          # Выравниваем IPv4 по границе блока
-                          target_ip=$(python3 -c "
-import ipaddress
-ip = ipaddress.IPv4Address('$target_ip')
-mask = $IPV4_CLIENT_MASK
-block_size = 2 ** (32 - mask)
-aligned_int = int(ip) & ~(block_size - 1)
-aligned = ipaddress.IPv4Address(aligned_int)
-print(aligned)
-")
+                          fi
                       fi
-                  fi
 
-                  if [ -n "$target_ip" ]; then
-                      if [ "$ip_type" = "ipv6" ]; then
-                          tc filter add dev "$IFB_OUT" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 dst $target_ip flowid $classid 2>/dev/null || true
-                          tc filter add dev "$IFB_IN" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 src $target_ip flowid $classid 2>/dev/null || true
-                      else
-                          tc filter add dev "$IFB_OUT" protocol ip parent ${major_class}: prio 1 u32 match ip dst $target_ip flowid $classid
-                          tc filter add dev "$IFB_IN" protocol ip parent ${major_class}: prio 1 u32 match ip src $target_ip flowid $classid
+                      if [ -n "$target_ip" ]; then
+                          # Определяем протокол по адресу
+                          if [[ "$target_ip" == *:* ]]; then
+                              tc filter add dev "$IFB_OUT" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 dst $target_ip flowid $classid 2>/dev/null || true
+                              tc filter add dev "$IFB_IN" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 src $target_ip flowid $classid 2>/dev/null || true
+                          else
+                              tc filter add dev "$IFB_OUT" protocol ip parent ${major_class}: prio 1 u32 match ip dst $target_ip flowid $classid 2>/dev/null || true
+                              tc filter add dev "$IFB_IN" protocol ip parent ${major_class}: prio 1 u32 match ip src $target_ip flowid $classid 2>/dev/null || true
+                          fi
                       fi
-                  fi
+                  done
               done
               
               tc qdisc add dev "$IFB_OUT" parent $classid fq_codel
