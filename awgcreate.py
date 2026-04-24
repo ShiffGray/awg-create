@@ -116,7 +116,6 @@ params_script_template = r'''#!/bin/bash
 PORT="<SERVER_PORT>"
 IFACE="<SERVER_IFACE>"
 TUN="<SERVER_TUN>"
-QUANT="4400"
 
 # --- Подсеть ---
 LOCAL_SUBNETS="<SERVER_ADDR>"                                  # Подсеть VPN (пример: 10.1.0.0/23)
@@ -125,6 +124,8 @@ LOCAL_SUBNETS="<SERVER_ADDR>"                                  # Подсеть 
 SUBNETS_LIMITS=(
   "<SERVER_ADDR>:<RATE_LIMIT>"
 )
+BRIDGE="9999:10000mbit:4400"
+
 # --- Список WARP-интерфейсов с маршрутизацией ---
 # Формат: "interface1,interface2=subnet1, subnet2" или "interface1,interface2" (для всего трафика)
 # Примеры:
@@ -146,6 +147,415 @@ PORT_FORWARDING_RULES=(
   #"10.1.0.2:443:TCP:SNAT"
 )
 
+# --- Режим логирования ---
+# 0 = выключен (по умолчанию), 1 = включён
+# UPLOG=1 — включить лог для up скрипта
+# DOWNLOG=1 — включить лог для down скрипта
+# TESTLOG=1 — включить лог для проверочного скрипта
+UPLOG=0
+DOWNLOG=0
+TESTLOG=0
+
+# ==========================================
+# === Python Helpers (вся работа с IP) ===
+# ==========================================
+
+# Проверка: перекрывается ли подсеть с локальными подсетями туннеля
+local_subnet_overlaps() {
+    python3 -c "
+import ipaddress, sys
+try:
+    ip = ipaddress.ip_network('$1', strict=False)
+    t4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
+    t6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
+    if (t4 and ip.overlaps(t4)) or (t6 and ip.overlaps(t6)):
+        sys.exit(0)
+    sys.exit(1)
+except: sys.exit(1)
+" 2>/dev/null
+}
+
+# Проверка: является ли IP адресом сети (network address)
+is_network_address() {
+    python3 -c "
+import ipaddress, sys
+try:
+    ip = ipaddress.ip_address('$1')
+    net = ipaddress.ip_network('$2', strict=False)
+    print(1 if ip == net.network_address else 0)
+except: print(0)
+" 2>/dev/null
+}
+
+check_server_network() {
+    is_network_address "$1" "$2"
+}
+
+# Проверка ip rule по диапазону MARK
+# $1 = MARK_BASE
+check_ip_rules() {
+    local mark_base_val="$1"
+    MARK_BASE="$mark_base_val" python3 << 'PYEOF'
+import subprocess, sys
+import os
+
+mark_base = int(os.environ.get('MARK_BASE', '1000'))
+
+warp_start = mark_base
+warp_end = warp_start + 999
+bc_start = mark_base + 1000
+bc_end = mark_base + 1099
+
+def get_rules(ip_ver):
+    try:
+        cmd = ['ip'] + (['-6'] if ip_ver == 6 else []) + ['rule', 'show']
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        lines = []
+        for line in result.stdout.strip().split('\n'):
+            if not line: continue
+            parts = line.split()
+            for i, p in enumerate(parts):
+                if p == 'fwmark' and i+1 < len(parts):
+                    v = parts[i+1]
+                    m = int(v, 0) if v.startswith('0x') else int(v)
+                    lines.append((line, m))
+        return lines
+    except:
+        return []
+
+def print_matching(rules, start, end, label_v4, label_v6):
+    for ip_ver, label in [(4, label_v4), (6, label_v6)]:
+        if ip_ver in rules:
+            print(f'   {label}:')
+            found = False
+            for line, m in rules[ip_ver]:
+                if start <= m <= end:
+                    print(f'       {line}')
+                    found = True
+            if not found:
+                print('       (нет правил)')
+
+rules = {4: get_rules(4), 6: get_rules(6)}
+print_matching(rules, warp_start, warp_end, 'WARP марки (маркировка + маршрутизация) IPv4', 'WARP марки (маркировка + маршрутизация) IPv6')
+print_matching(rules, bc_start, bc_end, 'Broadcast/Multicast марки IPv4', 'Broadcast/Multicast марки IPv6')
+PYEOF
+}
+
+# Расчёт всех параметров IPv4 подсети
+calc_ipv4_info() {
+    eval $(python3 -c "
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
+    srv = ipaddress.ip_address('$LOCAL_SERVER_IP')
+    print(f'FIRST_IP=\"{net.network_address + 1}\"')
+    print(f'LAST_IP=\"{net.broadcast_address - 1}\"')
+    print(f'BROADCAST_ADDR=\"{net.broadcast_address}\"')
+    print(f'SERVER_ON_NETWORK={int(srv == net.network_address)}')
+except Exception as e:
+    print(f'echo \"❌ Ошибка расчёта IPv4: {e}\"; exit 1', file=sys.stderr)
+    sys.exit(1)
+")
+}
+
+# Проверка статуса IPv6 подсети
+calc_ipv6_status() {
+    eval $(python3 -c "
+import ipaddress
+try:
+    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
+    srv = ipaddress.ip_address('$LOCAL_SERVER_IP_IPV6')
+    print(f'SERVER_ON_NETWORK_IPV6={int(srv == net.network_address)}')
+except:
+    print('SERVER_ON_NETWORK_IPV6=0')
+")
+}
+
+# Валидация маски подсети для лимитов скорости
+validate_subnet_mask() {
+    python3 -c "
+import ipaddress, sys
+try:
+    ip_str = '$1'.strip()
+    net = ipaddress.ip_network(ip_str, strict=False)
+    if isinstance(net, ipaddress.IPv4Network):
+        ok = 8 <= net.prefixlen <= 32
+    else:
+        ok = 104 <= net.prefixlen <= 128
+    sys.exit(0 if ok else 1)
+except Exception as e:
+    print(f'Ошибка проверки подсети: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+}
+
+# Расчёт broadcast адреса
+get_broadcast_addr() {
+    python3 -c "
+import ipaddress
+try:
+    print(ipaddress.ip_network('$1', strict=False).broadcast_address)
+except: pass
+" 2>/dev/null
+}
+
+# Поиск туннеля по подсети в .conf файлах и активных интерфейсах
+find_tunnel_for_subnet() {
+  local target_subnet="$1"
+  local script_dir="$(dirname "$(readlink -f "$0")")"
+
+  for conf_file in "$script_dir"/*.conf; do
+    [ -f "$conf_file" ] || continue
+    local conf_name="$(basename "$conf_file" .conf)"
+    [[ "$conf_name" == *warp* ]] && continue
+    local conf_subnet_raw=$(grep -E "^Address = " "$conf_file" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d ' ')
+    [ -z "$conf_subnet_raw" ] && continue
+    IFS=',' read -ra SUBNETS <<< "$conf_subnet_raw"
+    for subnet in "${SUBNETS[@]}"; do
+      subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [ -z "$subnet" ] && continue
+      local overlaps
+      overlaps=$(python3 -c "import ipaddress, sys; ip1 = ipaddress.ip_network('$target_subnet', strict=False); ip2 = ipaddress.ip_network('$subnet', strict=False); sys.exit(0 if ip1.overlaps(ip2) else 1)" 2>/dev/null)
+      if [ $? -eq 0 ]; then
+        echo "$conf_name"
+        return 0
+      fi
+    done
+  done
+
+  for iface in $(ip -br link show 2>/dev/null | awk '{print $1}'); do
+    [ "$iface" = "${TUN:-}" ] && continue
+    for addr in $(ip -o addr show "$iface" 2>/dev/null | awk '{print $4}'); do
+      local overlaps
+      overlaps=$(python3 -c "import ipaddress, sys; ip1 = ipaddress.ip_network('$target_subnet', strict=False); ip2 = ipaddress.ip_network('$addr', strict=False); sys.exit(0 if ip1.overlaps(ip2) else 1)" 2>/dev/null)
+      if [ $? -eq 0 ]; then
+        echo "$iface"
+        return 0
+      fi
+    done
+  done
+
+  return 1
+}
+
+# Поиск туннеля из INTERFACE_MAP по IP/подсети
+find_tun_from_map() {
+  local ip_or_subnet="$1"
+
+  for mapping in "${INTERFACE_MAP[@]}"; do
+    tun_name="${mapping%%=*}"
+    tun_subnet="${mapping#*=}"
+
+    local overlaps
+    overlaps=$(python3 -c "import ipaddress, sys; ip1 = ipaddress.ip_network('$ip_or_subnet', strict=False); ip2 = ipaddress.ip_network('$tun_subnet', strict=False); sys.exit(0 if ip1.overlaps(ip2) else 1)" 2>/dev/null)
+    if [ $? -eq 0 ]; then
+      echo "$tun_name"
+      return 0
+    fi
+  done
+
+  echo ""
+  return 1
+}
+
+# Атомарное обновление reference count с mkdir-based блокировкой
+atomic_ref_update() {
+  local ref_file="$1"
+  local operation="$2"
+  local value="${3:-}"
+  local lock_dir="${ref_file}.d"
+  local attempts=0
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 30 ]; then
+      echo "⚠️ Блокировка $ref_file не получена за 3с — выполняем без неё..." >&2
+      break
+    fi
+    sleep 0.1
+  done
+
+  local result=""
+  case "$operation" in
+    "inc")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result=$((cur + 1))
+      echo "$result" > "$ref_file"
+      ;;
+    "dec")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result=$((cur - 1))
+      echo "$result" > "$ref_file"
+      ;;
+    "get_inc")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result="$cur:$((cur + 1))"
+      echo "$((cur + 1))" > "$ref_file"
+      ;;
+    "get_dec")
+      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+      result="$cur:$((cur - 1))"
+      echo "$((cur - 1))" > "$ref_file"
+      ;;
+    "set")
+      echo "$value" > "$ref_file"
+      result="$value"
+      ;;
+    "get")
+      result=$(cat "$ref_file" 2>/dev/null || echo "0")
+      ;;
+  esac
+
+  rm -rf "$lock_dir" 2>/dev/null || true
+  echo "$result"
+}
+
+# Парсинг WARP интерфейсов из записи WARP_LIST
+parse_warp_interfaces() {
+  local entry="$1"
+  if [[ "$entry" == *"="* ]]; then
+    echo "${entry%%=*}"
+  else
+    echo "$entry"
+  fi
+}
+
+# Парсинг флагов (SNAT + интерфейс)
+parse_flags() {
+  local s="$1"
+  PARSED_SNAT=""
+  PARSED_IFACE=""
+  IFS=',' read -ra flag_parts <<< "$s"
+  for part in "${flag_parts[@]}"; do
+    part="${part// /}"
+    local part_upper
+    part_upper=$(printf '%s' "$part" | tr '[:lower:]' '[:upper:]')
+    if [ "$part_upper" = "SNAT" ]; then
+      PARSED_SNAT="SNAT"
+    elif [ -n "$part" ]; then
+      PARSED_IFACE="$part"
+    fi
+  done
+}
+
+# Проверка протокола (поддержка пробелов: "TCP, UDP")
+is_proto_field() {
+  local f="$1"
+  local f_clean="${f// /}"
+  local f_upper
+  f_upper=$(printf '%s' "$f_clean" | tr '[:lower:]' '[:upper:]')
+  [ "$f_upper" = "TCP" ] || [ "$f_upper" = "UDP" ] || [ "$f_upper" = "TCP,UDP" ] || [ "$f_upper" = "UDP,TCP" ]
+}
+
+# Проверка флагов (SNAT, интерфейс)
+is_flags_field() {
+  local f="$1"
+  local f_upper
+  f_upper=$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')
+  [ "$f_upper" = "SNAT" ] && return 0
+  [[ "$f" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] && return 0
+  [[ "$f_upper" == *"SNAT"* ]] && [[ "$f" =~ [a-zA-Z] ]] && return 0
+  return 1
+}
+
+# Проверка: является ли IP адресом сети (network address)
+check_server_network() {
+    python3 -c "
+import ipaddress, sys
+try:
+    ip = ipaddress.ip_address('$1')
+    net = ipaddress.ip_network('$2', strict=False)
+    print(1 if ip == net.network_address else 0)
+except: print(0)
+" 2>/dev/null
+}
+
+# Получение информации о подсети (кол-во адресов + префикс)
+get_subnet_info() {
+    SUBNET_ARG="$1" python3 << PYEOF
+import ipaddress, os
+try:
+    net = ipaddress.ip_network(os.environ.get('SUBNET_ARG', ''), strict=False)
+    print(f'{net.num_addresses}:{net.prefixlen}')
+except:
+    print('0:0')
+PYEOF
+ 2>/dev/null
+}
+
+# Перечисление всех IP в подсети
+list_subnet_ips() {
+    SUBNET_ARG="$1" python3 << PYEOF
+import ipaddress, os, sys
+try:
+    net = ipaddress.ip_network(os.environ.get('SUBNET_ARG', ''), strict=False)
+    for ip in net:
+        print(ip)
+except:
+    sys.exit(1)
+PYEOF
+}
+
+# Вычисление соотношений скоростей
+calc_subnet_ratios() {
+    SUBNETS_ARG="$1" python3 << PYEOF
+import ipaddress, os
+subnets = os.environ.get('SUBNETS_ARG', '').split(',')
+nets = []
+counts = []
+for s in subnets:
+    s = s.strip()
+    if not s: continue
+    net = ipaddress.ip_network(s, strict=False)
+    nets.append((net.num_addresses, net.prefixlen, 'ipv6' if ':' in s else 'ipv4'))
+    counts.append(net.num_addresses)
+min_count = min(counts)
+ratios = [c // min_count for c in counts]
+result = [str(min_count)]
+for (cnt, pre, ip_type), r in zip(nets, ratios):
+    result.append(f"{cnt}:{pre}:{ip_type}:{r}:{cnt}")
+print('|'.join(result))
+PYEOF
+}
+
+# Вычисление базового IP блока
+get_block_ip() {
+    SUBNET_ARG="$1" RATIO_ARG="$2" IDX_ARG="$3" python3 << PYEOF
+import ipaddress, os
+subnet = os.environ.get('SUBNET_ARG', '')
+net = ipaddress.ip_network(subnet, strict=False)
+start_int = int(net.network_address)
+ratio = int(os.environ.get('RATIO_ARG', '1'))
+idx = int(os.environ.get('IDX_ARG', '0'))
+block_size = ratio
+block_start = start_int + (idx * block_size)
+block_end = block_start + block_size - 1
+if ':' in subnet:
+    start = ipaddress.IPv6Address(block_start)
+    end = ipaddress.IPv6Address(block_end)
+    prefix = net.prefixlen
+    mask = 128 if ratio == 1 else min(128, prefix + (ratio - 1).bit_length())
+    print(f'{start},{end},{mask}')
+else:
+    start = ipaddress.IPv4Address(block_start)
+    end = ipaddress.IPv4Address(block_end)
+    prefix = net.prefixlen
+    mask = 32 if ratio == 1 else min(32, prefix + (ratio - 1).bit_length())
+    print(f'{start},{end},{mask}')
+PYEOF
+}
+
+# Парсинг подсети из .conf файла
+parse_conf_subnet() {
+    python3 -c "import ipaddress; print(ipaddress.ip_network('$1', strict=False))" 2>/dev/null
+}
+
+# ==========================================
+# === Конец Python Helpers ===
+# ==========================================
+# === Конец Python Helpers ===
+# ==========================================
+
 # ================================================================
 # === ПРОВЕРОЧНЫЙ СКРИПТ (запускается при прямом вызове bash) ===
 # ================================================================
@@ -157,9 +567,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   mkdir -p "$LOG_DIR" 2>/dev/null || true
   LOG_FILE="$LOG_DIR/${TUN}.log"
   
-  # Перенаправляем весь вывод скрипта в лог И в консоль (через tee)
-  exec 1> >(tee "$LOG_FILE")
-  exec 2>&1
+  # Логирование включается если TESTLOG=1
+  if [ "$TESTLOG" = "1" ]; then
+    exec 1> >(tee "$LOG_FILE")
+    exec 2>&1
+  fi
 
   echo "═══════════════════════════════════════════════════════════"
   echo "🔍 Проверка правил для интерфейса: $TUN ($(date '+%Y-%m-%d %H:%M:%S'))"
@@ -187,6 +599,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   RANDOM_WARP_CHAIN="RANDOM_WARP_${TUN_SAFE}"
   INPUT_CHAIN="INPUT_${TUN_SAFE}"
   HAIRPIN_CHAIN="HAIRPIN_${TUN_SAFE}"
+
+  # --- Парсинг LOCAL_SUBNETS на IPv4 и IPv6 (точно как в up.sh) ---
+  LOCAL_SUBNETS_IPV4=""
+  LOCAL_SUBNETS_IPV6=""
+
+  IFS=',' read -ra RAW_SUBNETS <<< "$LOCAL_SUBNETS"
+  for subnet in "${RAW_SUBNETS[@]}"; do
+    subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -n "$subnet" ]; then
+      if [[ "$subnet" == *:* ]]; then
+        LOCAL_SUBNETS_IPV6="$subnet"
+      else
+        LOCAL_SUBNETS_IPV4="$subnet"
+      fi
+    fi
+  done
+
+  # --- Вычисление BROADCAST_ADDR (только из IPv4, как в up.sh) ---
+  BROADCAST_ADDR=""
+  if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+    BROADCAST_ADDR=$(get_broadcast_addr "$LOCAL_SUBNETS_IPV4")
+  fi
 
   # --- 1. INPUT цепочка (IPv4 + IPv6) ---
   echo "📥 INPUT цепочка ($INPUT_CHAIN):"
@@ -237,17 +671,35 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   # --- 2.1. Общие правила PREROUTING и FORWARD ---
   echo "🔗 Общие правила (ссылки на цепочки):"
   echo "   PREROUTING → $RANDOM_WARP_CHAIN (WARP маркировка):"
-  iptables -t mangle -L PREROUTING -n -v 2>/dev/null | grep -E "$RANDOM_WARP_CHAIN|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t mangle -L PREROUTING -n -v 2>/dev/null | grep -E "$RANDOM_WARP_CHAIN" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t mangle -L PREROUTING -n -v 2>/dev/null | grep -E "$RANDOM_WARP_CHAIN" || echo "     (нет правил)"
   echo "   PREROUTING → $PF_CHAIN_NAT (проброс портов NAT):"
-  iptables -t nat -L PREROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_NAT|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t nat -L PREROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_NAT" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t nat -L PREROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_NAT" || echo "     (нет правил)"
   echo "   FORWARD → $PF_CHAIN_FILTER (проброс портов FILTER):"
-  iptables -t filter -L FORWARD -n -v 2>/dev/null | grep -E "$PF_CHAIN_FILTER|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t filter -L FORWARD -n -v 2>/dev/null | grep -E "$PF_CHAIN_FILTER" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t filter -L FORWARD -n -v 2>/dev/null | grep -E "$PF_CHAIN_FILTER" || echo "     (нет правил)"
   echo "   POSTROUTING → $PF_CHAIN_SNAT (проброс портов SNAT):"
-  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_SNAT|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_SNAT" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$PF_CHAIN_SNAT" || echo "     (нет правил)"
   echo "   POSTROUTING → $HAIRPIN_CHAIN (Hairpin NAT):"
-  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$HAIRPIN_CHAIN|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$HAIRPIN_CHAIN" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "$HAIRPIN_CHAIN" || echo "     (нет правил)"
   echo "   INPUT → $INPUT_CHAIN (вход):"
-  iptables -t filter -L INPUT -n -v 2>/dev/null | grep -E "$INPUT_CHAIN|Цепочка" || echo "   (нет правил)"
+  echo "   IPv4:"
+  iptables -t filter -L INPUT -n -v 2>/dev/null | grep -E "$INPUT_CHAIN" || echo "     (нет правил)"
+  echo "   IPv6:"
+  ip6tables -t filter -L INPUT -n -v 2>/dev/null | grep -E "$INPUT_CHAIN" || echo "     (нет правил)"
   echo ""
 
   # --- 3. Таблицы маршрутизации и ip rule ---
@@ -258,10 +710,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   fi
   echo ""
   echo "   ip rule (fwmark → table):"
-  echo "   IPv4:"
-  ip rule show 2>/dev/null | grep -E "fwmark $MARK_BASE" || echo "     (нет правил с fwmark $MARK_BASE)"
-  echo "   IPv6:"
-  ip -6 rule show 2>/dev/null | grep -E "fwmark $MARK_BASE" || echo "     (нет правил с fwmark $MARK_BASE)"
+  # MARK_BASE используется для WARP маркировки (CONNMARK) и ip rule
+  # Проверяем все диапазоны через helper функцию
+  check_ip_rules "$MARK_BASE"
   echo ""
   echo "   Маршруты по таблицам WARP:"
   for warp_entry in "${WARP_LIST[@]}"; do
@@ -286,6 +737,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "🚦 Лимиты скорости (tc + IFB):"
   IFB_IN="ifb_${TUN_SAFE}_in"
   IFB_OUT="ifb_${TUN_SAFE}_out"
+  IFB_MIX="ifb_${TUN_SAFE}_mix"
   echo "   IFB устройства:"
   if ip link show "$IFB_IN" &>/dev/null; then
     echo "   ✅ $IFB_IN активен"
@@ -299,12 +751,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   else
     echo "   ❌ $IFB_OUT не найден"
   fi
+  if ip link show "$IFB_MIX" &>/dev/null; then
+    echo "   ✅ $IFB_MIX активен"
+    ip -br link show "$IFB_MIX" 2>/dev/null
+  else
+    echo "   ❌ $IFB_MIX не найден"
+  fi
   echo ""
   
   # Проверка tc фильтров на TUN (перенаправление на IFB)
   echo "   🔍 Фильтры перенаправления (на $TUN):"
   echo "   IPv4 фильтры:"
-  ipv4_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -c "mirred" || echo "0")
+  ipv4_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -c "mirred")
+  ipv4_filter_count=${ipv4_filter_count:-0}
   if [ "$ipv4_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ipv4_filter_count IPv4 фильтров"
     tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
@@ -312,7 +771,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ❌ IPv4 фильтры не найдены"
   fi
   echo "   IPv6 фильтры:"
-  ipv6_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -c "mirred" || echo "0")
+  ipv6_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -c "mirred")
+  ipv6_filter_count=${ipv6_filter_count:-0}
   if [ "$ipv6_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ipv6_filter_count IPv6 фильтров"
     tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
@@ -320,12 +780,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ❌ IPv6 фильтры не найдены"
   fi
   echo ""
-  
+
   # Проверка tc классов на IFB
   echo "   📊 Классы HTB ($IFB_OUT):"
-  total_classes=$(tc class show dev "$IFB_OUT" 2>/dev/null | grep -c "rate" || echo "0")
-  active_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -E "Sent [1-9]" | wc -l)
+  total_classes=$(tc class show dev "$IFB_OUT" 2>/dev/null | grep -c "rate")
+  total_classes=${total_classes:-0}
+  active_classes=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep -cE "Sent [1-9]")
+  active_classes=${active_classes:-0}
   total_overlimits=$(tc -s class show dev "$IFB_OUT" 2>/dev/null | grep "overlimits" | grep -oE "[0-9]+" | awk '{sum+=$1} END {print sum+0}')
+  total_overlimits=${total_overlimits:-0}
 
   if [ "$total_classes" -gt 0 ]; then
     echo "   ✅ Создано HTB классов: $total_classes"
@@ -344,7 +807,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   
   # Проверка ingress фильтров (для входящего трафика)
   echo "   🔍 Ingress фильтры (на $TUN):"
-  ingress_filter_count=$(tc -s filter show dev "$TUN" parent ffff: 2>/dev/null | grep -c "mirred" || echo "0")
+  ingress_filter_count=$(tc -s filter show dev "$TUN" parent ffff: 2>/dev/null | grep -c "mirred")
+  ingress_filter_count=${ingress_filter_count:-0}
   if [ "$ingress_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ingress_filter_count ingress фильтров"
   else
@@ -398,10 +862,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 
   # --- 8. MARK диапазоны ---
   echo "📈 MARK диапазоны:"
-  echo "   MARK_BASE: $MARK_BASE (tc/htb)"
-  echo "   Диапазон tc: $MARK_BASE .. $((MARK_BASE + 899))"
-  echo "   WARP марки: $((MARK_BASE)) .. $((MARK_BASE + 99))"
-  echo "   Broadcast/Multicast: $((MARK_BASE + 1000)) .. $((MARK_BASE + 1099))"
+  echo "   MARK_BASE: $MARK_BASE (база для всех марок туннеля)"
+  echo "   WARP марки (CONNMARK + ip rule): $MARK_BASE .. $((MARK_BASE + 999))"
+  echo "   Broadcast/Multicast марки: $((MARK_BASE + 1000)) .. $((MARK_BASE + 1099))"
+  echo "   Примечание: tc/htb использует classid (major:minor), НЕ fwmark"
   echo ""
 
   # --- 9. Состояние интерфейса TUN ---
@@ -414,15 +878,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   fi
   echo ""
 
-  # --- 10. WARP reference count ---
-  echo "🔢 WARP Reference Count:"
+  # --- 10. WARP reference count + active status ---
+  echo "🔢 WARP Reference Count + Active Status:"
   WARP_DIR="$(dirname "$(readlink -f "$0")")/.data/warp"
   if [ -d "$WARP_DIR" ]; then
+    # Показываем все .ref файлы с ref count и active статусом
     for ref_file in "$WARP_DIR"/*.ref; do
       if [ -f "$ref_file" ]; then
         warp_name=$(basename "$ref_file" .ref)
         ref_count=$(cat "$ref_file" 2>/dev/null)
-        echo "   • $warp_name: ref=$ref_count"
+        active_file="$WARP_DIR/${warp_name}.active"
+        if [ -f "$active_file" ]; then
+          active_status="✅ active"
+        else
+          active_status="❌ не active"
+        fi
+        # Проверяем реальный статус интерфейса
+        if ip link show "$warp_name" &>/dev/null; then
+          iface_status="✅ интерфейс поднят"
+        else
+          iface_status="❌ интерфейс не найден"
+        fi
+        echo "   • $warp_name: ref=$ref_count | $active_status | $iface_status"
       fi
     done
   else
@@ -439,13 +916,20 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "   FORWARD для WARP интерфейсов:"
   for entry in "${WARP_LIST[@]}"; do
     if [ "$entry" != "none" ] && [ -n "$entry" ]; then
-      warp_iface=$(echo "$entry" | cut -d'=' -f1 | sed 's/[[:space:]]//g')
-      if [[ "$warp_iface" != *","* ]]; then
+      # Разбиваем группу интерфейсов (точно как parse_warp_interfaces в up.sh)
+      interfaces_part="$entry"
+      if [[ "$entry" == *"="* ]]; then
+        interfaces_part="${entry%%=*}"
+      fi
+      IFS=',' read -ra RAW_IFACES <<< "$interfaces_part"
+      for warp_iface in "${RAW_IFACES[@]}"; do
+        warp_iface="$(echo "$warp_iface" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "$warp_iface" ] && continue
         echo "   IPv4: $TUN → $warp_iface:"
         iptables -L FORWARD -n -v 2>/dev/null | grep -E "$TUN.*$warp_iface" || echo "     (нет правил)"
         echo "   IPv6: $TUN → $warp_iface:"
         ip6tables -L FORWARD -n -v 2>/dev/null | grep -E "$TUN.*$warp_iface" || echo "     (нет правил)"
-      fi
+      done
     fi
   done
   echo ""
@@ -466,9 +950,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 
   echo "   Broadcast/Multicast mark правила:"
   echo "   IPv4 (mangle):"
-  iptables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*$BROADCAST_ADDR|MARK.*255.255.255.255" | head -5 || echo "   (нет правил)"
+  if [ -n "$BROADCAST_ADDR" ]; then
+    iptables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*$BROADCAST_ADDR|MARK.*255.255.255.255" | head -5 || echo "     (нет правил)"
+  else
+    echo "     (broadcast не вычислен — нет IPv4 подсети)"
+  fi
   echo "   IPv6 (mangle):"
-  ip6tables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*ff02::1" | head -5 || echo "   (нет правил)"
+  ip6tables -t mangle -L FORWARD -n -v 2>/dev/null | grep -E "MARK.*ff02::1" | head -5 || echo "     (нет правил)"
   echo ""
 
   echo "   NAT POSTROUTING (MASQUERADE):"
@@ -485,6 +973,23 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "📄 Лог сохранён: $LOG_FILE"
 fi
 '''
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
 
 # Шаблоны up/down с поддержкой WARP, пробросов портов и лимитов скорости
 up_script_template_warp = r'''#!/bin/bash
@@ -508,12 +1013,14 @@ fi
 # --- Настройка логирования ---
 LOG_DIR="$SCRIPT_DIR/.data/log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
-LOG_FILE="$LOG_DIR/${TUN}up.log"
-# Открываем файл-дескриптор для логов (FD 3)
-exec 3>"$LOG_FILE"
-# Направляем set -x ТОЛЬКО в лог (через FD 3)
-BASH_XTRACEFD=3
-set -x
+
+# Включаем логирование только если UPLOG=1
+if [ "$UPLOG" = "1" ]; then
+  LOG_FILE="$LOG_DIR/${TUN}up.log"
+  exec 3>"$LOG_FILE"
+  BASH_XTRACEFD=3
+  set -x
+fi
 
 # "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
 TUN_SAFE="$(echo "$TUN" | sed 's/[^a-zA-Z0-9]/_/g')"
@@ -524,24 +1031,28 @@ PF_CHAIN_SNAT="PORT_FORWARD_SNAT_${TUN_SAFE}"
 RANDOM_WARP_CHAIN="RANDOM_WARP_${TUN_SAFE}"
 IFB_IN="ifb_${TUN_SAFE}_in"
 IFB_OUT="ifb_${TUN_SAFE}_out"
+IFB_MIX="ifb_${TUN_SAFE}_mix"
 INPUT_CHAIN="INPUT_${TUN_SAFE}"
 HAIRPIN_CHAIN="HAIRPIN_${TUN_SAFE}"
 
 echo "————————————————————————————————"
 
+# Python helper функции загружаются через source "$PARAMS_FILE" выше
+# Все функции доступны: ip_overlaps, calc_ipv4_info, get_broadcast_addr, и т.д.
+
 # --- Включаем IP forwarding если выключен ---
-if [ $(sysctl -n net.ipv4.ip_forward) -eq 1 ]; then
+if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ]; then
     echo "✅ IPv4 forwarding включён"
 else
     echo "❌ IPv4 forwarding ВЫКЛЮЧЕН! Включаю..."
-    sysctl -w net.ipv4.ip_forward=1
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 fi
 
-if [ $(sysctl -n net.ipv6.conf.all.forwarding) -eq 1 ]; then
+if [ "$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null)" = "1" ]; then
     echo "✅ IPv6 forwarding включён"
 else
     echo "❌ IPv6 forwarding ВЫКЛЮЧЕН! Включаю..."
-    sysctl -w net.ipv6.conf.all.forwarding=1
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
 fi
 
 # --- Парсинг LOCAL_SUBNETS (IPv4 + IPv6) ---
@@ -570,59 +1081,14 @@ LOCAL_SERVER_IP=""
 FIRST_IP=""
 LAST_IP=""
 BROADCAST_ADDR=""
-SERVER_OCCUPIES_FIRST=0
 
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   LOCAL_SERVER_IP="$(echo "$LOCAL_SUBNETS_IPV4" | cut -d'/' -f1)"
+  calc_ipv4_info
 
-  # Вычисляем первый, последний и broadcast через Python
-  FIRST_IP=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
-print(str(net.network_address + 1))
-" 2>/dev/null) || {
-    echo "❌ Ошибка: не удалось вычислить FIRST_IP для IPv4"
-    exit 1
-  }
-
-  LAST_IP=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
-print(str(net.broadcast_address - 1))
-" 2>/dev/null) || {
-    echo "❌ Ошибка: не удалось вычислить LAST_IP для IPv4"
-    exit 1
-  }
-
-  BROADCAST_ADDR=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
-print(str(net.broadcast_address))
-" 2>/dev/null) || {
-    echo "❌ Ошибка: не удалось вычислить BROADCAST_ADDR для IPv4"
-    exit 1
-  }
-
-  # Проверяем, занимает ли сервер NETWORK адрес (сравниваем как IP адреса!)
-  # Используем strict=True для точного сравнения
-  if python3 -c "
-import ipaddress
-import sys
-try:
-    server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP')
-    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
-    # Сравниваем как целые числа для точности
-    if int(server_ip) == int(net.network_address):
-        sys.exit(0)
-    sys.exit(1)
-except Exception as e:
-    # При ошибке считаем что сервер НЕ на network адресе
-    sys.exit(1)
-"; then
-    SERVER_ON_NETWORK=1
+  if [ "$SERVER_ON_NETWORK" -eq 1 ]; then
     echo "📍 IPv4: Сервер на network адресе ($LOCAL_SERVER_IP) — broadcast НЕ работает"
   else
-    SERVER_ON_NETWORK=0
     echo "📍 IPv4: Сервер НЕ на network адресе ($LOCAL_SERVER_IP) — broadcast работает"
   fi
 fi
@@ -631,28 +1097,14 @@ fi
 LOCAL_SERVER_IP_IPV6=""
 FIRST_IP_IPV6=""
 LAST_IP_IPV6=""
-SERVER_OCCUPIES_FIRST_IPV6=0
 
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   LOCAL_SERVER_IP_IPV6="$(echo "$LOCAL_SUBNETS_IPV6" | cut -d'/' -f1)"
+  calc_ipv6_status
 
-  # Проверяем, занимает ли сервер адрес сети (для multicast)
-  if python3 -c "
-import ipaddress
-import sys
-try:
-    server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP_IPV6')
-    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
-    if int(server_ip) == int(net.network_address):
-        sys.exit(0)
-    sys.exit(1)
-except:
-    sys.exit(1)
-"; then
-    SERVER_ON_NETWORK_IPV6=1
+  if [ "$SERVER_ON_NETWORK_IPV6" -eq 1 ]; then
     echo "📍 IPv6: Сервер на network адресе ($LOCAL_SERVER_IP_IPV6) — multicast НЕ работает"
   else
-    SERVER_ON_NETWORK_IPV6=0
     echo "📍 IPv6: Сервер НЕ на network адресе ($LOCAL_SERVER_IP_IPV6) — multicast работает"
   fi
 fi
@@ -690,23 +1142,10 @@ find_table_id() {
   echo "0"
 }
 
-# --- Helper функция для парсинга WARP_LIST ---
-# Использование: interfaces="$(parse_warp_interfaces "$entry")"
-parse_warp_interfaces() {
-  local entry="$1"
-  # Если есть "=" — возвращаем часть до "=", иначе всю запись
-  if [[ "$entry" == *"="* ]]; then
-    echo "${entry%%=*}"
-  else
-    echo "$entry"
-  fi
-}
-
 # --- Запуск WARP-интерфейсов (дополнительные WireGuard-интерфейсы для мульти-WARP) ---
 # Пропускаем, если WARP_LIST пустой или содержит только "none"
 # Используем счётчик ссылок для поддержки общих WARP между туннелями
 # Парсим формат: "warp0,warp1=subnet1, subnet2" или "warp0,warp1"
-WARP_ACTIVE=0
 
 # Создаём ОБЩУЮ папку для всех WARP файлов (ОБЩАЯ ДЛЯ ВСЕХ ИНТЕРФЕЙСОВ!)
 # Файлы хранятся рядом с up.sh/down.sh скриптом в .data/warp/
@@ -734,64 +1173,6 @@ for entry in "${WARP_LIST[@]}"; do
     fi
   done
 done
-
-# Функция: атомарное обновление .ref файла через mkdir (гарантированно атомарен в POSIX)
-# Если не удалось получить блокировку за 1 сек — всё равно выполняет операцию
-atomic_ref_update() {
-  local ref_file="$1"
-  local operation="$2"  # "inc", "dec", "set", "get", "get_inc", "get_dec"
-  local value="${3:-}"  # для "set"
-  local lock_dir="${ref_file}.d"
-  local attempts=0
-
-  # Пытаемся захватить блокировку (30 попыток по 0.1с = 3 сек макс)
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    attempts=$((attempts + 1))
-    if [ "$attempts" -ge 30 ]; then
-      echo "⚠️ Блокировка $ref_file не получена за 3с — выполняем без неё..." >&2
-      break
-    fi
-    sleep 0.1
-  done
-
-  # Выполняем операцию (всегда выполняется, даже если не получили блокировку)
-  local result=""
-  case "$operation" in
-    "inc")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result=$((cur + 1))
-      echo "$result" > "$ref_file"
-      ;;
-    "dec")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result=$((cur - 1))
-      echo "$result" > "$ref_file"
-      ;;
-    "get_inc")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result="$cur:$((cur + 1))"
-      echo "$((cur + 1))" > "$ref_file"
-      ;;
-    "get_dec")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result="$cur:$((cur - 1))"
-      echo "$((cur - 1))" > "$ref_file"
-      ;;
-    "set")
-      echo "$value" > "$ref_file"
-      result="$value"
-      ;;
-    "get")
-      result=$(cat "$ref_file" 2>/dev/null || echo "0")
-      ;;
-  esac
-
-  # Освобождаем блокировку
-  rmdir "$lock_dir" 2>/dev/null || true
-
-  # Возвращаем результат
-  echo "$result"
-}
 
 # Запускаем каждый уникальный WARP интерфейс
 # Reference counting + ПРЯМАЯ ПРОВЕРКА реального состояния интерфейса
@@ -1148,25 +1529,6 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
     done
   fi
 
-  # --- Обработка интерфейсов БЕЗ подсетей (для всего остального трафика) ---
-  DEFAULT_WARP_COUNT=${#DEFAULT_WARP_GROUP[@]}
-  if [ "$DEFAULT_WARP_COUNT" -gt 0 ]; then
-    for i in $(seq 0 $((DEFAULT_WARP_COUNT-1))); do
-      MARK=$((MARK_BASE + MARK_OFFSET + i))
-      warp_iface="${DEFAULT_WARP_GROUP[$i]}"
-      TABLE_ID="${WARP_TABLE_IDS[$warp_iface]}"
-      if [ -n "$TABLE_ID" ]; then
-        # Сначала удаляем старые правила если есть (чтобы избежать дубликатов)
-        ip rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-        ip -6 rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-        # Создаём IPv4 правило
-        ip rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-        # Создаём IPv6 правило
-        ip -6 rule add fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
-      fi
-    done
-  fi
-
   # --- Настройка FORWARD и NAT для трафика через WARP ---
   # IPv4 правила (свои для каждого туннеля!)
   for warp in "${!ALL_WARP_INTERFACES[@]}"; do
@@ -1261,46 +1623,6 @@ ip6tables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || ip6tables -t 
 iptables -A FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 ip6tables -A FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 
-# --- Функция: найти туннель для IP/подсети ---
-# Возвращает имя туннеля (например, "awg0") или пустую строку если не найден
-find_tun_for_ip() {
-  local ip_or_subnet="$1"
-
-  # Перебираем ВСЕ запущенные интерфейсы (не только awg*)
-  for test_tun in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1); do
-
-    # Получаем все адреса этого интерфейса
-    local addrs=$(ip -o addr show "$test_tun" 2>/dev/null | awk '{print $4}')
-
-    # Проверяем каждый адрес
-    for addr in $addrs; do
-      if python3 -c "
-import ipaddress
-try:
-    ip = ipaddress.ip_network('$ip_or_subnet', strict=False)
-    tun_net = ipaddress.ip_network('$addr', strict=False)
-    # Проверяем перекрытие: ip в пределах tun_net или наоборот
-    ip_first = int(ip.network_address)
-    ip_last = int(ip.broadcast_address)
-    tun_first = int(tun_net.network_address)
-    tun_last = int(tun_net.broadcast_address)
-    # Перекрываются если начало одного <= концу другого и наоборот
-    if ip_first <= tun_last and tun_first <= ip_last:
-        exit(0)
-    exit(1)
-except:
-    exit(1)
-" 2>/dev/null; then
-        echo "$test_tun"
-        return 0
-      fi
-    done
-  done
-
-  # Не нашли туннель для этого IP
-  echo ""
-  return 1
-}
 
 if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
   echo "🏠 Локальная сеть: РАЗРЕШЕНА для ${#LAN_ALLOW[@]} групп сегментации"
@@ -1347,6 +1669,7 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
       done
 
       # Считаем уникальных участников каждого типа
+      unset IPV4_UNIQUE IPV6_UNIQUE 2>/dev/null || true
       declare -A IPV4_UNIQUE
       declare -A IPV6_UNIQUE
       for part in "${IPV4_PARTS[@]}"; do
@@ -1356,201 +1679,83 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
         IPV6_UNIQUE[$part]=1
       done
 
-      # Обрабатываем IPv4 группу отдельно
-      if [ ${#IPV4_PARTS[@]} -gt 0 ]; then
-        # Создаём unicast правила для ВСЕХ пар участников (включая один туннель!)
-        echo "   Создание unicast правил для IPv4 пар..."
-        for ((i=0; i<${#IPV4_PARTS[@]}; i++)); do
-          for ((j=i+1; j<${#IPV4_PARTS[@]}; j++)); do
-            SRC="${IPV4_PARTS[$i]}"
-            DST="${IPV4_PARTS[$j]}"
-            
-            # Убираем маску /32 для правил
-            SRC_CLEAN="${SRC%/*}"
-            DST_CLEAN="${DST%/*}"
-            
-            echo "    $SRC_CLEAN ↔ $DST_CLEAN"
-            iptables -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
-            iptables -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
-          done
-        done
-        
-        # Intra-subnet разрешён если:
-        # 1. Участник только ОДИН (нет с кем общаться на inter-subnet)
-        # 2. ИЛИ участник встречается >1 раза (явно указан дубль)
-        if [ ${#IPV4_PARTS[@]} -eq 1 ]; then
-          # Только один IPv4 участник — разрешаем intra-subnet
-          SUBNET="${IPV4_PARTS[0]}"
-          if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-            SUBNET_TUN="$TUN"
+      # Универсальная функция обработки LAN_ALLOW группы для одного типа IP
+      # Вызов: lan_allow_group 4 IPV4_PARTS IPV4_UNIQUE  или  lan_allow_group 6 IPV6_PARTS IPV6_UNIQUE
+      # Использует eval для совместимости с bash < 4.3 (без nameref)
+      lan_allow_group() {
+          local ip_ver="$1"
+          local _parts_name="$2"
+          local _unique_name="$3"
+          local IPT_CMD=""
+          local LABEL=""
+          if [ "$ip_ver" -eq 4 ]; then
+              IPT_CMD="iptables"
+              LABEL="IPv4"
           else
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                SUBNET_TUN="$TUN"
-              else
-                SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-              fi
-            else
-              SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-              [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-            fi
+              IPT_CMD="ip6tables"
+              LABEL="IPv6"
           fi
-          [ -n "$SUBNET_TUN" ] && iptables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-        else
-          # Участников >1 — intra-subnet только для дублей
-          for SUBNET in "${!IPV4_UNIQUE[@]}"; do
-            COUNT=0
-            for part in "${IPV4_PARTS[@]}"; do
-              [ "$part" = "$SUBNET" ] && ((COUNT++))
-            done
-            if [ $COUNT -gt 1 ]; then
-              # Этот участник встречается >1 раза — разрешаем intra-subnet
-              if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-                SUBNET_TUN="$TUN"
-              else
-                if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-                  if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                    SUBNET_TUN="$TUN"
-                  else
-                    SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                    [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-                  fi
-                else
-                  SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                  [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-                fi
-              fi
-              [ -n "$SUBNET_TUN" ] && iptables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-            fi
-          done
-        fi
-      fi
-      unset IPV4_UNIQUE
 
-      # Обрабатываем IPv6 группу отдельно
-      if [ ${#IPV6_PARTS[@]} -gt 0 ]; then
-        # Создаём unicast правила для ВСЕХ пар участников (включая один туннель!)
-        echo "   Создание unicast правил для IPv6 пар..."
-        for ((i=0; i<${#IPV6_PARTS[@]}; i++)); do
-          for ((j=i+1; j<${#IPV6_PARTS[@]}; j++)); do
-            SRC="${IPV6_PARTS[$i]}"
-            DST="${IPV6_PARTS[$j]}"
-            
-            # Убираем маску /124 для правил
-            SRC_CLEAN="${SRC%/*}"
-            DST_CLEAN="${DST%/*}"
-            
-            echo "    $SRC_CLEAN ↔ $DST_CLEAN"
-            ip6tables -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
-            ip6tables -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
+          local _parts_count
+          eval "_parts_count=\${#$_parts_name[@]}"
+          [ "$_parts_count" -eq 0 ] && return
+
+          # 1. Unicast правила для ВСЕХ пар участников
+          echo "   Создание unicast правил для $LABEL пар..."
+          for ((i=0; i<_parts_count; i++)); do
+              for ((j=i+1; j<_parts_count; j++)); do
+                  local SRC DST SRC_CLEAN DST_CLEAN
+                  eval "SRC=\${$_parts_name[$i]}"
+                  eval "DST=\${$_parts_name[$j]}"
+                  SRC_CLEAN="${SRC%/*}"
+                  DST_CLEAN="${DST%/*}"
+                  echo "    $SRC_CLEAN ↔ $DST_CLEAN"
+                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
+                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
+              done
           done
-        done
-        
-        # Intra-subnet разрешён если:
-        # 1. Участник только ОДИН (нет с кем общаться на inter-subnet)
-        # 2. ИЛИ участник встречается >1 раза (явно указан дубль)
-        if [ ${#IPV6_PARTS[@]} -eq 1 ]; then
-          # Только один IPv6 участник — разрешаем intra-subnet
-          SUBNET="${IPV6_PARTS[0]}"
-          if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-            SUBNET_TUN="$TUN"
+
+          # Вспомогательная: найти туннель для подсети (универсальная для intra и inter)
+          _find_tun_for_subnet() {
+              local target="$1"
+              if [ "$target" = "$LOCAL_SUBNETS_IPV4" ] || [ "$target" = "$LOCAL_SUBNETS_IPV6" ]; then
+                  echo "$TUN"
+              elif local_subnet_overlaps "$target"; then
+                  echo "$TUN"
+              else
+                  find_tunnel_for_subnet "$target"
+              fi
+          }
+
+          # 2. Intra-subnet разрешён если один участник ИЛИ участник дубль
+          if [ "$_parts_count" -eq 1 ]; then
+              # Один участник — разрешаем intra-subnet
+              local SUBNET
+              eval "SUBNET=\${$_parts_name[0]}"
+              local SUBNET_TUN=$(_find_tun_for_subnet "$SUBNET")
+              [ -n "$SUBNET_TUN" ] && $IPT_CMD -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
           else
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                SUBNET_TUN="$TUN"
-              else
-                SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-              fi
-            else
-              SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-              [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-            fi
-          fi
-          [ -n "$SUBNET_TUN" ] && ip6tables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-        else
-          # Участников >1 — intra-subnet только для дублей
-          for SUBNET in "${!IPV6_UNIQUE[@]}"; do
-            COUNT=0
-            for part in "${IPV6_PARTS[@]}"; do
-              [ "$part" = "$SUBNET" ] && ((COUNT++))
-            done
-            if [ $COUNT -gt 1 ]; then
-              # Этот участник встречается >1 раза — разрешаем intra-subnet
-              if [ "$SUBNET" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SUBNET" = "$LOCAL_SUBNETS_IPV6" ]; then
-                SUBNET_TUN="$TUN"
-              else
-                if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-                  if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SUBNET', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                    SUBNET_TUN="$TUN"
-                  else
-                    SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                    [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
+              # Участников >1 — intra-subnet только для дублей
+              local _unique_keys
+              eval "_unique_keys=\"\${!$_unique_name[@]}\""
+              for SUBNET in $_unique_keys; do
+                  local COUNT=0
+                  for part_idx in $(seq 0 $((_parts_count - 1))); do
+                      local _part_val
+                      eval "_part_val=\${$_parts_name[$part_idx]}"
+                      [ "$_part_val" = "$SUBNET" ] && ((COUNT++))
+                  done
+                  if [ "$COUNT" -gt 1 ]; then
+                      local SUBNET_TUN=$(_find_tun_for_subnet "$SUBNET")
+                      [ -n "$SUBNET_TUN" ] && $IPT_CMD -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
                   fi
-                else
-                  SUBNET_TUN=$(find_tun_for_ip "$SUBNET")
-                  [ -z "$SUBNET_TUN" ] && SUBNET_TUN=$(find_tunnel_by_subnet_in_configs "$SUBNET")
-                fi
-              fi
-              [ -n "$SUBNET_TUN" ] && ip6tables -I FORWARD -i "$SUBNET_TUN" -o "$SUBNET_TUN" -s "$SUBNET" -d "$SUBNET" -j ACCEPT 2>/dev/null || true
-            fi
-          done
-        fi
-      fi
-      unset IPV6_UNIQUE
+              done
+          fi
+      }
+
+      # Обрабатываем IPv4 и IPv6 через одну функцию
+      lan_allow_group 4 IPV4_PARTS IPV4_UNIQUE
+      lan_allow_group 6 IPV6_PARTS IPV6_UNIQUE
 
       # Проходим по каждой паре участников ОДНОГО ТИПА и создаём правила
       # IPv4 и IPv6 не могут общаться друг с другом — не создаём бесполезные правила
@@ -1573,96 +1778,25 @@ except Exception as e:
           # Пропускаем если это одинаковые подсети (для них есть intra-subnet)
           [ "$SRC" = "$DST" ] && continue
 
-          # Автоматически определяем туннель для источника
-          # Если это подсеть текущего туннеля — используем $TUN
-          if [ "$SRC" = "$LOCAL_SUBNETS_IPV4" ] || [ "$SRC" = "$LOCAL_SUBNETS_IPV6" ]; then
-            SRC_TUN="$TUN"
-          else
-            # Проверяем, принадлежит ли подсеть текущему туннелю (пересекается ли)
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$SRC', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    # Проверяем что LAN_ALLOW подсеть пересекается с серверной
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                SRC_TUN="$TUN"
-              else
-                # Сначала ищем среди активных интерфейсов
-                SRC_TUN=$(find_tun_for_ip "$SRC")
-                # Если не нашли — ищем в .conf файлах (даже если туннель не активен)
-                if [ -z "$SRC_TUN" ]; then
-                  SRC_TUN=$(find_tunnel_by_subnet_in_configs "$SRC")
-                fi
-              fi
-            else
-              # Нет локальных подсетей — ищем в других интерфейсах
-              SRC_TUN=$(find_tun_for_ip "$SRC")
-              if [ -z "$SRC_TUN" ]; then
-                SRC_TUN=$(find_tunnel_by_subnet_in_configs "$SRC")
-              fi
-            fi
-          fi
+          # Определяем туннель для источника и получателя (универсальная функция)
+          SRC_TUN=$(_find_tun_for_subnet "$SRC")
+          DST_TUN=$(_find_tun_for_subnet "$DST")
 
-          # Если не нашли туннель для SRC — пропускаем эту пару
+          # Если не нашли туннель — пропускаем эту пару
           if [ -z "$SRC_TUN" ]; then
             echo "    ⚠️  Пропущено: $SRC (туннель не найден)"
             continue
           fi
-
-          # Автоматически определяем туннель для получателя
-          # Если это подсеть текущего туннеля — используем $TUN
-          if [ "$DST" = "$LOCAL_SUBNETS_IPV4" ] || [ "$DST" = "$LOCAL_SUBNETS_IPV6" ]; then
-            DST_TUN="$TUN"
-          else
-            # Проверяем, принадлежит ли подсеть текущему туннелю (пересекается ли)
-            if [ -n "$LOCAL_SUBNETS_IPV4" ] || [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-              if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$DST', strict=False)
-    tun4 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False) if '$LOCAL_SUBNETS_IPV4' else None
-    tun6 = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False) if '$LOCAL_SUBNETS_IPV6' else None
-    # Проверяем что LAN_ALLOW подсеть пересекается с серверной
-    if (tun4 and ip.overlaps(tun4)) or (tun6 and ip.overlaps(tun6)):
-        exit(0)
-    exit(1)
-except Exception as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    exit(1)
-" 2>&1; then
-                DST_TUN="$TUN"
-              else
-                # Сначала ищем среди активных интерфейсов
-                DST_TUN=$(find_tun_for_ip "$DST")
-                # Если не нашли — ищем в .conf файлах (даже если туннель не активен)
-                if [ -z "$DST_TUN" ]; then
-                  DST_TUN=$(find_tunnel_by_subnet_in_configs "$DST")
-                fi
-              fi
-            else
-              # Нет локальных подсетей — ищем в других интерфейсах
-              DST_TUN=$(find_tun_for_ip "$DST")
-              if [ -z "$DST_TUN" ]; then
-                DST_TUN=$(find_tunnel_by_subnet_in_configs "$DST")
-              fi
-            fi
-          fi
-
-          # Если не нашли туннель для DST — пропускаем эту пару
           if [ -z "$DST_TUN" ]; then
             echo "    ⚠️  Пропущено: $DST (туннель не найден)"
             continue
+          fi
+
+          # Определяем iptables/ip6tables по типу
+          if [[ "$SRC" == *:* ]]; then
+              IPT_CMD="ip6tables"
+          else
+              IPT_CMD="iptables"
           fi
 
           # Разрешаем SRC → DST (в НАЧАЛО цепи, поверх DROP!)
@@ -1683,7 +1817,6 @@ fi
 # Храним: параметры, WARP_LIST, LAN_ALLOW, INTERFACE_MAP
 TUNNELS_STATE_DIR="$STATE_BASE_DIR/params"
 mkdir -p "$TUNNELS_STATE_DIR" 2>/dev/null || true
-TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${TUN}"
 
 # --- Собираем карту интерфейсов и подсетей для всех IP в LAN_ALLOW ---
 # Это нужно чтобы down.sh мог очистить правила даже если интерфейс больше не существует
@@ -1697,129 +1830,6 @@ fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   INTERFACE_MAP+=("$TUN=$LOCAL_SUBNETS_IPV6")
 fi
-
-# Функция: найти туннель по подсети в .conf файлах рядом со скриптом
-find_tunnel_by_subnet_in_configs() {
-  local target_subnet="$1"
-  local script_dir="$(dirname "$(readlink -f "$0")")"
-
-  # Ищем все .conf файлы рядом со скриптом
-  for conf_file in "$script_dir"/*.conf; do
-    [ -f "$conf_file" ] || continue
-    
-    # Извлекаем имя туннеля из имени файла
-    local conf_name="$(basename "$conf_file" .conf)"
-    
-    # Пропускаем warp конфиги
-    [[ "$conf_name" == *warp* ]] && continue
-    
-    # Читаем подсеть из конфига
-    local conf_subnet=$(grep -E "^Address = " "$conf_file" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d ' ')
-    
-    [ -z "$conf_subnet" ] && continue
-    
-    # Разбираем на IPv4 и IPv6
-    IFS=',' read -ra SUBNETS <<< "$conf_subnet"
-    for subnet in "${SUBNETS[@]}"; do
-      subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-      [ -z "$subnet" ] && continue
-      
-      # Прямое совпадение
-      if [ "$subnet" = "$target_subnet" ]; then
-        echo "$conf_name"
-        return 0
-      fi
-      
-      # Проверяем перекрытие через Python
-      if python3 -c "
-import ipaddress
-try:
-    ip = ipaddress.ip_network('$target_subnet', strict=False)
-    conf_net = ipaddress.ip_network('$subnet', strict=False)
-    ip_first = int(ip.network_address)
-    ip_last = int(ip.broadcast_address)
-    conf_first = int(conf_net.network_address)
-    conf_last = int(conf_net.broadcast_address)
-    if ip_first <= conf_last and conf_first <= ip_last:
-        exit(0)
-    exit(1)
-except:
-    exit(1)
-" 2>/dev/null; then
-        echo "$conf_name"
-        return 0
-      fi
-    done
-  done
-  
-  echo ""
-  return 1
-}
-
-# Функция: найти туннель по подсети среди ЗАПУЩЕННЫХ интерфейсов
-# Проверяем только AmneziaWG/WireGuard интерфейсы
-find_tunnel_in_running_interfaces() {
-  local target_subnet="$1"
-
-  # Получаем список всех AmneziaWG интерфейсов
-  for iface in $(ip -br link show 2>/dev/null | awk '$2 ~ /amneziawg|wireguard/ {print $1}'); do
-    # Пропускаем текущий туннель — он уже добавлен
-    [ "$iface" = "$TUN" ] && continue
-
-    # Получаем IPv4 адрес интерфейса
-    local iface_ipv4=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d./]+' | head -1)
-    if [ -n "$iface_ipv4" ]; then
-      if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$target_subnet', strict=False)
-    iface_net = ipaddress.ip_network('$iface_ipv4', strict=False)
-    if ip.overlaps(iface_net):
-        sys.exit(0)
-    sys.exit(1)
-except:
-    sys.exit(1)
-" 2>/dev/null; then
-        echo "$iface"
-        return 0
-      fi
-    fi
-
-    # Получаем IPv6 адрес интерфейса
-    local iface_ipv6=$(ip -6 addr show "$iface" 2>/dev/null | grep -oP 'inet6 \K[\da-f.:]+/\d+' | head -1)
-    if [ -n "$iface_ipv6" ]; then
-      if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$target_subnet', strict=False)
-    iface_net = ipaddress.ip_network('$iface_ipv6', strict=False)
-    if ip.overlaps(iface_net):
-        sys.exit(0)
-    sys.exit(1)
-except:
-    sys.exit(1)
-" 2>/dev/null; then
-        echo "$iface"
-        return 0
-      fi
-    fi
-  done
-
-  echo ""
-  return 1
-}
-
-# Для текущего туннеля (TUN) используем LOCAL_SUBNETS напрямую
-# Не нужно искать туннель по IP — мы уже знаем что это TUN!
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
-  INTERFACE_MAP+=("$TUN=$LOCAL_SUBNETS_IPV4")
-fi
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-  INTERFACE_MAP+=("$TUN=$LOCAL_SUBNETS_IPV6")
-fi
-
 # Для остальных правил LAN_ALLOW ищем туннели
 for rule in "${LAN_ALLOW[@]}"; do
   IFS=',' read -ra PARTS <<< "$rule"
@@ -1832,13 +1842,8 @@ for rule in "${LAN_ALLOW[@]}"; do
       continue
     fi
 
-    # 1️⃣ Сначала ищем в .conf файлах (по соседству)
-    tun_name=$(find_tunnel_by_subnet_in_configs "$part")
-
-    # 2️⃣ Если не нашли — проверяем запущенные AmneziaWG интерфейсы
-    if [ -z "$tun_name" ]; then
-      tun_name=$(find_tunnel_in_running_interfaces "$part")
-    fi
+    # Ищем туннель универсальной функцией
+    tun_name=$(find_tunnel_for_subnet "$part")
 
     if [ -n "$tun_name" ]; then
       # Получаем подсеть этого туннеля
@@ -1851,7 +1856,8 @@ for rule in "${LAN_ALLOW[@]}"; do
         if [ -f "$conf_file" ]; then
           conf_subnet=$(grep -E "^Address = " "$conf_file" 2>/dev/null | head -1 | cut -d'=' -f2 | tr -d ' ')
           if [ -n "$conf_subnet" ]; then
-            INTERFACE_MAP+=("$tun_name=$conf_subnet")
+            local tun_subnet_net=$(parse_conf_subnet "$conf_subnet")
+            [ -n "$tun_subnet_net" ] && INTERFACE_MAP+=("$tun_name=$tun_subnet_net")
           fi
         fi
       fi
@@ -1966,37 +1972,6 @@ fi
 
 # --- Добавление правил для каждого проброса ---
 
-# --- Вспомогательные функции для разбора правил проброски портов ---
-# Функция проверки является ли поле валидным именем интерфейса
-is_valid_interface() {
-  local s="$1"
-  if [ -z "$s" ]; then return 1; fi
-  local s_upper
-  s_upper=$(echo "$s" | tr '[:lower:]' '[:upper:]')
-  if [ "$s_upper" = "SNAT" ]; then return 1; fi
-  if ! [[ "$s" =~ [a-zA-Z] ]]; then return 1; fi
-  if [[ "$s" =~ ^[a-zA-Z0-9_]+$ ]]; then return 0; fi
-  return 1
-}
-
-# Функция парсинга FLAGS
-parse_flags() {
-  local s="$1"
-  PARSED_SNAT=""
-  PARSED_IFACE=""
-  IFS=',' read -ra flag_parts <<< "$s"
-  for part in "${flag_parts[@]}"; do
-    part="${part// /}"
-    local part_upper
-    part_upper=$(echo "$part" | tr '[:lower:]' '[:upper:]')
-    if [ "$part_upper" = "SNAT" ]; then
-      PARSED_SNAT="SNAT"
-    elif [ -n "$part" ]; then
-      PARSED_IFACE="$part"
-    fi
-  done
-}
-
 # Обработка правил проброски портов
 declare -A GLOBAL_SNAT_RULES_ADDED
 for rule in "${PORT_FORWARDING_RULES[@]}"; do
@@ -2080,35 +2055,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
   # Предпоследнее поле — проверяем на протокол или порт
   PREV_IDX=$((NUM_FIELDS - 2))
   PREV_FIELD="${FIELDS[$PREV_IDX]}"
-  
-  # Проверяем является ли поле протоколом
-  is_proto_field() {
-    local f="$1"
-    local f_upper=$(echo "$f" | tr '[:lower:]' '[:upper:]')
-    [ "$f_upper" = "TCP" ] || [ "$f_upper" = "UDP" ] || [ "$f_upper" = "TCP,UDP" ] || [ "$f_upper" = "UDP,TCP" ]
-  }
-  
-  # Проверяем является ли поле FLAGS (SNAT или интерфейс)
-  is_flags_field() {
-    local f="$1"
-    local f_upper=$(echo "$f" | tr '[:lower:]' '[:upper:]')
-    # SNAT
-    [ "$f_upper" = "SNAT" ] && return 0
-    # Интерфейс (содержит буквы, не содержит цифр и /)
-    [[ "$f" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] && return 0
-    # SNAT,interface или interface,SNAT
-    [[ "$f_upper" == *"SNAT"* ]] && [[ "$f" =~ [a-zA-Z] ]] && return 0
-    return 1
-  }
-  
-  # Проверяем является ли поле портом (содержит цифры, может содержать - и >)
-  is_port_field() {
-    local f="$1"
-    local f_check="${f//-/}"
-    f_check="${f_check//>/}"
-    [[ "$f_check" =~ ^[0-9]+$ ]]
-  }
-  
+
   # Парсим с конца
   if is_flags_field "$LAST_FIELD"; then
     # Последнее поле — FLAGS
@@ -2218,12 +2165,18 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
   else
     USE_SUBNETS=1
     SUBNETS_ARRAY=()
+    ALLOWED_SUBNETS_DISPLAY="$ALLOWED_SUBNETS"
     IFS=',' read -ra RAW_SUBNETS <<< "$ALLOWED_SUBNETS"
     for s in "${RAW_SUBNETS[@]}"; do
       s="$(echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       [ -n "$s" ] && SUBNETS_ARRAY+=("$s")
     done
-    ALLOWED_SUBNETS_DISPLAY="$ALLOWED_SUBNETS"
+
+    # Если оба лимита = 100000 (было 0), пропускаем (полный безлимит)
+    if [ "$LIM_DOWN" = "100000" ] && [ "$LIM_UP" = "100000" ]; then
+        echo "ℹ️  $SUBNETS_PART -> безлимитный (0)"
+        continue
+    fi
   fi
 
   # Разбор внешнего/внутреннего портов
@@ -2314,10 +2267,10 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
               # ВАЖНО: Добавляем префикс ipv4:/ipv6 для уникальности между протоколами
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
-                GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
-              fi
-              $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
+$IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
+              GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
+            fi
+            $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$INT_PORT" -s "$ALLOWED_SUBNET" -j ACCEPT
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$INT_PORT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
@@ -2342,39 +2295,39 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         # После обработки обоих диапазонов — завершаем обработку этого CLIENT_IP
         continue
     fi
-    # 2. Внешний диапазон
+    # 2. Внешний диапазон, внутренний одиночный порт
     if [[ "$PF_PORT_EXT" == *"-"* ]] && [[ "$PF_PORT_INT" != *"-"* ]]; then
         PF_PORT_START="${PF_PORT_EXT%-*}"
         PF_PORT_END="${PF_PORT_EXT#*-}"
         for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
-              # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
-              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+              # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (используем внутренний порт!)
+              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
-              $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j ACCEPT
-              $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
+              $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -s "$ALLOWED_SUBNET" -j ACCEPT
+              $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
-            # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
-            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
-            if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
-              GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
-            fi
-            $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PORT_NUM" -j ACCEPT
-            $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -m state --state RELATED,ESTABLISHED -j ACCEPT
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+            # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (используем внутренний порт!)
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
+              if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
+                GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
+              fi
+              $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -d "$CLIENT_IP" --dport "$PF_PORT_INT" -j ACCEPT
+            $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -m state --state RELATED,ESTABLISHED -j ACCEPT
           fi
 
           if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ]; then
-            echo "$PF_PROTO порт $PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
+            echo "$PF_PROTO порт $PORT_NUM->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
           else
-            echo "$PF_PROTO порт $PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
+            echo "$PF_PROTO порт $PORT_NUM->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
           fi
         done
         # После обработки внешнего диапазона — завершаем обработку этого CLIENT_IP
@@ -2466,9 +2419,9 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   # --- Проверка диапазона масок подсетей (IPv4: /8-/32, IPv6: /104-/128) ---
   VALID_SUBNETS_LIMITS=()
   for entry in "${SUBNETS_LIMITS[@]}"; do
-    # Извлекаем подсети (всё до последнего :)
-    subnets_part=$(echo "$entry" | rev | cut -d':' -f2- | rev)
-    limit_part=$(echo "$entry" | rev | cut -d':' -f1 | rev)
+    # Извлекаем подсети (всё до последнего :) через bash
+    subnets_part=${entry%:*}
+    limit_part=${entry##*:}
     
     entry_valid=1
     IFS=',' read -ra RAW_SUBNETS <<< "$subnets_part"
@@ -2476,24 +2429,8 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
       subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       [ -z "$subnet" ] && continue
       
-      # Проверяем маску через Python
-      if ! python3 -c "
-import ipaddress, sys
-try:
-    net = ipaddress.ip_network('$subnet', strict=False)
-    if isinstance(net, ipaddress.IPv4Network):
-        if net.prefixlen < 8 or net.prefixlen > 32:
-            print(f'IPv4 подсеть /{net.prefixlen} вне диапазона /8-/32', file=sys.stderr)
-            sys.exit(1)
-    else:
-        if net.prefixlen < 104 or net.prefixlen > 128:
-            print(f'IPv6 подсеть /{net.prefixlen} вне диапазона /104-/128', file=sys.stderr)
-            sys.exit(1)
-    sys.exit(0)
-except Exception as e:
-    print(f'Ошибка: {e}', file=sys.stderr)
-    sys.exit(1)
-" 2>&1; then
+      # Проверяем маску подсети
+      if ! validate_subnet_mask "$subnet"; then
         echo "⚠️  Пропущено: '$subnet' (недопустимая подсеть)"
         entry_valid=0
         break
@@ -2506,13 +2443,37 @@ except Exception as e:
     fi
   done
   
-  # Если все правила отфильтрованы — пропускаем этот блок
+  # Если все правила отфильтрованы — выходим
   if [ ${#VALID_SUBNETS_LIMITS[@]} -eq 0 ]; then
     echo "ℹ️  Лимиты скорости отключены (нет валидных правил)"
-  else
+  fi
   
   # Используем валидные правила вместо исходных
   SUBNETS_LIMITS=("${VALID_SUBNETS_LIMITS[@]}")
+  
+  # Проверяем есть ли хотя бы одно правило с лимитом
+  HAS_ACTIVE_LIMIT=0
+  for entry in "${SUBNETS_LIMITS[@]}"; do
+    _lim_raw=$(echo "$entry" | rev | cut -d':' -f1 | rev)
+    if echo "$_lim_raw" | grep -q ':'; then
+        _ld="${_lim_raw%%:*}"
+        _lu="${_lim_raw##*:}"
+    else
+        _ld="$_lim_raw"
+        _lu="$_lim_raw"
+    fi
+    [ "$_ld" = "0" ] && _ld="100000"
+    [ "$_lu" = "0" ] && _lu="100000"
+    if [ "$_ld" != "100000" ] || [ "$_lu" != "100000" ]; then
+      HAS_ACTIVE_LIMIT=1
+      break
+    fi
+  done
+  
+  # Если все лимиты = 0 — не создаём ifb
+  if [ "$HAS_ACTIVE_LIMIT" -eq 0 ]; then
+    echo "ℹ️  Все лимиты = 0, шейпинг отключен"
+  fi
   
   if ! modprobe ifb; then
     echo "Ошибка: не удалось загрузить модуль ifb"
@@ -2523,54 +2484,147 @@ except Exception as e:
   ip link delete "$IFB_IN" 2>/dev/null || true
   ip link set "$IFB_OUT" down 2>/dev/null || true
   ip link delete "$IFB_OUT" 2>/dev/null || true
+  IFB_IN="ifb_${TUN_SAFE}_in"
+  IFB_OUT="ifb_${TUN_SAFE}_out"
+  IFB_MIX="ifb_${TUN_SAFE}_mix"
+
   ip link add "$IFB_OUT" type ifb 2>/dev/null || true
   ip link set "$IFB_OUT" up
   ip link add "$IFB_IN" type ifb 2>/dev/null || true
   ip link set "$IFB_IN" up
+  ip link add "$IFB_MIX" type ifb 2>/dev/null || true
+  ip link set "$IFB_MIX" up
 
   tc qdisc del dev "$TUN" root 2>/dev/null || true
   tc qdisc del dev "$TUN" handle ffff: ingress 2>/dev/null || true
   tc qdisc del dev "$IFB_OUT" root 2>/dev/null || true
   tc qdisc del dev "$IFB_IN" root 2>/dev/null || true
+  tc qdisc del dev "$IFB_MIX" root 2>/dev/null || true
 
   tc qdisc add dev "$TUN" root handle 1: htb
   # Перенаправляем IPv4 трафик на ifb для ограничения
   tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
   # Перенаправляем IPv6 трафик на ifb для ограничения
   tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
-  tc qdisc add dev "$IFB_OUT" root handle 1: htb default 2
+  tc qdisc add dev "$IFB_OUT" root handle 1: htb default 1
   tc qdisc add dev "$TUN" handle ffff: ingress
   # Перенаправляем входящий IPv4 трафик на ifb
   tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
   # Перенаправляем входящий IPv6 трафик на ifb
   tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
-  tc qdisc add dev "$IFB_IN" root handle 1: htb default 2
+  tc qdisc add dev "$IFB_IN" root handle 1: htb default 1
+  tc qdisc add dev "$IFB_MIX" root handle 1: htb default 1
+
+  # Проверяем, можно ли использовать IFB_MIX (все подсети с одинаковым download=upload)
+  USE_IFB_MIX=0
+  if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
+      _all_same=1
+      _first_lim=""
+      for _entry in "${SUBNETS_LIMITS[@]}"; do
+          _l=$(echo "$_entry" | rev | cut -d':' -f1 | rev)
+          if echo "$_l" | grep -q ':'; then
+              _all_same=0
+              break
+          fi
+          if [ -z "$_first_lim" ]; then
+              _first_lim="$_l"
+          else
+              if [ "$_l" != "$_first_lim" ]; then
+                  _all_same=0
+                  break
+              fi
+          fi
+      done
+      if [ "$_all_same" = "1" ] && [ "$_first_lim" != "0" ]; then
+          USE_IFB_MIX=1
+      fi
+  fi
+
+  # Перенаправляем трафик на IFB_MIX если все лимиты одинаковые
+  if [ "$USE_IFB_MIX" = "1" ]; then
+      tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
+      tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
+      tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
+      tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
+  fi
+
+  # Парсим BRIDGE (формат: MAX_CLIENTS:BRIDGE_RATE:QUANT)
+  _rest="${BRIDGE#*:}"
+  MAX_CLIENTS_PER_HIERARCHY="${BRIDGE%%:*}"
+  BRIDGE_RATE="${_rest%%:*}"
+  QUANT="${_rest##*:}"
 
   # Функция для создания новой иерархии tc классов при переполнении minor_id
-  # ВАЖНО: 1: используется ТОЛЬКО для BRIDGE (1:2 до 1:9999)
-  # Клиенты создаются в 2:, 3:, ... до 9999: (по 9999 клиентов на иерархию)
-  # ИТОГО: 9998 иерархий × 9999 клиентов = ~100 миллионов клиентов!
+  # ВАЖНО: Каждая иерархия (2:, 3:, ... 9999:) привязана К КОРНЮ (1:) через свой мост
+  # Структура: 1:2→2:1-9999, 1:3→3:1-9999, 1:4→4:1-9999 ... 1:9999→9999:1-9999
+  # ИТОГО: ($(($MAX_CLIENTS_PER_HIERARCHY - 1)) иерархий × $MAX_CLIENTS_PER_HIERARCHY клиентов
   create_tc_hierarchy() {
-    major_class=$((major_class + 1))
-    minor_id=1  # ← Начинаем с 1 для 2:, 3:, etc. (экономим 999 классов!)
-    tc class add dev "$IFB_OUT" parent $((major_class - 1)): classid $((major_class - 1)):1 htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc class add dev "$IFB_OUT" parent $((major_class - 1)):1 classid $((major_class - 1)):${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc qdisc add dev "$IFB_OUT" parent $((major_class - 1)):${major_class} handle ${major_class}: htb default $((major_class + 1))
-    tc class add dev "$IFB_IN" parent $((major_class - 1)): classid $((major_class - 1)):1 htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc class add dev "$IFB_IN" parent $((major_class - 1)):1 classid $((major_class - 1)):${major_class} htb rate 10000mbit ceil 10000mbit quantum "$QUANT"
-    tc qdisc add dev "$IFB_IN" parent $((major_class - 1)):${major_class} handle ${major_class}: htb default $((major_class + 1))
+    # Создаём мост для СЛЕДУЮЩЕГО major_class
+    next_major=$((major_class + 1))
+    tc class add dev "$IFB_OUT" parent 1: classid 1:${next_major} htb rate "$BRIDGE_RATE" ceil "$BRIDGE_RATE" quantum "$QUANT" 2>/dev/null || true
+    tc qdisc add dev "$IFB_OUT" parent 1:${next_major} handle ${next_major}: htb default 1 2>/dev/null || true
+    tc class add dev "$IFB_IN" parent 1: classid 1:${next_major} htb rate "$BRIDGE_RATE" ceil "$BRIDGE_RATE" quantum "$QUANT" 2>/dev/null || true
+    tc qdisc add dev "$IFB_IN" parent 1:${next_major} handle ${next_major}: htb default 1 2>/dev/null || true
+    
+    # Переходим на следующую группу
+    major_class=$next_major
   }
 
-  major_class=1
-  minor_id=10000  # ← СРАЗУ > 9999 чтобы создать первую иерархию (2:) для клиентов!
+  # Fallback класс (1:1) - безлимитный трафик
+  tc class add dev "$IFB_OUT" parent 1: classid 1:1 htb rate "$BRIDGE_RATE" ceil "$BRIDGE_RATE" quantum "$QUANT" 2>/dev/null || true
+  # Мост для первой группы (2:)
+  tc class add dev "$IFB_OUT" parent 1: classid 1:2 htb rate "$BRIDGE_RATE" ceil "$BRIDGE_RATE" quantum "$QUANT" 2>/dev/null || true
+  tc qdisc add dev "$IFB_OUT" parent 1:2 handle 2: htb default 1 2>/dev/null || true
+  tc class add dev "$IFB_IN" parent 1: classid 1:1 htb rate "$BRIDGE_RATE" ceil "$BRIDGE_RATE" quantum "$QUANT" 2>/dev/null || true
+  tc class add dev "$IFB_IN" parent 1: classid 1:2 htb rate "$BRIDGE_RATE" ceil "$BRIDGE_RATE" quantum "$QUANT" 2>/dev/null || true
+  tc qdisc add dev "$IFB_IN" parent 1:2 handle 2: htb default 1 2>/dev/null || true
+
+  major_class=2
+  minor_id=1
+  client_num=0
   echo "📊 Установка лимитов скорости для подсетей"
   
   for entry in "${SUBNETS_LIMITS[@]}"; do
-      # Парсим с конца: последнее поле после : это лимит
-      # Формат: "subnet1, subnet2:limit" или "subnet:limit"
-      LIM=$(echo "$entry" | rev | cut -d':' -f1 | rev)
+      # Парсим лимиты (формат: "[MULTIPLIER:]subnet1, subnet2:LIM" или "[MULTIPLIER:]subnet:LIM_D:LIM_U")
+      # MULTIPLIER - умножает соотношение (опционально, по умолчанию 1)
+      # LIM_D:LIM_U - download:upload (если одно значение - общий лимит)
+      # 0 = безлимит
+
+      _lim_part=$(echo "$entry" | rev | cut -d':' -f1 | rev)
       # Всё остальное — это список подсетей
       SUBNETS_PART=$(echo "$entry" | rev | cut -d':' -f2- | rev)
+
+      # Парсим Download и Upload лимиты
+      if echo "$_lim_part" | grep -q ':'; then
+          LIM_DOWN="${_lim_part%%:*}"
+          LIM_UP="${_lim_part##*:}"
+      else
+          LIM_DOWN="$_lim_part"
+          LIM_UP="$_lim_part"
+      fi
+
+      # Сохраняем оригинальные значения до замены
+      _orig_down="$LIM_DOWN"
+      _orig_up="$LIM_UP"
+
+      # 0 = безлимит (заменяем на большое число для создания классов)
+      [ "$LIM_DOWN" = "0" ] && LIM_DOWN="100000"
+      [ "$LIM_UP" = "0" ] && LIM_UP="100000"
+
+      # Если оба лимита = 0, пропускаем всю группу
+      if [ "$_orig_down" = "0" ] && [ "$_orig_up" = "0" ]; then
+          echo "$SUBNETS_PART -> лимит отключен (0)"
+          continue
+      fi
+
+      # Флаги: создавать ли классы для каждой стороны
+      _create_down=1
+      _create_up=1
+      [ "$_orig_down" = "0" ] && _create_down=0
+      [ "$_orig_up" = "0" ] && _create_up=0
+
+      # Для совместимости - если одно значение, используем его как общий
+      LIM="$LIM_DOWN"
       
       # Разбиваем подсети по запятой и обрезаем пробелы
       SUBNET_ARRAY=()
@@ -2580,13 +2634,7 @@ except Exception as e:
         [ -n "$s" ] && SUBNET_ARRAY+=("$s")
       done
       
-      # Если лимит = 0, пропускаем эту группу подсетей (лимит отключен)
-      if [ "$LIM" -eq 0 ] 2>/dev/null; then
-          echo "$SUBNETS_PART -> лимит отключен (0)"
-          continue
-      fi
-      
-      # Если только одна подсеть — используем старую логику
+      # Если только одна подсеть — создаём 1 класс на КАЖДЫЙ IP (без маскирования!)
       if [ ${#SUBNET_ARRAY[@]} -eq 1 ]; then
           SUBNET="${SUBNET_ARRAY[0]}"
 
@@ -2594,239 +2642,201 @@ except Exception as e:
           if [[ "$SUBNET" == *:* ]]; then
               IP_VERSION="ipv6"
               PROTO_MATCH="ip6"
-              IPV4_CLIENT_MASK=32
-              IPV6_CLIENT_MASK=128
           else
               IP_VERSION="ip"
               PROTO_MATCH="ip"
-              IPV4_CLIENT_MASK=32
-              IPV6_CLIENT_MASK=128
           fi
 
-          IPS=$(python3 - <<PY
-import ipaddress, sys
-try:
-    net = ipaddress.ip_network('${SUBNET}', strict=False)
-    for ip in net:
-        print(ip)
-except Exception as e:
-    sys.exit(1)
-PY
-)
-          for ip in $IPS; do
-              if [ "$minor_id" -gt 9999 ]; then
-                  create_tc_hierarchy
-              fi
-              classid="${major_class}:${minor_id}"
-              major="${major_class}:"
-              tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
-              # Используем prio 1 для IPv4 и prio 2 для IPv6 (tc не разрешает одинаковый prio для разных протоколов)
-              if [ "$IP_VERSION" = "ipv6" ]; then
-                  tc filter add dev "$IFB_OUT" protocol $IP_VERSION parent ${major_class}: prio 2 u32 match $PROTO_MATCH dst $ip flowid $classid 2>/dev/null || true
-                  tc filter add dev "$IFB_IN" protocol $IP_VERSION parent ${major_class}: prio 2 u32 match $PROTO_MATCH src $ip flowid $classid 2>/dev/null || true
-              else
-                  tc filter add dev "$IFB_OUT" protocol $IP_VERSION parent ${major_class}: prio 1 u32 match $PROTO_MATCH dst $ip flowid $classid
-                  tc filter add dev "$IFB_IN" protocol $IP_VERSION parent ${major_class}: prio 1 u32 match $PROTO_MATCH src $ip flowid $classid
-              fi
-              tc qdisc add dev "$IFB_OUT" parent $classid fq_codel
-              tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
-              tc qdisc add dev "$IFB_IN" parent $classid fq_codel
-              minor_id=$((minor_id + 1))
-          done
-          echo "$SUBNET -> ${LIM}mbit"
+          # Получаем информацию о подсети через helper функцию
+          SUBNET_INFO=$(get_subnet_info "$SUBNET")
+          NUM_ADDRS=$(echo "$SUBNET_INFO" | cut -d':' -f1)
+          PREFIXLEN=$(echo "$SUBNET_INFO" | cut -d':' -f2)
+
+_dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
+          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
+          if [ "$USE_IFB_MIX" = "1" ]; then
+              echo "⚡ Одна подсеть: $SUBNET ($NUM_ADDRS IP) -> ${_dl}mbit (MIX)"
+          else
+              echo "⚡ Одна подсеть: $SUBNET ($NUM_ADDRS IP) -> ↓${_dl}mbit ↑${_ul}mbit"
+          fi
+
+          # Одна подсеть = 1 класс на КАЖДЫЙ IP (без маскирования!)
+          IPS=$(list_subnet_ips "$SUBNET")
+            for ip in $IPS; do
+                client_num=$((client_num + 1))
+                major_class=$((2 + (client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
+                minor_id=$(((client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
+                if [ "$major_class" -gt 2 ] && [ "$minor_id" -eq 1 ]; then
+                    create_tc_hierarchy
+                fi
+                classid="${major_class}:${minor_id}"
+                major="${major_class}:"
+
+                if [ "$USE_IFB_MIX" = "1" ]; then
+                    if [ "$_create_down" = "1" ]; then
+                        tc class add dev "$IFB_MIX" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                        if [ "$IP_VERSION" = "ipv6" ]; then
+                            tc filter add dev "$IFB_MIX" protocol ipv6 parent ${major_class}: prio 1 u32 match ip6 dst $ip flowid $classid 2>/dev/null || true
+                            tc filter add dev "$IFB_MIX" protocol ipv6 parent ${major_class}: prio 1 u32 match ip6 src $ip flowid $classid 2>/dev/null || true
+                        else
+                            tc filter add dev "$IFB_MIX" protocol ip parent ${major_class}: prio 1 u32 match ip dst $ip flowid $classid 2>/dev/null || true
+                            tc filter add dev "$IFB_MIX" protocol ip parent ${major_class}: prio 1 u32 match ip src $ip flowid $classid 2>/dev/null || true
+                        fi
+                        tc qdisc add dev "$IFB_MIX" parent $classid fq_codel 2>/dev/null || true
+                    fi
+                else
+                    if [ "$_create_down" = "1" ]; then
+                        tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                        if [ "$IP_VERSION" = "ipv6" ]; then
+                            tc filter add dev "$IFB_OUT" protocol ipv6 parent ${major_class}: prio 1 u32 match ip6 dst $ip flowid $classid 2>/dev/null || true
+                        else
+                            tc filter add dev "$IFB_OUT" protocol ip parent ${major_class}: prio 1 u32 match ip dst $ip flowid $classid 2>/dev/null || true
+                        fi
+                        tc qdisc add dev "$IFB_OUT" parent $classid fq_codel 2>/dev/null || true
+                    fi
+                    if [ "$_create_up" = "1" ]; then
+                        tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
+                        if [ "$IP_VERSION" = "ipv6" ]; then
+                            tc filter add dev "$IFB_IN" protocol ipv6 parent ${major_class}: prio 1 u32 match ip6 src $ip flowid $classid 2>/dev/null || true
+                        else
+                            tc filter add dev "$IFB_IN" protocol ip parent ${major_class}: prio 1 u32 match ip src $ip flowid $classid 2>/dev/null || true
+                        fi
+                        tc qdisc add dev "$IFB_IN" parent $classid fq_codel 2>/dev/null || true
+                    fi
+                fi
+            done
+_dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
+          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
+          if [ "$USE_IFB_MIX" = "1" ]; then
+              echo "✅ $SUBNET -> ${_dl}mbit (MIX)"
+          else
+              echo "✅ $SUBNET -> ↓${_dl}mbit ↑${_ul}mbit"
+          fi
       else
-          # Несколько подсетей — поддерживаем кратные соотношения
-          # Сначала получаем количество адресов и префиксы каждой подсети
-          SUBNET_INFO=()
-          for subnet in "${SUBNET_ARRAY[@]}"; do
-              INFO=$(python3 -c "
-import ipaddress
-try:
-    net = ipaddress.ip_network('${subnet}', strict=False)
-    print(f'{net.num_addresses}:{net.prefixlen}')
-except:
-    print('0:0')
-")
-              SUBNET_INFO+=("$INFO")
-          done
+# Несколько подсетей — поддерживаем кратные соотношения
+# MULTIPLIER из Bash передаётся как параметр
+RATIO_INFO=$(calc_subnet_ratios "$SUBNETS_PART" "$SUBNETS_LIMITS_STR")
+          NUM_CLASSES=$(echo "$RATIO_INFO" | cut -d'|' -f1)
 
-          # Определяем типы подсетей (IPv4 или IPv6)
-          SUBNET_TYPES=()
-          for subnet in "${SUBNET_ARRAY[@]}"; do
-              if [[ "$subnet" == *:* ]]; then
-                  SUBNET_TYPES+=("ipv6")
-              else
-                  SUBNET_TYPES+=("ipv4")
-              fi
-          done
+_dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
+          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
+          if [ "$USE_IFB_MIX" = "1" ]; then
+              echo "⚡ Несколько подсетей: $SUBNETS_PART -> ${_dl}mbit (MIX) ($NUM_CLASSES классов)"
+          else
+              echo "⚡ Несколько подсетей: $SUBNETS_PART -> ↓${_dl}mbit ↑${_ul}mbit ($NUM_CLASSES классов)"
+          fi
 
-          # Вычисляем соотношение подсетей через Python
-          # Возвращает: ipv4_count, ipv6_count, ipv4_client_mask, ipv6_client_mask, ratio_step
-          SHAPING_INFO=$(python3 - <<PY
-import ipaddress, math
+for idx in $(seq 0 $((NUM_CLASSES - 1))); do
+                client_num=$((client_num + 1))
+                major_class=$((2 + (client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
+                minor_id=$(((client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
+                if [ "$major_class" -gt 2 ] && [ "$minor_id" -eq 1 ]; then
+                    create_tc_hierarchy
+                fi
+                classid="${major_class}:${minor_id}"
+                major="${major_class}:"
 
-subnets = '${SUBNETS_PART}'.split(',')
-ipv4_nets = []
-ipv6_nets = []
+                if [ "$USE_IFB_MIX" = "1" ]; then
+                    if [ "$_create_down" = "1" ]; then
+                        tc class add dev "$IFB_MIX" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                    fi
+                else
+                    if [ "$_create_down" = "1" ]; then
+                        tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                    fi
+                    if [ "$_create_up" = "1" ]; then
+                        tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
+                    fi
+                fi
 
-for s in subnets:
-    s = s.strip()
-    if not s:
-        continue
-    net = ipaddress.ip_network(s, strict=False)
-    if isinstance(net, ipaddress.IPv4Network):
-        ipv4_nets.append(net)
-    else:
-        ipv6_nets.append(net)
+                i=0
+                for sub_info in $(echo "$RATIO_INFO" | cut -d'|' -f2-); do
+                  [ -z "$sub_info" ] && continue
 
-# Если есть и IPv4 и IPv6
-if ipv4_nets and ipv6_nets:
-    # Берём первую IPv4 и первую IPv6 для расчёта соотношения
-    ipv4_net = ipv4_nets[0]
-    ipv6_net = ipv6_nets[0]
-    
-    ipv4_total = 2 ** (32 - ipv4_net.prefixlen)
-    ipv6_total = 2 ** (128 - ipv6_net.prefixlen)
-    ratio = ipv6_total / ipv4_total
-    
-    if ratio >= 1:
-        # 1 IPv4 : N IPv6
-        ipv4_client_mask = 32
-        ipv6_per_ipv4 = int(ratio)
-        # Используем bit_length() вместо log2() для правильных масок!
-        ipv6_bits = (ipv6_per_ipv4 - 1).bit_length() if ipv6_per_ipv4 > 0 else 0
-        ipv6_client_mask = 128 - ipv6_bits
-        ipv4_step = 1
-        ipv6_step = int(ratio)
-        # Количество классов = количество IPv4 адресов
-        num_classes = ipv4_total
-    else:
-        # N IPv4 : 1 IPv6
-        ipv6_client_mask = 128
-        ipv4_per_ipv6 = int(1 / ratio)
-        # Используем bit_length() вместо log2() для правильных масок!
-        ipv4_bits = (ipv4_per_ipv6 - 1).bit_length() if ipv4_per_ipv6 > 0 else 0
-        ipv4_client_mask = 32 - ipv4_bits
-        ipv4_step = int(1 / ratio)
-        ipv6_step = 1
-        # Количество классов = количество IPv6 адресов
-        num_classes = ipv6_total
-    
-    print(f'{num_classes}:{ipv4_step}:{ipv6_step}:{ipv4_client_mask}:{ipv6_client_mask}')
-else:
-    # Только один тип подсетей
-    print('0:1:1:32:128')
-PY
-)
-          NUM_CLASSES=$(echo "$SHAPING_INFO" | cut -d':' -f1)
-          IPV4_STEP=$(echo "$SHAPING_INFO" | cut -d':' -f2)
-          IPV6_STEP=$(echo "$SHAPING_INFO" | cut -d':' -f3)
-          IPV4_CLIENT_MASK=$(echo "$SHAPING_INFO" | cut -d':' -f4)
-          IPV6_CLIENT_MASK=$(echo "$SHAPING_INFO" | cut -d':' -f5)
+                  count=$(echo "$sub_info" | cut -d':' -f1)
+                  prefix=$(echo "$sub_info" | cut -d':' -f2)
+                  ip_type=$(echo "$sub_info" | cut -d':' -f3)
+                  ratio=$(echo "$sub_info" | cut -d':' -f4)
+                  num_classes=$(echo "$sub_info" | cut -d':' -f5)
 
-          # Генерируем IP для каждой подсети
-          ALL_IPS_ARRAYS=()
-          declare -a ALL_IPS_ARRAYS
-          for i in "${!SUBNET_ARRAY[@]}"; do
-              subnet="${SUBNET_ARRAY[$i]}"
-              IPS=$(python3 - <<PY
-import ipaddress, sys
-try:
-    net = ipaddress.ip_network('${subnet}', strict=False)
-    for ip in net:
-        print(str(ip))
-except Exception as e:
-    sys.exit(1)
-PY
-)
-              ALL_IPS_ARRAYS[$i]="$IPS"
-          done
+                  [ "$ratio" = "0" ] && continue
+                  [ "$num_classes" = "0" ] && continue
+                  max_idx=$((num_classes - 1))
+                  [ "$idx" -gt "$max_idx" ] && continue
 
-          # Проходим по всем классам с учётом шага
-          # IP с соответствующими индексами получают один лимит
-          for idx in $(seq 0 $((NUM_CLASSES - 1))); do
-              if [ "$minor_id" -gt 9999 ]; then
-                  create_tc_hierarchy
-              fi
-
-              classid="${major_class}:${minor_id}"
-              major="${major_class}:"
-
-              # Создаём класс с общим лимитом
-              tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
-              tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM}"mbit ceil "${LIM}"mbit quantum "$QUANT"
-
-              # Добавляем фильтры для каждой подсети
-              for i in "${!SUBNET_ARRAY[@]}"; do
                   subnet="${SUBNET_ARRAY[$i]}"
-                  ip_type="${SUBNET_TYPES[$i]}"
-                  ips_str="${ALL_IPS_ARRAYS[$i]}"
 
-                  # Определяем шаг для этого типа подсети
-                  if [ "$ip_type" = "ipv6" ]; then
-                      STEP="$IPV6_STEP"
-                  else
-                      STEP="$IPV4_STEP"
-                  fi
+                  BLOCK_BASE=$(get_block_ip "$subnet" "$ratio" "$idx")
 
-                  # Вычисляем индекс с учётом шага
-                  REAL_IDX=$((idx * STEP + 1))
-
-                  # Получаем IP по индексу
-                  target_ip=$(echo "$ips_str" | sed -n "${REAL_IDX}p")
-
-                  # Выравниваем по границе блока (как в Python скрипте)
-                  if [ -n "$target_ip" ]; then
-                      if [ "$ip_type" = "ipv6" ] && [ "$IPV6_CLIENT_MASK" -lt 128 ]; then
-                          # Выравниваем IPv6 по границе блока
-                          target_ip=$(python3 -c "
-import ipaddress
-ip = ipaddress.IPv6Address('$target_ip')
-mask = $IPV6_CLIENT_MASK
-block_size = 2 ** (128 - mask)
-aligned_int = int(ip) & ~(block_size - 1)
-aligned = ipaddress.IPv6Address(aligned_int)
-print(aligned)
-")
-                      elif [ "$ip_type" = "ipv4" ] && [ "$IPV4_CLIENT_MASK" -lt 32 ]; then
-                          # Выравниваем IPv4 по границе блока
-                          target_ip=$(python3 -c "
-import ipaddress
-ip = ipaddress.IPv4Address('$target_ip')
-mask = $IPV4_CLIENT_MASK
-block_size = 2 ** (32 - mask)
-aligned_int = int(ip) & ~(block_size - 1)
-aligned = ipaddress.IPv4Address(aligned_int)
-print(aligned)
-")
-                      fi
-                  fi
-
-                  if [ -n "$target_ip" ]; then
-                      if [ "$ip_type" = "ipv6" ]; then
-                          tc filter add dev "$IFB_OUT" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 dst $target_ip flowid $classid 2>/dev/null || true
-                          tc filter add dev "$IFB_IN" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 src $target_ip flowid $classid 2>/dev/null || true
+                  if [ -n "$BLOCK_BASE" ]; then
+                      if [ "$USE_IFB_MIX" = "1" ]; then
+                          if [ "$_create_down" = "1" ]; then
+                              if [ "$ip_type" = "ipv6" ]; then
+                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $classid 2>/dev/null || true
+                              else
+                                  tc filter add dev "$IFB_MIX" protocol ip parent ${major_class}: prio 1 u32 match ip dst $BLOCK_BASE flowid $classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_MIX" protocol ip parent ${major_class}: prio 1 u32 match ip src $BLOCK_BASE flowid $classid 2>/dev/null || true
+                              fi
+                          fi
                       else
-                          tc filter add dev "$IFB_OUT" protocol ip parent ${major_class}: prio 1 u32 match ip dst $target_ip flowid $classid
-                          tc filter add dev "$IFB_IN" protocol ip parent ${major_class}: prio 1 u32 match ip src $target_ip flowid $classid
+                          if [ "$_create_down" = "1" ]; then
+                              if [ "$ip_type" = "ipv6" ]; then
+                                  tc filter add dev "$IFB_OUT" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $classid 2>/dev/null || true
+                              else
+                                  tc filter add dev "$IFB_OUT" protocol ip parent ${major_class}: prio 1 u32 match ip dst $BLOCK_BASE flowid $classid 2>/dev/null || true
+                              fi
+                          fi
+                          if [ "$_create_up" = "1" ]; then
+                              if [ "$ip_type" = "ipv6" ]; then
+                                  tc filter add dev "$IFB_IN" protocol ipv6 parent ${major_class}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $classid 2>/dev/null || true
+                              else
+                                  tc filter add dev "$IFB_IN" protocol ip parent ${major_class}: prio 1 u32 match ip src $BLOCK_BASE flowid $classid 2>/dev/null || true
+                              fi
+                          fi
                       fi
                   fi
+
+                  i=$((i + 1))
               done
-              
-              tc qdisc add dev "$IFB_OUT" parent $classid fq_codel
-              tc qdisc add dev "$IFB_IN" parent $classid fq_codel
-              minor_id=$((minor_id + 1))
+
+              if [ "$_create_down" = "1" ]; then
+                  tc qdisc add dev "$IFB_OUT" parent $classid fq_codel 2>/dev/null || true
+              fi
+              if [ "$_create_up" = "1" ]; then
+                  tc qdisc add dev "$IFB_IN" parent $classid fq_codel 2>/dev/null || true
+              fi
           done
-          
-          unset ALL_IPS_ARRAYS
-          echo "$SUBNETS_PART -> ${LIM}mbit (общий лимит)"
-      fi
-  done
-  echo "✅ Лимиты скорости настроены"
-  fi
+          _dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
+          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
+          if [ "$USE_IFB_MIX" = "1" ]; then
+              echo "$SUBNETS_PART -> ${_dl}mbit (MIX)"
+          else
+              echo "$SUBNETS_PART -> ↓${_dl}mbit ↑${_ul}mbit"
+          fi
+        fi
+    done
+    echo "✅ Лимиты скорости настроены"
 fi
 echo "————————————————————————————————"
 '''
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
+#####################################################################################################################################################################################
+
 
 down_script_template_warp = r'''#!/bin/bash
 
@@ -2865,70 +2875,17 @@ fi
 # --- Настройка логирования ---
 LOG_DIR="$SCRIPT_DIR/.data/log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
-LOG_FILE="$LOG_DIR/${TUN}down.log"
-# Открываем файл-дескриптор для логов (FD 3)
-exec 3>"$LOG_FILE"
-# Направляем set -x ТОЛЬКО в лог (через FD 3)
-BASH_XTRACEFD=3
-set -x
 
-# Функция: атомарное обновление .ref файла через mkdir (гарантированно атомарен в POSIX)
-# Если не удалось получить блокировку за 1 сек — всё равно выполняет операцию
-atomic_ref_update() {
-  local ref_file="$1"
-  local operation="$2"  # "inc", "dec", "set", "get", "get_inc", "get_dec"
-  local value="${3:-}"  # для "set"
-  local lock_dir="${ref_file}.d"
-  local attempts=0
+# Включаем логирование только если DOWNLOG=1
+if [ "$DOWNLOG" = "1" ]; then
+  LOG_FILE="$LOG_DIR/${TUN}down.log"
+  exec 3>"$LOG_FILE"
+  BASH_XTRACEFD=3
+  set -x
+fi
 
-  # Пытаемся захватить блокировку (30 попыток по 0.1с = 3 сек макс)
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    attempts=$((attempts + 1))
-    if [ "$attempts" -ge 30 ]; then
-      echo "⚠️ Блокировка $ref_file не получена за 3с — выполняем без неё..." >&2
-      break
-    fi
-    sleep 0.1
-  done
-
-  # Выполняем операцию (всегда выполняется, даже если не получили блокировку)
-  local result=""
-  case "$operation" in
-    "inc")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result=$((cur + 1))
-      echo "$result" > "$ref_file"
-      ;;
-    "dec")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result=$((cur - 1))
-      echo "$result" > "$ref_file"
-      ;;
-    "get_inc")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result="$cur:$((cur + 1))"
-      echo "$((cur + 1))" > "$ref_file"
-      ;;
-    "get_dec")
-      local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
-      result="$cur:$((cur - 1))"
-      echo "$((cur - 1))" > "$ref_file"
-      ;;
-    "set")
-      echo "$value" > "$ref_file"
-      result="$value"
-      ;;
-    "get")
-      result=$(cat "$ref_file" 2>/dev/null || echo "0")
-      ;;
-  esac
-
-  # Освобождаем блокировку
-  rmdir "$lock_dir" 2>/dev/null || true
-
-  # Возвращаем результат
-  echo "$result"
-}
+# Helper функции загружены из params через source:
+# atomic_ref_update, find_tun_from_map
 
 # --- Парсинг LOCAL_SUBNETS (IPv4 + IPv6) ---
 LOCAL_SUBNETS_IPV4=""
@@ -2966,37 +2923,11 @@ SERVER_ON_NETWORK=0
 SERVER_ON_NETWORK_IPV6=0
 
 if [ -n "$LOCAL_SUBNETS_IPV4" ] && [ -n "$LOCAL_SERVER_IP" ]; then
-  if python3 -c "
-import ipaddress
-import sys
-try:
-    server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP')
-    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
-    if int(server_ip) == int(net.network_address):
-        sys.exit(0)
-    sys.exit(1)
-except:
-    sys.exit(1)
-"; then
-    SERVER_ON_NETWORK=1
-  fi
+  SERVER_ON_NETWORK=$(check_server_network "$LOCAL_SERVER_IP" "$LOCAL_SUBNETS_IPV4")
 fi
 
 if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ -n "$LOCAL_SERVER_IP_IPV6" ]; then
-  if python3 -c "
-import ipaddress
-import sys
-try:
-    server_ip = ipaddress.ip_address('$LOCAL_SERVER_IP_IPV6')
-    net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV6', strict=False)
-    if int(server_ip) == int(net.network_address):
-        sys.exit(0)
-    sys.exit(1)
-except:
-    sys.exit(1)
-"; then
-    SERVER_ON_NETWORK_IPV6=1
-  fi
+  SERVER_ON_NETWORK_IPV6=$(check_server_network "$LOCAL_SERVER_IP_IPV6" "$LOCAL_SUBNETS_IPV6")
 fi
 
 # "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
@@ -3008,6 +2939,7 @@ PF_CHAIN_SNAT="PORT_FORWARD_SNAT_${TUN_SAFE}"
 RANDOM_WARP_CHAIN="RANDOM_WARP_${TUN_SAFE}"
 IFB_IN="ifb_${TUN_SAFE}_in"
 IFB_OUT="ifb_${TUN_SAFE}_out"
+IFB_MIX="ifb_${TUN_SAFE}_mix"
 INPUT_CHAIN="INPUT_${TUN_SAFE}"
 HAIRPIN_CHAIN="HAIRPIN_${TUN_SAFE}"
 
@@ -3133,16 +3065,6 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     fi
   fi
 
-  # Очищаем FORWARD и NAT правила для этого WARP
-  # ВАЖНО: Правила созданы С -i "$TUN" для каждого туннеля!
-  iptables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-  iptables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
-
-  ip6tables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-  ip6tables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  ip6tables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
-
   # Удаляем .active файл (используется для отслеживания в up.sh)
   rm -f "$STATE_BASE_DIR/warp/${warp}.active" 2>/dev/null || true
 done
@@ -3167,8 +3089,11 @@ if [ -n "$LOCAL_SUBNETS" ]; then
   done
 fi
 
-# Удаляем файлы активности WARP
-rm -f "$STATE_BASE_DIR/warp/*.active" 2>/dev/null || true
+# Удаляем файлы активности WARP для всех остановленных интерфейсов
+# (простое и надёжное решение - как в старой версии)
+for warp in "${!STOPPED_WARP_INTERFACES[@]}"; do
+  rm -f "$STATE_BASE_DIR/warp/${warp}.active" 2>/dev/null || true
+done
 
 # --- Очистка маршрутизации и таблиц для WARP ---
 # Очищаем ВСЕГДА для всех WARP интерфейсов которые были остановлены
@@ -3287,6 +3212,19 @@ if [ ${#STOPPED_WARP_INTERFACES[@]} -gt 0 ]; then
   fi
 fi
 
+# --- Очистка FORWARD и NAT для WARP (только для остановленных интерфейсов) ---
+for warp in "${!STOPPED_WARP_INTERFACES[@]}"; do
+  iptables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  # Удаляем ВСЕ MASQUERADE правила для этого интерфейса (не только первое)
+  while iptables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null; do :; done
+
+  ip6tables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
+  ip6tables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  # Удаляем ВСЕ MASQUERADE правила для этого интерфейса (не только первое)
+  while ip6tables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null; do :; done
+done
+
 # --- Очистка iptables/ip6tables для балансировки WARP (цепочка специфична для туннеля) ---
 # Очищаем всегда, даже если WARP не активен (на случай если правила остались)
 # Используем обе команды для поддержки IPv4 и IPv6
@@ -3299,17 +3237,7 @@ ip6tables -t mangle -D PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 ip6tables -t mangle -X "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
 # --- Очистка FORWARD для трафика через WARP (IPv4) ---
-# ВАЖНО: Правила созданы С -i "$TUN" для каждого туннеля!
-for warp in "${!STOPPED_WARP_INTERFACES[@]}"; do
-  iptables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-  iptables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-done
-
-# --- Очистка FORWARD для трафика через WARP (IPv6) ---
-for warp in "${!STOPPED_WARP_INTERFACES[@]}"; do
-  ip6tables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-  ip6tables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-done
+# УЖЕ очищенО в блоке выше (строки 3050-3059) — НЕ дублируем!
 
 # --- Удаляем Hairpin NAT (IPv4 + IPv6) ---
 iptables -t nat -D POSTROUTING -j "$HAIRPIN_CHAIN" 2>/dev/null || true
@@ -3327,13 +3255,10 @@ ip6tables -t nat -X "$HAIRPIN_CHAIN" 2>/dev/null || true
 # ВАЖНО: Правила созданы БЕЗ -i/-o, поэтому удаляем БЕЗ интерфейсов!
 
 # Вычисляем BROADCAST_ADDR для очистки (так же как в up.sh)
+# Вычисляем Broadcast только если он нужен (для очистки broadcast mark)
 BROADCAST_ADDR=""
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
-  BROADCAST_ADDR=$(python3 -c "
-import ipaddress
-net = ipaddress.ip_network('$LOCAL_SUBNETS_IPV4', strict=False)
-print(str(net.broadcast_address))
-" 2>/dev/null)
+  BROADCAST_ADDR=$(get_broadcast_addr "$LOCAL_SUBNETS_IPV4")
 fi
 
 # IPv4 Broadcast очистка (mangle mark)
@@ -3499,48 +3424,9 @@ ip6tables -t filter -X "$INPUT_CHAIN" 2>/dev/null || true
 # Очищаем правило локальной сети (из up скрипта) (IPv4 + IPv6)
 # LAN_ALLOW уже прочитан выше из файла параметров!
 
-# Функция: найти имя интерфейса из INTERFACE_MAP по IP/подсети
-# ВАЖНО: Используем ТОЛЬКО INTERFACE_MAP (не ip命令) так как интерфейс может быть уже удалён!
-find_tun_from_map() {
-  local ip_or_subnet="$1"
-
-  # Ищем в сохранённой карте интерфейсов
-  for mapping in "${INTERFACE_MAP[@]}"; do
-    tun_name="${mapping%%=*}"      # awg0 из "awg0=10.0.0.0/24"
-    tun_subnet="${mapping#*=}"     # 10.0.0.0/24 из "awg0=10.0.0.0/24"
-
-    # Проверяем попадает ли IP/подсеть в эту подсеть (используем overlaps)
-    if python3 -c "
-import ipaddress
-import sys
-try:
-    ip = ipaddress.ip_network('$ip_or_subnet', strict=False)
-    tun_net = ipaddress.ip_network('$tun_subnet', strict=False)
-    # Проверяем перекрытие подсетей
-    if ip.overlaps(tun_net):
-        sys.exit(0)
-    sys.exit(1)
-except Exception as e:
-    sys.exit(1)
-" 2>/dev/null; then
-      echo "$tun_name"
-      return 0
-    fi
-  done
-
-  # Не нашли в карте — возвращаем пусто
-  echo ""
-  return 1
-}
-
-# Получаем имя туннеля из INTERFACE_MAP (для очистки правил)
-# ВАЖНО: Делаем это ДО удаления файла параметров!
-MAIN_TUN=""
-if [ ${#INTERFACE_MAP[@]} -gt 0 ]; then
-  # Берём первый элемент INTERFACE_MAP и извлекаем имя туннеля
-  first_mapping="${INTERFACE_MAP[0]}"
-  MAIN_TUN="${first_mapping%%=*}"
-fi
+# Получаем имя туннеля для очистки LAN_ALLOW правил
+# Используем $TUN напрямую — это текущий туннель
+MAIN_TUN="$TUN"
 
 # Очищаем правила локальная сети если они есть
 if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
@@ -3569,6 +3455,7 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
     done
 
     # Считаем уникальных участников
+    unset IPV4_UNIQUE IPV6_UNIQUE 2>/dev/null || true
     declare -A IPV4_UNIQUE
     declare -A IPV6_UNIQUE
     for part in "${IPV4_PARTS[@]}"; do
@@ -3691,6 +3578,9 @@ ip link delete "$IFB_IN" 2>/dev/null || true
 tc qdisc del dev "$IFB_OUT" root 2>/dev/null || true
 ip link set "$IFB_OUT" down 2>/dev/null || true
 ip link delete "$IFB_OUT" 2>/dev/null || true
+tc qdisc del dev "$IFB_MIX" root 2>/dev/null || true
+ip link set "$IFB_MIX" down 2>/dev/null || true
+ip link delete "$IFB_MIX" 2>/dev/null || true
 
 # --- Удаляем файл параметров ---
 rm -f "$TUNNEL_PARAMS_FILE" 2>/dev/null || true
