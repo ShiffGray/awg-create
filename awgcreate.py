@@ -122,7 +122,7 @@ LOCAL_SUBNETS="<SERVER_ADDR>"                                  # Подсеть 
 
 # --- Ограничения скорости для подсетей ---
 SUBNETS_LIMITS=(
-  "<SERVER_ADDR>:<RATE_LIMIT>"
+  "<SERVER_ADDR>:<RATE_LIMIT>:<RATE_LIMIT>"
 )
 BRIDGE="9999:10000mbit:4400"
 
