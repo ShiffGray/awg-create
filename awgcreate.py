@@ -281,6 +281,7 @@ try:
     if isinstance(net, ipaddress.IPv4Network):
         ok = 8 <= net.prefixlen <= 32
     else:
+        # Для IPv6 разрешаем /104 до /128, но /112 допустима
         ok = 104 <= net.prefixlen <= 128
     sys.exit(0 if ok else 1)
 except Exception as e:
@@ -550,11 +551,7 @@ parse_conf_subnet() {
     python3 -c "import ipaddress; print(ipaddress.ip_network('$1', strict=False))" 2>/dev/null
 }
 
-# ==========================================
 # === Конец Python Helpers ===
-# ==========================================
-# === Конец Python Helpers ===
-# ==========================================
 
 # ================================================================
 # === ПРОВЕРОЧНЫЙ СКРИПТ (запускается при прямом вызове bash) ===
@@ -1055,6 +1052,12 @@ else
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
 fi
 
+# rp_filter settings for proper WireGuard operation
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+
 # --- Парсинг LOCAL_SUBNETS (IPv4 + IPv6) ---
 # Формат: "10.1.0.0/24" или "10.1.0.0/24, fd00::/120" (с пробелами и без)
 # Разделяем подсети по запятой и обрезаем пробелы
@@ -1123,6 +1126,24 @@ if [ -z "$TUN_HASH" ] || [ "$TUN_HASH" = "0" ]; then
   TUN_HASH=${#TUN}
 fi
 MARK_BASE=$((1000 + (TUN_HASH % 900) * 10))
+
+# --- Создаём rt_tables если его нет ---
+mkdir -p /etc/iproute2 2>/dev/null || true
+if [ ! -f /etc/iproute2/rt_tables ]; then
+    echo "#
+# reserved
+#
+#100 local
+#200 adsl
+#205 cidr
+#210 intern
+#211 adsl2
+#212 adsl3
+#253 wan
+#254 local
+#255 main
+" > /etc/iproute2/rt_tables 2>/dev/null || true
+fi
 
 # Функция: найти или зарезервировать TABLE_ID для данного TABLE_NAME (201..400)
 find_table_id() {
@@ -2412,35 +2433,29 @@ done
 # Применяется только если SUBNETS_LIMITS не пустой
 # Примечание: для больших подсетей (/16 и больше) этот цикл может работать долго
 # Если лимит = 0 для подсети — эта подсеть пропускается (лимит отключен)
-# Формат: "subnet1, subnet2:limit" или "subnet:limit" (поддержка IPv4+IPv6)
+# Формат: "subnet:rate" или "subnet:rate_in:rate_out" или "subnet" (без лимита)
+# ВАЖНО: валидация через validate_subnet_mask() которая уже есть в скрипте!
 if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   echo "⚡ Настройка лимитов скорости"
   
-  # --- Проверка диапазона масок подсетей (IPv4: /8-/32, IPv6: /104-/128) ---
+  # Валидация подсетей через validate_subnet_mask()
   VALID_SUBNETS_LIMITS=()
   for entry in "${SUBNETS_LIMITS[@]}"; do
-    # Извлекаем подсети (всё до последнего :) через bash
-    subnets_part=${entry%:*}
-    limit_part=${entry##*:}
-    
-    entry_valid=1
-    IFS=',' read -ra RAW_SUBNETS <<< "$subnets_part"
-    for subnet in "${RAW_SUBNETS[@]}"; do
-      subnet="$(echo "$subnet" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-      [ -z "$subnet" ] && continue
-      
-      # Проверяем маску подсети
-      if ! validate_subnet_mask "$subnet"; then
-        echo "⚠️  Пропущено: '$subnet' (недопустимая подсеть)"
-        entry_valid=0
-        break
+    _valid=1
+    # Подсети - всё до последнего : (${%:*} работает для IPv6!)
+    # "fd10:3::1/112:0" -> "fd10:3::1/112"
+    _subnets="${entry%:*}"
+    # Если нет лимита (нет :), то вся строка - подсеть
+    [ "$_subnets" = "$entry" ] && _subnets="$entry"
+    IFS=',' read -ra _sublist <<< "$_subnets"
+    for _s in "${_sublist[@]}"; do
+      _s="$(echo "$_s" | tr -d ' ')"
+      [ -z "$_s" ] && continue
+      if ! validate_subnet_mask "$_s"; then
+        _valid=0; break
       fi
     done
-    
-    # Если все подсети в правиле валидны — добавляем в список
-    if [ "$entry_valid" -eq 1 ]; then
-      VALID_SUBNETS_LIMITS+=("$entry")
-    fi
+    [ "$_valid" = "1" ] && VALID_SUBNETS_LIMITS+=("$entry")
   done
   
   # Если все правила отфильтрованы — выходим
@@ -2448,30 +2463,24 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
     echo "ℹ️  Лимиты скорости отключены (нет валидных правил)"
   fi
   
-  # Используем валидные правила вместо исходных
+  # SUBNETS_LIMITS уже валидирован при генерации - просто используем как есть
+  # Формат уже правильный: subnet:rate или subnet:rate_in:rate_out или subnet
   SUBNETS_LIMITS=("${VALID_SUBNETS_LIMITS[@]}")
   
-  # Проверяем есть ли хотя бы одно правило с лимитом
+  # Проверяем есть ли лимит - простой bash без Python
   HAS_ACTIVE_LIMIT=0
   for entry in "${SUBNETS_LIMITS[@]}"; do
-    _lim_raw=$(echo "$entry" | rev | cut -d':' -f1 | rev)
-    if echo "$_lim_raw" | grep -q ':'; then
-        _ld="${_lim_raw%%:*}"
-        _lu="${_lim_raw##*:}"
-    else
-        _ld="$_lim_raw"
-        _lu="$_lim_raw"
-    fi
-    [ "$_ld" = "0" ] && _ld="100000"
-    [ "$_lu" = "0" ] && _lu="100000"
-    if [ "$_ld" != "100000" ] || [ "$_lu" != "100000" ]; then
-      HAS_ACTIVE_LIMIT=1
-      break
-    fi
+    # getting rate after last colon works for IPv6 too!
+    _rate="${entry##*:}"
+    _rate="${_rate//[kmgtpKMGTP]/}"
+    case "$_rate" in
+      ''|*[!0-9]*) ;;
+      *) HAS_ACTIVE_LIMIT=1; break ;;
+    esac
   done
   
   # Если все лимиты = 0 — не создаём ifb
-  if [ "$HAS_ACTIVE_LIMIT" -eq 0 ]; then
+  if [ "${HAS_ACTIVE_LIMIT:-0}" = "0" ]; then
     echo "ℹ️  Все лимиты = 0, шейпинг отключен"
   fi
   
