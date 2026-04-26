@@ -366,11 +366,15 @@ atomic_ref_update() {
   local value="${3:-}"
   local lock_dir="${ref_file}.d"
   local attempts=0
+  
+  # Очищаем lock при EXIT, INT, TERM - критически важно!
+  trap 'rm -rf "$lock_dir" 2>/dev/null || true' EXIT INT TERM
 
   while ! mkdir "$lock_dir" 2>/dev/null; do
     attempts=$((attempts + 1))
     if [ "$attempts" -ge 30 ]; then
-      echo "⚠️ Блокировка $ref_file не получена за 3с — выполняем без неё..." >&2
+      echo "⚠️ Блокировка $ref_file не получена за 3с — удаляем сломанный lock и продолжаем..." >&2
+      rm -rf "$lock_dir" 2>/dev/null || true
       break
     fi
     sleep 0.1
@@ -1010,6 +1014,12 @@ fi
 # --- Настройка логирования ---
 LOG_DIR="$SCRIPT_DIR/.data/log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+# Загружаем conntrack helpers для Active FTP, SIP, TFTP - для работы PORT_FORWARD
+# Игнорируем ошибки если модули уже загружены или недоступны
+modprobe nf_conntrack_ftp 2>/dev/null || true
+modprobe nf_conntrack_sip 2>/dev/null || true
+modprobe nf_conntrack_tftp 2>/dev/null || true
 
 # Включаем логирование только если UPLOG=1
 if [ "$UPLOG" = "1" ]; then
@@ -2828,6 +2838,8 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
     echo "✅ Лимиты скорости настроены"
 fi
 echo "————————————————————————————————"
+
+exit 0
 '''
 
 #####################################################################################################################################################################################
