@@ -186,7 +186,6 @@ try:
 except: print(0)
 " 2>/dev/null
 }
-
 check_server_network() {
     is_network_address "$1" "$2"
 }
@@ -281,8 +280,8 @@ try:
     if isinstance(net, ipaddress.IPv4Network):
         ok = 8 <= net.prefixlen <= 32
     else:
-        # Для IPv6 разрешаем /104 до /128, но /112 допустима
-        ok = 104 <= net.prefixlen <= 128
+        # Для IPv6 разрешаем /96 до /128, но /112 допустима
+        ok = 96 <= net.prefixlen <= 128
     sys.exit(0 if ok else 1)
 except Exception as e:
     print(f'Ошибка проверки подсети: {e}', file=sys.stderr)
@@ -359,27 +358,100 @@ find_tun_from_map() {
   return 1
 }
 
-# Атомарное обновление reference count с mkdir-based блокировкой
+# Атомарное обновление reference count с PID-based mkdir блокировкой
+# Безопасная версия: проверяем жив ли процесс перед удалением lock
 atomic_ref_update() {
   local ref_file="$1"
   local operation="$2"
   local value="${3:-}"
   local lock_dir="${ref_file}.d"
-  local attempts=0
+  local pid_file="$lock_dir/pid"
+  local max_attempts=90
+  local attempt=0
   
-  # Очищаем lock при EXIT, INT, TERM - критически важно!
-  trap 'rm -rf "$lock_dir" 2>/dev/null || true' EXIT INT TERM
-
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    attempts=$((attempts + 1))
-    if [ "$attempts" -ge 30 ]; then
-      echo "⚠️ Блокировка $ref_file не получена за 3с — удаляем сломанный lock и продолжаем..." >&2
-      rm -rf "$lock_dir" 2>/dev/null || true
-      break
+  acquire_lock() {
+    if mkdir "$lock_dir" 2>/dev/null; then
+      echo "$$" > "$pid_file"
+      return 0
     fi
-    sleep 0.1
+    return 1
+  }
+  
+  check_and_cleanup_stale_lock() {
+    local locked_pid
+    locked_pid=$(cat "$pid_file" 2>/dev/null)
+    
+    if [ -z "$locked_pid" ]; then
+      rm -rf "$lock_dir" 2>/dev/null || true
+      return 1
+    fi
+    if ! kill -0 "$locked_pid" 2>/dev/null; then
+      rm -rf "$lock_dir" 2>/dev/null || true
+      return 1
+    fi
+    
+    return 2
+  }
+  
+  while [ $attempt -lt $max_attempts ]; do
+    attempt=$((attempt + 1))
+    
+    if acquire_lock; then
+      trap 'rm -rf "$lock_dir" 2>/dev/null || true' EXIT INT TERM
+      
+      local result=""
+      case "$operation" in
+        "inc")
+          local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+          result=$((cur + 1))
+          echo "$result" > "$ref_file"
+          ;;
+        "dec")
+          local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+          result=$((cur - 1))
+          echo "$result" > "$ref_file"
+          ;;
+        "get_inc")
+          local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+          result="$cur:$((cur + 1))"
+          echo "$((cur + 1))" > "$ref_file"
+          ;;
+        "get_dec")
+          local cur=$(cat "$ref_file" 2>/dev/null || echo "0")
+          result="$cur:$((cur - 1))"
+          echo "$((cur - 1))" > "$ref_file"
+          ;;
+        "set")
+          echo "$value" > "$ref_file"
+          result="$value"
+          ;;
+        "get")
+          result=$(cat "$ref_file" 2>/dev/null || echo "0")
+          ;;
+      esac
+      
+      rm -rf "$lock_dir" 2>/dev/null || true
+      echo "$result"
+      return 0
+    fi
+    
+    local check_result=0
+    check_and_cleanup_stale_lock || check_result=$?
+    
+    if [ $check_result -eq 1 ]; then
+      continue
+    elif [ $check_result -eq 2 ]; then
+      sleep 0.1
+      continue
+    fi
+    
+sleep 0.1
   done
-
+   
+  local locked_pid_final=$(cat "$pid_file" 2>/dev/null)
+  echo "⚠️ Lock для $ref_file занят процессом $locked_pid_final — принудительное удаление" >&2
+  rm -rf "$lock_dir" 2>/dev/null || true
+  
   local result=""
   case "$operation" in
     "inc")
@@ -410,9 +482,9 @@ atomic_ref_update() {
       result=$(cat "$ref_file" 2>/dev/null || echo "0")
       ;;
   esac
-
-  rm -rf "$lock_dir" 2>/dev/null || true
+  
   echo "$result"
+  return 0
 }
 
 # Парсинг WARP интерфейсов из записи WARP_LIST
@@ -463,18 +535,6 @@ is_flags_field() {
   return 1
 }
 
-# Проверка: является ли IP адресом сети (network address)
-check_server_network() {
-    python3 -c "
-import ipaddress, sys
-try:
-    ip = ipaddress.ip_address('$1')
-    net = ipaddress.ip_network('$2', strict=False)
-    print(1 if ip == net.network_address else 0)
-except: print(0)
-" 2>/dev/null
-}
-
 # Получение информации о подсети (кол-во адресов + префикс)
 get_subnet_info() {
     SUBNET_ARG="$1" python3 << PYEOF
@@ -488,20 +548,43 @@ PYEOF
  2>/dev/null
 }
 
-# Перечисление всех IP в подсети
+# Перечисление IP в подсети с предупреждением для больших подсетей
+# /8 для IPv4 (16M адресов), /96 для IPv6
+# tc создаёт 1 класс на каждый IP подсети
 list_subnet_ips() {
-    SUBNET_ARG="$1" python3 << PYEOF
+    local subnet="$1"
+    local max_prefixlen_ipv4=8
+    local max_prefixlen_ipv6=96
+    SUBNET_ARG="$subnet" MAX_V4="$max_prefixlen_ipv4" MAX_V6="$max_prefixlen_ipv6" python3 << PYEOF
 import ipaddress, os, sys
 try:
-    net = ipaddress.ip_network(os.environ.get('SUBNET_ARG', ''), strict=False)
+    subnet = os.environ.get('SUBNET_ARG', '')
+    max_v4 = int(os.environ.get('MAX_V4', 8))
+    max_v6 = int(os.environ.get('MAX_V6', 96))
+    net = ipaddress.ip_network(subnet, strict=False)
+    num_ips = net.num_addresses
+    
+    if ':' in subnet:
+        effective_limit = max_v6
+        limit_type = 'IPv6'
+    else:
+        effective_limit = max_v4
+        limit_type = 'IPv4'
+    if net.prefixlen > effective_limit:
+        print(f"# Подсеть {subnet} слишком большая (/{net.prefixlen} > /{effective_limit} для {limit_type})", file=sys.stderr)
+        print(f"# Максимум: {effective_limit} ({num_ips} адресов)", file=sys.stderr)
+        sys.exit(1)
+    if num_ips > 65536:
+        print(f"# ⚠️ Внимание: {subnet} содержит {num_ips} адресов - это может занять время", file=sys.stderr)
     for ip in net:
         print(ip)
-except:
+except Exception as e:
+    print(f"Ошибка: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
 }
 
-# Вычисление соотношений скоростей
+# Вычисление соотношений подсетей
 calc_subnet_ratios() {
     SUBNETS_ARG="$1" python3 << PYEOF
 import ipaddress, os
