@@ -152,9 +152,9 @@ PORT_FORWARDING_RULES=(
 # UPLOG=1 — включить лог для up скрипта
 # DOWNLOG=1 — включить лог для down скрипта
 # TESTLOG=1 — включить лог для проверочного скрипта
-UPLOG=0
-DOWNLOG=0
-TESTLOG=0
+UPLOG=1
+DOWNLOG=1
+TESTLOG=1
 
 # ==========================================
 # === Python Helpers (вся работа с IP) ===
@@ -2535,10 +2535,21 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   VALID_SUBNETS_LIMITS=()
   for entry in "${SUBNETS_LIMITS[@]}"; do
     _valid=1
-    # Подсети - всё до последнего : (${%:*} работает для IPv6!)
-    # "fd10:3::1/112:0" -> "fd10:3::1/112"
-    _subnets="${entry%:*}"
-    # Если нет лимита (нет :), то вся строка - подсеть
+    # Подсети - парсим с конца до mask (/prefix)
+    _subnets=$(python3 -c "
+import sys
+entry = sys.argv[1]
+last_slash = entry.rfind('/')
+rate_part = entry[last_slash+1:]
+colon_pos = rate_part.find(':')
+if colon_pos >= 0:
+    prefix = rate_part[:colon_pos]
+    subnet = entry[:last_slash] + '/' + prefix
+else:
+    # No rate - just subnet
+    subnet = entry
+print(subnet)
+" "$entry")
     [ "$_subnets" = "$entry" ] && _subnets="$entry"
     IFS=',' read -ra _sublist <<< "$_subnets"
     for _s in "${_sublist[@]}"; do
@@ -2554,17 +2565,33 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   # Если все правила отфильтрованы — выходим
   if [ ${#VALID_SUBNETS_LIMITS[@]} -eq 0 ]; then
     echo "ℹ️  Лимиты скорости отключены (нет валидных правил)"
-  fi
-  
+fi
+   
   # SUBNETS_LIMITS уже валидирован при генерации - просто используем как есть
   # Формат уже правильный: subnet:rate или subnet:rate_in:rate_out или subnet
   SUBNETS_LIMITS=("${VALID_SUBNETS_LIMITS[@]}")
   
-  # Проверяем есть ли лимит - простой bash без Python
+  # Проверяем есть ли лимит - парсим с конца до mask
   HAS_ACTIVE_LIMIT=0
   for entry in "${SUBNETS_LIMITS[@]}"; do
-    # getting rate after last colon works for IPv6 too!
-    _rate="${entry##*:}"
+    _rate=$(python3 -c "
+import sys
+entry = sys.argv[1]
+last_slash = entry.rfind('/')
+rate_part = entry[last_slash+1:]
+colon_pos = rate_part.find(':')
+if colon_pos >= 0:
+    prefix = rate_part[:colon_pos]
+    rate = rate_part[colon_pos+1:]
+else:
+    prefix = rate_part
+    rate = ''
+# Если есть rate И rate НЕ '0' - значит ЕСТЬ лимит
+if rate and rate != '0':
+    print('1')
+else:
+    print('0')
+" "$entry")
     _rate="${_rate//[kmgtpKMGTP]/}"
     case "$_rate" in
       ''|*[!0-9]*) ;;
@@ -2577,6 +2604,10 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
     echo "ℹ️  Все лимиты = 0, шейпинг отключен"
   fi
   
+  IFB_IN="ifb_${TUN_SAFE}_in"
+  IFB_OUT="ifb_${TUN_SAFE}_out"
+  IFB_MIX="ifb_${TUN_SAFE}_mix"
+
   if ! modprobe ifb; then
     echo "Ошибка: не удалось загрузить модуль ifb"
     exit 1
@@ -2586,16 +2617,8 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   ip link delete "$IFB_IN" 2>/dev/null || true
   ip link set "$IFB_OUT" down 2>/dev/null || true
   ip link delete "$IFB_OUT" 2>/dev/null || true
-  IFB_IN="ifb_${TUN_SAFE}_in"
-  IFB_OUT="ifb_${TUN_SAFE}_out"
-  IFB_MIX="ifb_${TUN_SAFE}_mix"
-
-  ip link add "$IFB_OUT" type ifb 2>/dev/null || true
-  ip link set "$IFB_OUT" up
-  ip link add "$IFB_IN" type ifb 2>/dev/null || true
-  ip link set "$IFB_IN" up
-  ip link add "$IFB_MIX" type ifb 2>/dev/null || true
-  ip link set "$IFB_MIX" up
+  ip link set "$IFB_MIX" down 2>/dev/null || true
+  ip link delete "$IFB_MIX" 2>/dev/null || true
 
   tc qdisc del dev "$TUN" root 2>/dev/null || true
   tc qdisc del dev "$TUN" handle ffff: ingress 2>/dev/null || true
@@ -2604,18 +2627,7 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   tc qdisc del dev "$IFB_MIX" root 2>/dev/null || true
 
   tc qdisc add dev "$TUN" root handle 1: htb
-  # Перенаправляем IPv4 трафик на ifb для ограничения
-  tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
-  # Перенаправляем IPv6 трафик на ifb для ограничения
-  tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
-  tc qdisc add dev "$IFB_OUT" root handle 1: htb default 1
   tc qdisc add dev "$TUN" handle ffff: ingress
-  # Перенаправляем входящий IPv4 трафик на ifb
-  tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
-  # Перенаправляем входящий IPv6 трафик на ifb
-  tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
-  tc qdisc add dev "$IFB_IN" root handle 1: htb default 1
-  tc qdisc add dev "$IFB_MIX" root handle 1: htb default 1
 
   # Проверяем, можно ли использовать IFB_MIX (все подсети с одинаковым download=upload)
   USE_IFB_MIX=0
@@ -2623,8 +2635,31 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
       _all_same=1
       _first_lim=""
       for _entry in "${SUBNETS_LIMITS[@]}"; do
-          _l=$(echo "$_entry" | rev | cut -d':' -f1 | rev)
-          if echo "$_l" | grep -q ':'; then
+          _l=$(python3 -c "
+import sys
+entry = sys.argv[1]
+# Найти последний '/' - это начало prefix
+last_slash = entry.rfind('/')
+rate_part = entry[last_slash+1:]  # "24:77" или "112:77" включая prefix
+
+# Отделить prefix от rate
+colon_pos = rate_part.find(':')
+if colon_pos >= 0:
+    prefix = rate_part[:colon_pos]  # "24" или "112"
+    rate = rate_part[colon_pos+1:]  # "77" или "77:77"
+else:
+    # Нет ':' - значит только prefix, нет rate (только подсеть)
+    prefix = rate_part
+    rate = ''
+
+# Если есть rate - значит ЕСТЬ лимит
+if rate:
+    print('1')
+else:
+    print('0')
+" "$_entry")
+
+          if [ "$_l" = "0" ]; then
               _all_same=0
               break
           fi
@@ -2637,17 +2672,59 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
               fi
           fi
       done
-      if [ "$_all_same" = "1" ] && [ "$_first_lim" != "0" ]; then
+
+      # Определяем MIX vs Separate для каждой подсети
+      for _entry in "${SUBNETS_LIMITS[@]}"; do
+          _is_sep=$(python3 -c "
+import sys
+entry = sys.argv[1]
+last_slash = entry.rfind('/')
+rate_part = entry[last_slash+1:]
+colon_pos = rate_part.find(':')
+if colon_pos >= 0:
+    rate = rate_part[colon_pos+1:]
+else:
+    rate = ''
+if ':' in rate:
+    print('separate')
+else:
+    print('mix')
+" "$_entry")
+
+          if [ "$_is_sep" = "separate" ]; then
+              _all_same=0
+              break
+          fi
+      done
+
+      # MIX только если ВСЕ имеют rate (=1) и все "mix" (не "separate")
+      if [ "$_all_same" = "1" ] && [ "$_first_lim" = "1" ]; then
           USE_IFB_MIX=1
       fi
   fi
 
-  # Перенаправляем трафик на IFB_MIX если все лимиты одинаковые
+  # Перенаправляем трафик на IFB (MIX или Separate)
   if [ "$USE_IFB_MIX" = "1" ]; then
+      # MIX mode: создаём только ifb_mix
+      ip link add "$IFB_MIX" type ifb 2>/dev/null || true
+      ip link set "$IFB_MIX" up
+      tc qdisc add dev "$IFB_MIX" root handle 1: htb default 1
       tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
       tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
       tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
       tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
+  else
+      # Separate mode: создаём ifb_out + ifb_in
+      ip link add "$IFB_OUT" type ifb 2>/dev/null || true
+      ip link set "$IFB_OUT" up
+      tc qdisc add dev "$IFB_OUT" root handle 1: htb default 1
+      ip link add "$IFB_IN" type ifb 2>/dev/null || true
+      ip link set "$IFB_IN" up
+      tc qdisc add dev "$IFB_IN" root handle 1: htb default 1
+      tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
+      tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
+      tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
+      tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
   fi
 
   # Парсим BRIDGE (формат: MAX_CLIENTS:BRIDGE_RATE:QUANT)
@@ -2687,14 +2764,25 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
   echo "📊 Установка лимитов скорости для подсетей"
   
   for entry in "${SUBNETS_LIMITS[@]}"; do
-      # Парсим лимиты (формат: "[MULTIPLIER:]subnet1, subnet2:LIM" или "[MULTIPLIER:]subnet:LIM_D:LIM_U")
-      # MULTIPLIER - умножает соотношение (опционально, по умолчанию 1)
-      # LIM_D:LIM_U - download:upload (если одно значение - общий лимит)
-      # 0 = безлимит
+      # Парсим лимиты (формат: "subnet1, subnet2:LIM" или "subnet1:LIM_D:LIM_U")
+      # Лимит - всё что ПОСЛЕДНЕГО '/' (mask) - prefix digits
+      _parsed=$(python3 -c "
+import sys
+entry = sys.argv[1]
+last_slash = entry.rfind('/')
+rate_part = entry[last_slash+1:]
+colon_pos = rate_part.find(':')
+if colon_pos >= 0:
+    prefix = rate_part[:colon_pos]
+    subnet = entry[:last_slash] + '/' + prefix
+    rate = rate_part[colon_pos+1:]
+    print(subnet + '|' + rate)
+else:
+    print(entry + '|0')
+" "$entry")
 
-      _lim_part=$(echo "$entry" | rev | cut -d':' -f1 | rev)
-      # Всё остальное — это список подсетей
-      SUBNETS_PART=$(echo "$entry" | rev | cut -d':' -f2- | rev)
+      _lim_part="${_parsed##*|}"
+      SUBNETS_PART="${_parsed%%|*}"
 
       # Парсим Download и Upload лимиты
       if echo "$_lim_part" | grep -q ':'; then
@@ -2708,10 +2796,6 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
       # Сохраняем оригинальные значения до замены
       _orig_down="$LIM_DOWN"
       _orig_up="$LIM_UP"
-
-      # 0 = безлимит (заменяем на большое число для создания классов)
-      [ "$LIM_DOWN" = "0" ] && LIM_DOWN="100000"
-      [ "$LIM_UP" = "0" ] && LIM_UP="100000"
 
       # Если оба лимита = 0, пропускаем всю группу
       if [ "$_orig_down" = "0" ] && [ "$_orig_up" = "0" ]; then
@@ -2754,8 +2838,8 @@ if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
           NUM_ADDRS=$(echo "$SUBNET_INFO" | cut -d':' -f1)
           PREFIXLEN=$(echo "$SUBNET_INFO" | cut -d':' -f2)
 
-_dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
-          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
+_dl="${_orig_down}"; [ "$_orig_down" = "100000" ] && _dl="∞"
+          _ul="${_orig_up}"; [ "$_orig_up" = "100000" ] && _ul="∞"
           if [ "$USE_IFB_MIX" = "1" ]; then
               echo "⚡ Одна подсеть: $SUBNET ($NUM_ADDRS IP) -> ${_dl}mbit (MIX)"
           else
@@ -2775,7 +2859,7 @@ _dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
                 major="${major_class}:"
 
                 if [ "$USE_IFB_MIX" = "1" ]; then
-                    if [ "$_create_down" = "1" ]; then
+                    if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
                         tc class add dev "$IFB_MIX" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                         if [ "$IP_VERSION" = "ipv6" ]; then
                             tc filter add dev "$IFB_MIX" protocol ipv6 parent ${major_class}: prio 1 u32 match ip6 dst $ip flowid $classid 2>/dev/null || true
@@ -2787,7 +2871,7 @@ _dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
                         tc qdisc add dev "$IFB_MIX" parent $classid fq_codel 2>/dev/null || true
                     fi
                 else
-                    if [ "$_create_down" = "1" ]; then
+                    if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
                         tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                         if [ "$IP_VERSION" = "ipv6" ]; then
                             tc filter add dev "$IFB_OUT" protocol ipv6 parent ${major_class}: prio 1 u32 match ip6 dst $ip flowid $classid 2>/dev/null || true
@@ -2796,7 +2880,7 @@ _dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
                         fi
                         tc qdisc add dev "$IFB_OUT" parent $classid fq_codel 2>/dev/null || true
                     fi
-                    if [ "$_create_up" = "1" ]; then
+                    if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
                         tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
                         if [ "$IP_VERSION" = "ipv6" ]; then
                             tc filter add dev "$IFB_IN" protocol ipv6 parent ${major_class}: prio 1 u32 match ip6 src $ip flowid $classid 2>/dev/null || true
@@ -2807,25 +2891,26 @@ _dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
                     fi
                 fi
             done
-_dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
-          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
-          if [ "$USE_IFB_MIX" = "1" ]; then
-              echo "✅ $SUBNET -> ${_dl}mbit (MIX)"
-          else
-              echo "✅ $SUBNET -> ↓${_dl}mbit ↑${_ul}mbit"
-          fi
+            _dl="${_orig_down}"
+            _ul="${_orig_up}"
+            if [ "$USE_IFB_MIX" = "1" ]; then
+                [ "$_orig_down" = "0" ] && echo "✅ $SUBNET -> ПРОПУЩЕН (MIX)" || echo "✅ $SUBNET -> ${_dl}mbit (MIX)"
+            else
+                [ "$_orig_down" = "0" ] && echo "✅ $SUBNET -> ↓ПРОПУЩЕН" || echo "✅ $SUBNET -> ↓${_dl}mbit"
+                [ "$_orig_up" = "0" ] && echo "✅ $SUBNET -> ↑ПРОПУЩЕН" || echo "✅ $SUBNET -> ↑${_ul}mbit"
+            fi
       else
 # Несколько подсетей — поддерживаем кратные соотношения
 # MULTIPLIER из Bash передаётся как параметр
 RATIO_INFO=$(calc_subnet_ratios "$SUBNETS_PART" "$SUBNETS_LIMITS_STR")
           NUM_CLASSES=$(echo "$RATIO_INFO" | cut -d'|' -f1)
 
-_dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
-          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
+          _dl="${_orig_down}"
+          _ul="${_orig_up}"
           if [ "$USE_IFB_MIX" = "1" ]; then
-              echo "⚡ Несколько подсетей: $SUBNETS_PART -> ${_dl}mbit (MIX) ($NUM_CLASSES классов)"
+              [ "$_orig_down" = "0" ] && echo "⚡ Несколько подсетей: $SUBNETS_PART -> ПРОПУЩЕН (MIX) ($NUM_CLASSES классов)" || echo "⚡ Несколько подсетей: $SUBNETS_PART -> ${_dl}mbit (MIX) ($NUM_CLASSES классов)"
           else
-              echo "⚡ Несколько подсетей: $SUBNETS_PART -> ↓${_dl}mbit ↑${_ul}mbit ($NUM_CLASSES классов)"
+              [ "$_orig_down" = "0" ] && echo "⚡ Несколько подсетей: $SUBNETS_PART -> ↓ПРОПУЩЕН ↑${_ul}mbit ($NUM_CLASSES классов)" || echo "⚡ Несколько подсетей: $SUBNETS_PART -> ↓${_dl}mbit ↑${_ul}mbit ($NUM_CLASSES классов)"
           fi
 
 for idx in $(seq 0 $((NUM_CLASSES - 1))); do
@@ -2839,14 +2924,14 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                 major="${major_class}:"
 
                 if [ "$USE_IFB_MIX" = "1" ]; then
-                    if [ "$_create_down" = "1" ]; then
+                    if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
                         tc class add dev "$IFB_MIX" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                     fi
                 else
-                    if [ "$_create_down" = "1" ]; then
+                    if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
                         tc class add dev "$IFB_OUT" parent $major classid $classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                     fi
-                    if [ "$_create_up" = "1" ]; then
+                    if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
                         tc class add dev "$IFB_IN" parent $major classid $classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
                     fi
                 fi
@@ -2909,8 +2994,8 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                   tc qdisc add dev "$IFB_IN" parent $classid fq_codel 2>/dev/null || true
               fi
           done
-          _dl="${LIM_DOWN}"; [ "$LIM_DOWN" = "100000" ] && _dl="∞"
-          _ul="${LIM_UP}"; [ "$LIM_UP" = "100000" ] && _ul="∞"
+          _dl="${_orig_down}"; [ "$_orig_down" = "100000" ] && _dl="∞"
+          _ul="${_orig_up}"; [ "$_orig_up" = "100000" ] && _ul="∞"
           if [ "$USE_IFB_MIX" = "1" ]; then
               echo "$SUBNETS_PART -> ${_dl}mbit (MIX)"
           else
