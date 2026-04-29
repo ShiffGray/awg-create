@@ -4669,7 +4669,7 @@ def _select_endpoint_from_api_result(result: dict) -> Optional[object]:
 def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", version: str = "AWG2.0", for_server: bool = True) -> Tuple[str, str]:
     """
     Генерация одного WARP-конфига (универсальная функция).
-    
+
     for_server=True  → Серверный WARP (с Table = off, для up/down скриптов)
     for_server=False → Клиентский WARP (без Table = off, для личного использования)
     """
