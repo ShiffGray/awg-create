@@ -61,7 +61,6 @@ g_endpoint_config_fn: pathlib.Path = SCRIPT_DIR.joinpath("_endpoint.config")
 g_allowedips_config_fn: pathlib.Path = SCRIPT_DIR.joinpath("_allowedips.config")
 
 g_main_config_fn: Optional[pathlib.Path] = None
-g_main_config_type: Optional[str] = None  # 'WG' или 'AWG'
 clients_for_zip: List[str] = []
 
 
@@ -2688,21 +2687,21 @@ else:
   fi
 
   if [ "$_needs_out" = "1" ]; then
-      # Separate mode: создаём ifb_out для download
+      # Separate mode: создаём ifb_out для download (ingress → parent ffff:)
       ip link add "$IFB_OUT" type ifb 2>/dev/null || true
       ip link set "$IFB_OUT" up
       tc qdisc add dev "$IFB_OUT" root handle 1: htb default 1
-      tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
-      tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
+      tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
+      tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
   fi
 
   if [ "$_needs_in" = "1" ]; then
-      # Separate mode: создаём ifb_in для upload
+      # Separate mode: создаём ifb_in для upload (egress → parent 1:)
       ip link add "$IFB_IN" type ifb 2>/dev/null || true
       ip link set "$IFB_IN" up
       tc qdisc add dev "$IFB_IN" root handle 1: htb default 1
-      tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
-      tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
+      tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
+      tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
   fi
 
   # Парсим BRIDGE (формат: MAX_CLIENTS:BRIDGE_RATE:QUANT)
@@ -4214,29 +4213,39 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
 
 # ----------------- Генерация ключей -----------------
 
-def gen_pair_keys(cfg_type: Optional[str] = None) -> Tuple[str, str]:
-    """Генерация пары ключей (PrivateKey + PublicKey) через wg/awg genkey."""
-    global g_main_config_type
-    if not cfg_type:
-        cfg_type = g_main_config_type
-    if not cfg_type:
-        raise RuntimeError("Неизвестный тип конфига для генерации ключей")
-    wgtool = "wg" if cfg_type.lower().startswith("w") else "awg"
-    rc, out = exec_cmd([wgtool, "genkey"])
-    if rc != 0 or not out:
-        # Fallback
-        if wgtool == "awg":
-            logger.warning("⚠  awg не найден, пробую wg...")
-            rc, out = exec_cmd(["wg", "genkey"])
-            wgtool = "wg"
-    if rc != 0 or not out:
-        raise RuntimeError(f"Не удалось сгенерировать приватный ключ через {wgtool}: {out.strip()}")
-    priv = out.strip()
-    rc, out = exec_cmd([wgtool, "pubkey"], input=priv + "\n")
-    if rc != 0 or not out:
-        raise RuntimeError(f"Не удалось сгенерировать публичный ключ через {wgtool}: {out.strip()}")
-    pub = out.strip()
-    return priv, pub
+def gen_pair_keys() -> Tuple[str, str]:
+    """Генерация пары ключей (PrivateKey + PublicKey) через awg > wg > Python."""
+    # Всегда сначала пробуем awg, потом wg, потом Python fallback
+    for wgtool in ["awg", "wg"]:
+        rc, out = exec_cmd([wgtool, "genkey"])
+        if rc == 0 and out:
+            priv = out.strip()
+            rc, out = exec_cmd([wgtool, "pubkey"], input=priv + "\n")
+            if rc == 0 and out:
+                return priv, out.strip()
+
+    # Python fallback через cryptography
+    try:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+        import base64
+        from cryptography.hazmat.primitives import serialization
+
+        priv_key = X25519PrivateKey.generate()
+        priv_bytes = priv_key.private_bytes(
+            encoding=serialization.Encoding.raw,
+            format=serialization.Format.raw,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        priv = base64.b64encode(priv_bytes).decode().rstrip('=')
+        pub_key = priv_key.public_key()
+        pub_bytes = pub_key.public_bytes(
+            encoding=serialization.Encoding.raw,
+            format=serialization.Format.raw
+        )
+        pub = base64.b64encode(pub_bytes).decode().rstrip('=')
+        return priv, pub
+    except ImportError:
+        raise RuntimeError("Не удалось сгенерировать ключи: нет awg/wg и нет cryptography")
 
 
 def gen_preshared_key() -> str:
@@ -4712,7 +4721,7 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
         proxies = {"http": proxy, "https": proxy}
 
     try:
-        priv_key, pub_key = gen_pair_keys("AWG")
+        priv_key, pub_key = gen_pair_keys()
         data = {
             "install_id": "",
             "tos": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -6008,7 +6017,7 @@ def _fill_client_obfuscation_params(out_base: str, client_obf_params: dict,
 # ----------------- Обработчики команд -----------------
 
 def handle_makecfg(opt) -> None:
-    global g_main_config_fn, g_main_config_type
+    global g_main_config_fn
 
     raw_input = opt.makecfg
 
@@ -6028,8 +6037,6 @@ def handle_makecfg(opt) -> None:
 
     if g_main_config_fn.exists():
         raise RuntimeError(f'Файл уже существует: {g_main_config_fn}')
-
-    mtype = "AWG" if g_main_config_fn.name.startswith("a") else "WG"
 
     # Используем указанный интерфейс или определяем автоматически
     if opt.iface:
@@ -6053,13 +6060,7 @@ def handle_makecfg(opt) -> None:
     warp_configs = _generate_warp_if_needed(tun_name, opt.warp, opt.mtu, opt.proxy, awg_version)
 
     # --- ТЕПЕРЬ СОЗДАЁМ СЕРВЕРНЫЙ КОНФИГ И СКРИПТЫ ---
-    priv, pub = gen_pair_keys(mtype)
-
-    # Для сервера mtype должен соответствовать версии
-    if awg_version == "WG":
-        mtype = "WG"
-    else:
-        mtype = "AWG"
+    priv, pub = gen_pair_keys()
 
     # Инициализируем random уникальным seed
     _init_random_seed()
@@ -6875,15 +6876,13 @@ def resolve_server_config_candidate(name: Optional[str]) -> Optional[str]:
 
 
 def get_main_config_path(check: bool = True, override: Optional[str] = None) -> Optional[str]:
-    global g_main_config_fn, g_main_config_type
+    global g_main_config_fn
     
     if override:
         resolved = resolve_server_config_candidate(override)
         if resolved:
             g_main_config_fn = pathlib.Path(resolved)
             init_interface_paths(g_main_config_fn.stem)
-
-            g_main_config_type = "AWG" if g_main_config_fn.name.startswith("a") else "WG"
             return str(g_main_config_fn)
         else:
             if check:
@@ -6911,7 +6910,6 @@ def get_main_config_path(check: bool = True, override: Optional[str] = None) -> 
         raise RuntimeError(f'Основной конфиг "{g_main_config_fn}" не найден')
         
     init_interface_paths(g_main_config_fn.stem)
-    g_main_config_type = "AWG" if g_main_config_fn.name.startswith("a") else "WG"
     return str(g_main_config_fn)
 
 
