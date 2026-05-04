@@ -4014,47 +4014,47 @@ def _generate_i_params() -> Dict[str, str]:
     """
     return {
         # I1: DNS (порт 53) — DNS запрос
-        # Реальный DNS запрос: 50-512 байт (в среднем 150-300 байт)
+        # Реальный DNS запрос: 50-512 байт (типичный 80-200)
         # Структура: Header (12) + Question (домен + тип) + Additional records
         "I1": generate_cps_packet(
             static_bytes="0x01",          # DNS query ID (первый байт)
-            static_bytes_range=15,        # 1-16 байт (база + расширения EDNS)
-            use_timestamp=False,          # DNS не всегда использует timestamp
-            random_bytes=40,              # Padding + дополнительные байты (40-80)
-            random_bytes_range=40,
-            random_ascii=80,              # Доменное имя + query (80-160 символов)
-            random_ascii_range=80,
-            random_digits=12,             # Transaction ID + flags + counts (12-20 цифр)
-            random_digits_range=8,        # 10/10 — реалистичный DNS
+            static_bytes_range=10,        # 1-11 байт (база + расширения EDNS)
+            use_timestamp=False,           # DNS не всегда использует timestamp
+            random_bytes=30,              # Padding + дополнительные байты (30-60)
+            random_bytes_range=30,
+            random_ascii=60,              # Доменное имя + query (60-120 символов)
+            random_ascii_range=60,
+            random_digits=10,             # Transaction ID + flags + counts (10-16 цифр)
+            random_digits_range=6,        # 10/10 — реалистичный DNS
         ),
 
         # I2: QUIC (порт 443) — QUIC Initial packet
-        # Реальный QUIC Initial: 200-1200 байт (в среднем 500-900 байт)
+        # Реальный QUIC Initial: 200-1200 байт (типичный 500-900)
         # Структура: Header (1) + Version (4) + Connection ID (8-20) + Token + Crypto data
         "I2": generate_cps_packet(
             static_bytes="0xc7",          # QUIC Initial packet type + version
-            static_bytes_range=30,        # 1-31 байт (header + version + extensions)
+            static_bytes_range=20,        # 1-21 байт (header + version + extensions)
             use_timestamp=True,           # QUIC использует timestamp для защиты от replay
-            random_bytes=150,             # Connection ID + token (150-250 байт)
-            random_bytes_range=100,
-            random_ascii=250,             # HTTP/3 заголовки + crypto data (250-500 символов)
-            random_ascii_range=250,
-            random_digits=15,             # Version, packet numbers, stream IDs (15-22 цифр)
-            random_digits_range=7,        # 10/10 — реалистичный QUIC
+            random_bytes=120,             # Connection ID + token (120-200 байт)
+            random_bytes_range=80,
+            random_ascii=180,             # HTTP/3 заголовки + crypto data (180-320 символов)
+            random_ascii_range=140,
+            random_digits=12,             # Version, packet numbers, stream IDs (12-18 цифр)
+            random_digits_range=6,         # 10/10 — реалистичный QUIC
         ),
 
         # I3: DTLS 1.2 (порт 443) — DTLS ClientHello
-        # Реальный DTLS ClientHello: 300-1200 байт (в среднем 600-1000 байт)
+        # Реальный DTLS ClientHello: 300-1200 байт (типичный 500-900)
         # Структура: Handshake (1) + Version (2) + Length (2) + Random (32) + Session ID + Cipher Suites + Certificates
         "I3": generate_cps_packet(
             static_bytes="0x16FEFD",      # Handshake (0x16) + DTLS 1.2 version (0xFEFD)
-            static_bytes_range=20,        # 3-23 байта (handshake + version + extensions)
+            static_bytes_range=15,        # 3-18 байт (handshake + version + extensions)
             use_timestamp=True,           # DTLS использует timestamp в handshake
-            random_bytes=100,             # ClientHello random + session ID (100-200 байт)
-            random_bytes_range=100,
-            random_ascii=350,             # Сертификаты (PEM base64), расширения (350-750 символов)
-            random_ascii_range=400,
-            random_digits=10,             # Version, sequence numbers, cipher suite IDs (10-16 цифр)
+            random_bytes=80,               # ClientHello random + session ID (80-150 байт)
+            random_bytes_range=70,
+            random_ascii=200,             # Сертификаты (PEM base64), расширения (200-400 символов)
+            random_ascii_range=200,
+            random_digits=8,              # Version, sequence numbers, cipher suite IDs (8-14 цифр)
             random_digits_range=6,        # 10/10 — реалистичный DTLS 1.2
         ),
 
@@ -4073,19 +4073,19 @@ def _generate_i_params() -> Dict[str, str]:
             random_digits_range=6,        # 10/10 — идеальный NTP (48 байт)
         ),
 
-        # I5: DTLS 1.3 (порт 443) — DTLS 1.3 ClientHello
-        # Реальный DTLS 1.3 ClientHello: 200-600 байт (в среднем 250-400 байт)
-        # Структура: Handshake (1) + Version (2) + Random (32) + Session ID + Cipher Suites + Extensions
+        # I5: Кастомный протокол со случайной сигнатурой
+        # Каждый раз генерируется новая сигнатура — выглядит как неизвестный/редкий UDP протокол
+        # DPI не знает что это — не может заблокировать
         "I5": generate_cps_packet(
-            static_bytes="0x16FEFF",      # Handshake (0x16) + DTLS 1.3 version (0xFEFF)
-            static_bytes_range=20,        # 3-23 байта (handshake + version + extensions)
-            use_timestamp=True,           # DTLS 1.3 использует timestamp
-            random_bytes=40,              # ClientHello random + session ID (40-80 байт)
+            static_bytes=f"0x{secrets.token_hex(2)}",  # 2 байта случайной сигнатуры (каждый раз новая)
+            static_bytes_range=2,                       # 2-4 байта (сигнатура + немного данных)
+            use_timestamp=False,
+            random_bytes=40,                           # Случайные данные (40-80)
             random_bytes_range=40,
-            random_ascii=120,             # Расширения (120-220 символов)
-            random_ascii_range=100,
-            random_digits=8,              # Version, sequence numbers, cipher suite IDs (8-16 цифр)
-            random_digits_range=8,        # 10/10 — реалистичный DTLS 1.3
+            random_ascii=50,                           # Дополнительные символы (50-100)
+            random_ascii_range=50,
+            random_digits=0,
+            random_digits_range=0,
         ),
     }
 
