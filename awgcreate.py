@@ -4318,48 +4318,62 @@ def get_main_iface() -> Optional[str]:
 def get_ext_ipaddr() -> str:
     """
     Получение внешнего IP адреса сервера.
-    
-    Использует несколько сервисов по порядку (fallback) пока не получит валидный IP.
-    Сервисы проверяются в порядке: icanhazip.com → api.ipify.org → ifconfig.me → checkip.amazonaws.com
-    
+
+    Приоритет: IPv4 → IPv6.
+    Сначала пробуем получить IPv4, только если не получилось — IPv6.
+
     Returns:
         str: Внешний IPv4 или IPv6 адрес сервера
-    
+
     Raises:
         RuntimeError: Если ни один сервис не ответил
     """
-    # Список сервисов для получения внешнего IP (по порядку)
+    # Все сервисы (проверяем в два прогона: сначала IPv4, потом IPv6)
     services = [
-        ("https://icanhazip.com", "text"),
-        ("https://api.ipify.org", "text"),
-        ("https://ifconfig.me/ip", "text"),
-        ("https://checkip.amazonaws.com", "text"),
+        "https://icanhazip.com",
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com",
+        "https://wtfismyip.com/text",
+        "https://api64.ipify.org",
     ]
-    
+
     last_error = None
-    
-    for service_url, service_type in services:
+
+    # Первый прогон: ищем IPv4
+    for service_url in services:
         try:
             r = requests.get(service_url, timeout=6)
             r.raise_for_status()
             ip = r.text.strip()
-            
-            # Проверяем что это валидный IP адрес
-            ipaddress.ip_address(ip)
-            
-            return ip
-            
+            addr = ipaddress.ip_address(ip)
+            if addr.version == 4:
+                return ip
         except requests.exceptions.RequestException as e:
-            # Ошибка сети — пробуем следующий сервис
             last_error = f"{service_url}: {e}"
             continue
-        except ValueError as e:
-            # Неверный формат IP — пробуем следующий сервис
+        except ValueError:
             last_error = f"{service_url}: неверный формат IP"
             continue
-    
+
+    # Второй прогон: ищем IPv6 (если первый неудался)
+    for service_url in services:
+        try:
+            r = requests.get(service_url, timeout=6)
+            r.raise_for_status()
+            ip = r.text.strip()
+            addr = ipaddress.ip_address(ip)
+            if addr.version == 6:
+                return ip
+        except requests.exceptions.RequestException as e:
+            last_error = f"{service_url}: {e}"
+            continue
+        except ValueError:
+            last_error = f"{service_url}: неверный формат IP"
+            continue
+
     # Ни один сервис не сработал
-    raise RuntimeError(f"Не удалось получить внешний IP ни из одного сервиса. Последняя ошибка: {last_error}")
+    raise RuntimeError(f"Не удалось получить внешний IP. Последняя ошибка: {last_error}")
 
 
 class IPAddr:
