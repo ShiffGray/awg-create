@@ -141,7 +141,7 @@ LAN_ALLOW=(
 )
 # --- Пробросы портов ---
 PORT_FORWARDING_RULES=(
-  #"ЛокальныйIPv4/+v6:ВнешнийПорт[-Диапазон][>ВнутреннийПорт[-Диапазон]][:[TCP]/+[UDP]][:SNAT][:Список_IPv4/+v6_подсетей]"
+  #"ЛокальныйIPv4'/+'[,v6]:ВнешнийПорт[-Диапазон][>ВнутреннийПорт[-Диапазон]][:[TCP]'/+'[,UDP]][:[SNAT]'/+'[,IFACE]][:[Список_IPv4]'/+'[,v6_подсетей]]"
   #"10.1.0.1:80:TCP"
   #"10.1.0.2:443:TCP:SNAT"
 )
@@ -1818,15 +1818,18 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
         fi
       done
 
-      # Считаем уникальных участников каждого типа
-      unset IPV4_UNIQUE IPV6_UNIQUE 2>/dev/null || true
-      declare -A IPV4_UNIQUE
-      declare -A IPV6_UNIQUE
+      # Считаем уникальных участников каждого типа (без declare -A для совместимости с bash < 4.0)
+      IPV4_UNIQUE=()
+      IPV6_UNIQUE=()
       for part in "${IPV4_PARTS[@]}"; do
-        IPV4_UNIQUE[$part]=1
+        skip=
+        for u in "${IPV4_UNIQUE[@]}"; do [ "$u" = "$part" ] && skip=1 && break; done
+        [ -z "$skip" ] && IPV4_UNIQUE+=("$part")
       done
       for part in "${IPV6_PARTS[@]}"; do
-        IPV6_UNIQUE[$part]=1
+        skip=
+        for u in "${IPV6_UNIQUE[@]}"; do [ "$u" = "$part" ] && skip=1 && break; done
+        [ -z "$skip" ] && IPV6_UNIQUE+=("$part")
       done
 
       # Универсальная функция обработки LAN_ALLOW группы для одного типа IP
@@ -1854,14 +1857,12 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
           echo "   Создание unicast правил для $LABEL пар..."
           for ((i=0; i<_parts_count; i++)); do
               for ((j=i+1; j<_parts_count; j++)); do
-                  local SRC DST SRC_CLEAN DST_CLEAN
+                  local SRC DST
                   eval "SRC=\${$_parts_name[$i]}"
                   eval "DST=\${$_parts_name[$j]}"
-                  SRC_CLEAN="${SRC%/*}"
-                  DST_CLEAN="${DST%/*}"
-                  echo "    $SRC_CLEAN ↔ $DST_CLEAN"
-                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC_CLEAN" -d "$DST_CLEAN" -j ACCEPT 2>/dev/null || true
-                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$DST_CLEAN" -d "$SRC_CLEAN" -j ACCEPT 2>/dev/null || true
+                  echo "    $SRC ↔ $DST"
+                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$SRC" -d "$DST" -j ACCEPT 2>/dev/null || true
+                  $IPT_CMD -I FORWARD -i "$TUN" -o "$TUN" -s "$DST" -d "$SRC" -j ACCEPT 2>/dev/null || true
               done
           done
 
@@ -1887,7 +1888,7 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
           else
               # Участников >1 — intra-subnet только для дублей
               local _unique_keys
-              eval "_unique_keys=\"\${!$_unique_name[@]}\""
+              eval "_unique_keys=\"\${$_unique_name[@]}\""
               for SUBNET in $_unique_keys; do
                   local COUNT=0
                   for part_idx in $(seq 0 $((_parts_count - 1))); do
@@ -2206,13 +2207,23 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
   PREV_IDX=$((NUM_FIELDS - 2))
   PREV_FIELD="${FIELDS[$PREV_IDX]}"
 
-  # Парсим с конца
-  if is_flags_field "$LAST_FIELD"; then
+  # Парсим с конца: сначала проверяем протокол, потом флаги
+  if is_proto_field "$LAST_FIELD"; then
+    # Последнее поле — протокол
+    PF_PROTO="$LAST_FIELD"
+    PF_PORT_PROTO="$PREV_FIELD"
+    # CLIENT_IP — всё до порта
+    CLIENT_IP=""
+    for ((i=0; i<NUM_FIELDS-2; i++)); do
+      [ $i -gt 0 ] && CLIENT_IP+=":"
+      CLIENT_IP+="${FIELDS[$i]}"
+    done
+  elif is_flags_field "$LAST_FIELD"; then
     # Последнее поле — FLAGS
     parse_flags "$LAST_FIELD"
     SNAT_REQUESTED="$PARSED_SNAT"
     INTERFACE="$PARSED_IFACE"
-    
+
     if is_proto_field "$PREV_FIELD"; then
       # :PORT:PROTO:FLAGS
       PF_PROTO="$PREV_FIELD"
@@ -2235,16 +2246,6 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         CLIENT_IP+="${FIELDS[$i]}"
       done
     fi
-  elif is_proto_field "$LAST_FIELD"; then
-    # Последнее поле — протокол
-    PF_PROTO="$LAST_FIELD"
-    PF_PORT_PROTO="$PREV_FIELD"
-    # CLIENT_IP — всё до порта
-    CLIENT_IP=""
-    for ((i=0; i<NUM_FIELDS-2; i++)); do
-      [ $i -gt 0 ] && CLIENT_IP+=":"
-      CLIENT_IP+="${FIELDS[$i]}"
-    done
   else
     # Последнее поле — порт (без протокола и FLAGS)
     PF_PROTO=""
@@ -2399,7 +2400,7 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
         RANGE_LEN=$((PF_PORT_EXT_END - PF_PORT_EXT_START))
         if [ $RANGE_LEN -ne $((PF_PORT_INT_END - PF_PORT_INT_START)) ]; then
           echo "Ошибка: диапазоны портов должны быть одинаковой длины для правила '$rule'"
-          continue
+          continue 3
         fi
         for ((i=0; i<=RANGE_LEN; i++)); do
           EXT_PORT=$((PF_PORT_EXT_START + i))
@@ -2633,7 +2634,8 @@ else:
   if [ "${HAS_ACTIVE_LIMIT:-0}" = "0" ]; then
     echo "ℹ️  Все лимиты = 0, шейпинг отключен"
   fi
-  
+
+  if [ "${HAS_ACTIVE_LIMIT:-0}" != "0" ]; then
   IFB_IN="ifb_${TUN_SAFE}_in"
   IFB_OUT="ifb_${TUN_SAFE}_out"
   IFB_MIX="ifb_${TUN_SAFE}_mix"
@@ -2722,20 +2724,7 @@ else:
       ip link add "$IFB_MIX" type ifb 2>/dev/null || true
       ip link set "$IFB_MIX" up
       tc qdisc add dev "$IFB_MIX" root handle 1: htb default 1
-      tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
-      tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
-      tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
-      tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX"
-      # Очистка старых ip rules перед добавлением новых
-      ip rule del from "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip rule del to "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip -6 rule del from "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
-      ip -6 rule del to "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
-      # Заставить ВЕСЬ VPN трафик (и входящий и исходящий) идти через TUN для лимитирования (до WARP маршрутизации)
-      ip rule add from "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip rule add to "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip -6 rule add from "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
-      ip -6 rule add to "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
+      # Per-subnet mirred добавляется отдельно для каждого правила SUBNETS_LIMITS
   fi
 
   if [ "$_needs_out" = "1" ]; then
@@ -2743,14 +2732,7 @@ else:
       ip link add "$IFB_OUT" type ifb 2>/dev/null || true
       ip link set "$IFB_OUT" up
       tc qdisc add dev "$IFB_OUT" root handle 1: htb default 1
-      tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
-      tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT"
-      # Очистка старых ip rules перед добавлением новых
-      ip rule del from "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip -6 rule del from "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
-      # Заставить VPN трафик (upload/egress) идти через TUN для лимитирования (до WARP маршрутизации)
-      ip rule add from "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip -6 rule add from "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
+      # Per-subnet mirred добавляется отдельно для каждого правила SUBNETS_LIMITS
   fi
 
   if [ "$_needs_in" = "1" ]; then
@@ -2758,14 +2740,7 @@ else:
       ip link add "$IFB_IN" type ifb 2>/dev/null || true
       ip link set "$IFB_IN" up
       tc qdisc add dev "$IFB_IN" root handle 1: htb default 1
-      tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
-      tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN"
-      # Очистка старых ip rules перед добавлением новых
-      ip rule del to "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip -6 rule del to "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
-      # Заставить VPN трафик (download/ingress) идти через TUN для лимитирования (до WARP маршрутизации)
-      ip rule add to "$TUN_SUBNET4" table main prio 100 2>/dev/null || true
-      ip -6 rule add to "$TUN_SUBNET6" table main prio 100 2>/dev/null || true
+      # Per-subnet mirred добавляется отдельно для каждого правила SUBNETS_LIMITS
   fi
 
   # Парсим BRIDGE (формат: MAX_CLIENTS:BRIDGE_RATE:QUANT)
@@ -2850,6 +2825,24 @@ else:
   _out_minor=1
   _in_minor=1
   _current_root_prio=99
+
+  # Catch-all mirred: трафик вне SUBNETS_LIMITS попадает на IFB_MIX (BRIDGE лимит)
+  # Per-subnet mirred внутри loop имеют приоритет (first-match-wins)
+  if [ "$_needs_mix" = "1" ]; then
+    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+  fi
+  if [ "$_needs_out" = "1" ]; then
+    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" 2>/dev/null || true
+    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" 2>/dev/null || true
+  fi
+  if [ "$_needs_in" = "1" ]; then
+    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" 2>/dev/null || true
+    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" 2>/dev/null || true
+  fi
+
   echo "📊 Установка лимитов скорости для подсетей"
 
   for entry in "${SUBNETS_LIMITS[@]}"; do
@@ -2918,116 +2911,141 @@ else:
         [ -n "$s" ] && SUBNET_ARRAY+=("$s")
       done
 
-      # Если только одна подсеть — создаём 1 класс на КАЖДЫЙ IP (без маскирования!)
-      if [ ${#SUBNET_ARRAY[@]} -eq 1 ]; then
-          SUBNET="${SUBNET_ARRAY[0]}"
-
-          # Определяем версию IP (IPv4 или IPv6)
-          if [[ "$SUBNET" == *:* ]]; then
-              IP_VERSION="ipv6"
-              PROTO_MATCH="ip6"
-          else
-              IP_VERSION="ip"
-              PROTO_MATCH="ip"
-          fi
-
-          # Получаем информацию о подсети через helper функцию
-          SUBNET_INFO=$(get_subnet_info "$SUBNET")
-          NUM_ADDRS=$(echo "$SUBNET_INFO" | cut -d':' -f1)
-          PREFIXLEN=$(echo "$SUBNET_INFO" | cut -d':' -f2)
-
-          # Принудительный перенос на новую иерархию для каждого правила
-          # Это разносит разные правила SUBNETS_LIMITS по разным иерархиям
-          _mix_client_num=0
-          _mix_major=$((_mix_major + 1))
-          _mix_minor=1
-          create_tc_hierarchy_for "$IFB_MIX" "$_mix_major" "$SUBNETS_PART"
-
-          # Одна подсеть = 1 класс на КАЖДЫЙ IP (без маскирования!)
-          IPS=$(list_subnet_ips "$SUBNET")
-
-          # Принудительный перенос на новую иерархию для separate режима (ОДИН раз на правило)
-          if [ "$_rule_type" != "mix" ]; then
-              _out_client_num=0
-              _out_major=$((_out_major + 1))
-              _out_minor=1
-              create_tc_hierarchy_for "$IFB_OUT" "$_out_major" "$SUBNETS_PART"
-              _in_client_num=0
-              _in_major=$((_in_major + 1))
-              _in_minor=1
-              create_tc_hierarchy_for "$IFB_IN" "$_in_major" "$SUBNETS_PART"
-          fi
-
-            for ip in $IPS; do
-                if [ "$_rule_type" = "mix" ]; then
-                    _mix_client_num=$((_mix_client_num + 1))
-                    _mix_major=$((_mix_major + (_mix_client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
-                    _mix_minor=$(((_mix_client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
-                    if [ "$_mix_major" -gt 2 ] && [ "$_mix_minor" -eq 1 ]; then
-                        create_tc_hierarchy_for "$IFB_MIX" "$_mix_major" "$SUBNETS_PART"
-                    fi
-                    _classid="${_mix_major}:${_mix_minor}"
-                    _major="${_mix_major}:"
-
-                    if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                        tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
-                        if [ "$IP_VERSION" = "ipv6" ]; then
-                            tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
-                            tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
-                        else
-                            tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $ip flowid $_classid 2>/dev/null || true
-                            tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $ip flowid $_classid 2>/dev/null || true
-                        fi
-                        tc qdisc add dev "$IFB_MIX" parent $_classid fq_codel 2>/dev/null || true
-                    fi
-                else
-                    _out_client_num=$((_out_client_num + 1))
-                    _out_major=$((_out_major + (_out_client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
-                    _out_minor=$(((_out_client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
-                    if [ "$_out_major" -gt 2 ] && [ "$_out_minor" -eq 1 ]; then
-                        create_tc_hierarchy_for "$IFB_OUT" "$_out_major" "$SUBNETS_PART"
-                    fi
-                    _classid="${_out_major}:${_out_minor}"
-                    _major="${_out_major}:"
-
-                    if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                        tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
-                        if [ "$IP_VERSION" = "ipv6" ]; then
-                            # OUT на parent 1: (egress) = download = dst клиента
-                            tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
-                        else
-                            tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $ip flowid $_classid 2>/dev/null || true
-                        fi
-                        tc qdisc add dev "$IFB_OUT" parent $_classid fq_codel 2>/dev/null || true
-                    fi
-
-                    _in_client_num=$((_in_client_num + 1))
-                    _in_major=$((_in_major + (_in_client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
-                    _in_minor=$(((_in_client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
-                    if [ "$_in_major" -gt 2 ] && [ "$_in_minor" -eq 1 ]; then
-                        create_tc_hierarchy_for "$IFB_IN" "$_in_major" "$SUBNETS_PART"
-                    fi
-                    _classid="${_in_major}:${_in_minor}"
-                    _major="${_in_major}:"
-
-                    if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
-                        tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
-                        if [ "$IP_VERSION" = "ipv6" ]; then
-                            # IN на parent ffff: (ingress) = upload = src клиента
-                            tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
-                        else
-                            tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $ip flowid $_classid 2>/dev/null || true
-                        fi
-                        tc qdisc add dev "$IFB_IN" parent $_classid fq_codel 2>/dev/null || true
-                    fi
-                fi
-            done
-            if [ "$_rule_type" = "mix" ]; then
-                echo "⚡ $SUBNET -> ${_orig_down}mbit (MIX)"
-            else
-                echo "⚡ $SUBNET -> ↓${_orig_down}mbit ↑${_orig_up}mbit"
+      # Per-subnet mirred на TUN: перенаправляем трафик ТОЛЬКО этих подсетей на нужные IFB
+      # Вместо старого catch-all (match u32 0 0), который забирал весь трафик
+      for _mirred_sub in "${SUBNET_ARRAY[@]}"; do
+        if [[ "$_mirred_sub" == *:* ]]; then
+            _mirred_proto="ipv6"
+            _mirred_match="ip6"
+        else
+            _mirred_proto="ip"
+            _mirred_match="ip"
+        fi
+        if [ "$_rule_type" = "mix" ]; then
+            # MIX: оба направления на IFB_MIX
+            tc filter add dev "$TUN" parent 1: protocol $_mirred_proto u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+            tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+        else
+            # Separate: OUT на parent 1: (egress=download=dst), IN на parent ffff: (ingress=upload=src)
+            if [ "$_create_down" = "1" ]; then
+                tc filter add dev "$TUN" parent 1: protocol $_mirred_proto u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_OUT" 2>/dev/null || true
             fi
+            if [ "$_create_up" = "1" ]; then
+                tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_IN" 2>/dev/null || true
+            fi
+        fi
+  done
+
+  # Если только одна подсеть — создаём 1 класс на КАЖДЫЙ IP (без маскирования!)
+  if [ ${#SUBNET_ARRAY[@]} -eq 1 ]; then
+      SUBNET="${SUBNET_ARRAY[0]}"
+
+      # Определяем версию IP (IPv4 или IPv6)
+      if [[ "$SUBNET" == *:* ]]; then
+          IP_VERSION="ipv6"
+          PROTO_MATCH="ip6"
       else
+          IP_VERSION="ip"
+          PROTO_MATCH="ip"
+      fi
+
+      # Получаем информацию о подсети через helper функцию
+      SUBNET_INFO=$(get_subnet_info "$SUBNET")
+      NUM_ADDRS=$(echo "$SUBNET_INFO" | cut -d':' -f1)
+      PREFIXLEN=$(echo "$SUBNET_INFO" | cut -d':' -f2)
+
+      # Принудительный перенос на новую иерархию для каждого правила
+      # Это разносит разные правила SUBNETS_LIMITS по разным иерархиям
+      _mix_client_num=0
+      _mix_major=$((_mix_major + 1))
+      _mix_minor=1
+      create_tc_hierarchy_for "$IFB_MIX" "$_mix_major" "$SUBNETS_PART"
+
+      # Одна подсеть = 1 класс на КАЖДЫЙ IP (без маскирования!)
+      IPS=$(list_subnet_ips "$SUBNET")
+
+      # Принудительный перенос на новую иерархию для separate режима (ОДИН раз на правило)
+      if [ "$_rule_type" != "mix" ]; then
+          _out_client_num=0
+          _out_major=$((_out_major + 1))
+          _out_minor=1
+          create_tc_hierarchy_for "$IFB_OUT" "$_out_major" "$SUBNETS_PART"
+          _in_client_num=0
+          _in_major=$((_in_major + 1))
+          _in_minor=1
+          create_tc_hierarchy_for "$IFB_IN" "$_in_major" "$SUBNETS_PART"
+      fi
+
+      for ip in $IPS; do
+          if [ "$_rule_type" = "mix" ]; then
+              _mix_client_num=$((_mix_client_num + 1))
+              _mix_major=$((_mix_major + (_mix_client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
+              _mix_minor=$(((_mix_client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
+              if [ "$_mix_major" -gt 2 ] && [ "$_mix_minor" -eq 1 ]; then
+                  create_tc_hierarchy_for "$IFB_MIX" "$_mix_major" "$SUBNETS_PART"
+              fi
+              _classid="${_mix_major}:${_mix_minor}"
+              _major="${_mix_major}:"
+
+              if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
+                  tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                  if [ "$IP_VERSION" = "ipv6" ]; then
+                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
+                  else
+                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $ip flowid $_classid 2>/dev/null || true
+                  fi
+                  tc qdisc add dev "$IFB_MIX" parent $_classid fq_codel 2>/dev/null || true
+              fi
+          else
+              _out_client_num=$((_out_client_num + 1))
+              _out_major=$((_out_major + (_out_client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
+              _out_minor=$(((_out_client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
+              if [ "$_out_major" -gt 2 ] && [ "$_out_minor" -eq 1 ]; then
+                  create_tc_hierarchy_for "$IFB_OUT" "$_out_major" "$SUBNETS_PART"
+              fi
+              _classid="${_out_major}:${_out_minor}"
+              _major="${_out_major}:"
+
+              if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
+                  tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                  if [ "$IP_VERSION" = "ipv6" ]; then
+                      # OUT на parent 1: (egress) = download = dst клиента
+                      tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
+                  else
+                      tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $ip flowid $_classid 2>/dev/null || true
+                  fi
+                  tc qdisc add dev "$IFB_OUT" parent $_classid fq_codel 2>/dev/null || true
+              fi
+
+              _in_client_num=$((_in_client_num + 1))
+              _in_major=$((_in_major + (_in_client_num - 1) / MAX_CLIENTS_PER_HIERARCHY))
+              _in_minor=$(((_in_client_num - 1) % MAX_CLIENTS_PER_HIERARCHY + 1))
+              if [ "$_in_major" -gt 2 ] && [ "$_in_minor" -eq 1 ]; then
+                  create_tc_hierarchy_for "$IFB_IN" "$_in_major" "$SUBNETS_PART"
+              fi
+              _classid="${_in_major}:${_in_minor}"
+              _major="${_in_major}:"
+
+              if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
+                  tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
+                  if [ "$IP_VERSION" = "ipv6" ]; then
+                      # IN на parent ffff: (ingress) = upload = src клиента
+                      tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
+                  else
+                      tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $ip flowid $_classid 2>/dev/null || true
+                  fi
+                  tc qdisc add dev "$IFB_IN" parent $_classid fq_codel 2>/dev/null || true
+              fi
+          fi
+      done
+      if [ "$_rule_type" = "mix" ]; then
+          echo "⚡ $SUBNET -> ${_orig_down}mbit (MIX)"
+      else
+          echo "⚡ $SUBNET -> ↓${_orig_down}mbit ↑${_orig_up}mbit"
+      fi
+  else
       # Принудительный перенос на новую иерархию для каждого правила
       # Это разносит разные правила SUBNETS_LIMITS по разным иерархиям
       _mix_client_num=0
@@ -3045,9 +3063,9 @@ else:
           create_tc_hierarchy_for "$IFB_IN" "$_in_major" "$SUBNETS_PART"
       fi
 
-# Несколько подсетей — поддерживаем кратные соотношения
-# MULTIPLIER из Bash передаётся как параметр
-RATIO_INFO=$(calc_subnet_ratios "$SUBNETS_PART" "$SUBNETS_LIMITS_STR")
+      # Несколько подсетей — поддерживаем кратные соотношения
+      # MULTIPLIER из Bash передаётся как параметр
+      RATIO_INFO=$(calc_subnet_ratios "$SUBNETS_PART" "$SUBNETS_LIMITS_STR")
           NUM_CLASSES=$(echo "$RATIO_INFO" | cut -d'|' -f1)
 
           # Подсчёт общего количества классов
@@ -3175,6 +3193,7 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
         fi
     done
     echo "✅ Лимиты скорости настроены"
+  fi
 fi
 echo "————————————————————————————————"
 
@@ -3359,6 +3378,7 @@ WARP_ACTIVE=0
 
 # СОХРАНЯЕМ список WARP интерфейсов ДО остановки (для последующей очистки!)
 declare -A STOPPED_WARP_INTERFACES
+declare -A STOPPED_WARP_ZERO_REFS
 for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   STOPPED_WARP_INTERFACES["$warp"]=1
 done
@@ -3379,6 +3399,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
 
     if [ "$ref_count" -le 1 ]; then
       # Последний пользователь — закрываем WARP (если он запущен)
+      STOPPED_WARP_ZERO_REFS["$warp"]=1
       if [ "$WARP_RUNNING" -eq 1 ]; then
         if awg-quick down "$warp" 2>/dev/null; then
           : # WARP остановлен
@@ -3405,6 +3426,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     fi
   else
     # .ref нет — проверяем запущен ли WARP и закрываем если да
+    STOPPED_WARP_ZERO_REFS["$warp"]=1
     if [ "$WARP_RUNNING" -eq 1 ]; then
       echo "⚠️  WARP $warp запущен но .ref не найден — очистка..."
       if awg-quick down "$warp" 2>/dev/null; then
@@ -3425,8 +3447,10 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     fi
   fi
 
-  # Удаляем .active файл (используется для отслеживания в up.sh)
-  rm -f "$STATE_BASE_DIR/warp/${warp}.active" 2>/dev/null || true
+  # Удаляем .active файл только если WARP реально остановлен (ref=0 или .ref не найден)
+  if [ "${STOPPED_WARP_ZERO_REFS["$warp"]+x}" = "x" ]; then
+    rm -f "$STATE_BASE_DIR/warp/${warp}.active" 2>/dev/null || true
+  fi
 done
 
 # Все переменные (TUN, IFACE, PORT, LOCAL_SUBNETS, WARP_LIST, LAN_ALLOW, INTERFACE_MAP, MARK_BASE)
@@ -3573,15 +3597,18 @@ if [ ${#STOPPED_WARP_INTERFACES[@]} -gt 0 ]; then
 fi
 
 # --- Очистка FORWARD и NAT для WARP (только для остановленных интерфейсов) ---
+# FORWARD правила туннель-специфичны (-i "$TUN") — чистим для всех WARP этого туннеля
 for warp in "${!STOPPED_WARP_INTERFACES[@]}"; do
   iptables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  # Удаляем ВСЕ MASQUERADE правила для этого интерфейса (не только первое)
-  while iptables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null; do :; done
 
   ip6tables -D FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
   ip6tables -D FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  # Удаляем ВСЕ MASQUERADE правила для этого интерфейса (не только первое)
+done
+
+# MASQUERADE правила ОБЩИЕ для всех туннелей (без -i) — чистим только когда ref=0
+for warp in "${!STOPPED_WARP_ZERO_REFS[@]}"; do
+  while iptables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null; do :; done
   while ip6tables -t nat -D POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null; do :; done
 done
 
@@ -3589,11 +3616,11 @@ done
 # Очищаем всегда, даже если WARP не активен (на случай если правила остались)
 # Используем обе команды для поддержки IPv4 и IPv6
 iptables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-iptables -t mangle -D PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+iptables -t mangle -D PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 iptables -t mangle -X "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
 ip6tables -t mangle -F "$RANDOM_WARP_CHAIN" 2>/dev/null || true
-ip6tables -t mangle -D PREROUTING -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
+ip6tables -t mangle -D PREROUTING -i "$TUN" -j "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 ip6tables -t mangle -X "$RANDOM_WARP_CHAIN" 2>/dev/null || true
 
 # --- Очистка FORWARD для трафика через WARP (IPv4) ---
@@ -3814,30 +3841,16 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
       fi
     done
 
-    # Считаем уникальных участников
-    unset IPV4_UNIQUE IPV6_UNIQUE 2>/dev/null || true
-    declare -A IPV4_UNIQUE
-    declare -A IPV6_UNIQUE
-    for part in "${IPV4_PARTS[@]}"; do
-      IPV4_UNIQUE[$part]=1
-    done
-    for part in "${IPV6_PARTS[@]}"; do
-      IPV6_UNIQUE[$part]=1
-    done
-
     # ОЧИСТКА INTRA-SUBNET (для дублей и одиночных участников)
     # IPv4 - очищаем ВСЕ комбинации src/dst
     if [ ${#IPV4_PARTS[@]} -ge 1 ] && [ -n "$MAIN_TUN" ]; then
       for src in "${IPV4_PARTS[@]}"; do
-        # Убираем маску для очистки (например 10.100.0.100/32 → 10.100.0.100)
-        src_clean="${src%/*}"
         # Очищаем intra-subnet правило (src=dst)
-        iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$src_clean" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$src" -j ACCEPT 2>/dev/null || true
         # Очищаем cross-subnet правила (src→dst для всех dst)
         for dst in "${IPV4_PARTS[@]}"; do
           if [ "$src" != "$dst" ]; then
-            dst_clean="${dst%/*}"
-            iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$dst_clean" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$dst" -j ACCEPT 2>/dev/null || true
           fi
         done
       done
@@ -3846,22 +3859,16 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
     # IPv6 - очищаем ВСЕ комбинации src/dst
     if [ ${#IPV6_PARTS[@]} -ge 1 ] && [ -n "$MAIN_TUN" ]; then
       for src in "${IPV6_PARTS[@]}"; do
-        # Убираем маску для очистки (например fe10:100::640/124 → fe10:100::640)
-        src_clean="${src%/*}"
         # Очищаем intra-subnet правило (src=dst)
-        ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$src_clean" -j ACCEPT 2>/dev/null || true
+        ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$src" -j ACCEPT 2>/dev/null || true
         # Очищаем cross-subnet правила (src→dst для всех dst)
         for dst in "${IPV6_PARTS[@]}"; do
           if [ "$src" != "$dst" ]; then
-            dst_clean="${dst%/*}"
-            ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src_clean" -d "$dst_clean" -j ACCEPT 2>/dev/null || true
+            ip6tables -D FORWARD -i "$MAIN_TUN" -o "$MAIN_TUN" -s "$src" -d "$dst" -j ACCEPT 2>/dev/null || true
           fi
         done
       done
     fi
-
-    unset IPV4_UNIQUE
-    unset IPV6_UNIQUE
 
     # ОЧИСТКА INTER-SUBNET (все пары одного типа)
     for ((i=0; i<${#PARTS_CLEAN[@]}; i++)); do
