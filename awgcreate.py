@@ -115,30 +115,25 @@ params_script_template = r'''#!/bin/bash
 PORT="<SERVER_PORT>"
 IFACE="<SERVER_IFACE>"
 TUN="<SERVER_TUN>"
+LOCAL_SUBNETS="<SERVER_ADDR>"
 
-# --- Подсеть ---
-LOCAL_SUBNETS="<SERVER_ADDR>"                                  # Подсеть VPN (пример: 10.1.0.0/23)
-
-# --- Ограничения скорости для подсетей ---
+# --- Лимиты скорости ---
 SUBNETS_LIMITS=(
   "<SERVER_ADDR>:<RATE_LIMIT>:<RATE_LIMIT>"
 )
 BRIDGE="9999:10000mbit:4400"
 
-# --- Список WARP-интерфейсов с маршрутизацией ---
-# Формат: "interface1,interface2=subnet1, subnet2" или "interface1,interface2" (для всего трафика)
-# Примеры:
-#   "warp0,warp1=100.24.0.0/13, 104.16.0.0/12"  # Группа WARP для конкретных подсетей
-#   "warp2,warp3"                                 # Группа WARP для всего остального
-#   "warp4=8.8.8.8, 1.1.1.1"                     # Одиночный WARP для DNS
-#   "none=192.168.0.0/16, 10.0.0.0/8"           # Подсети для прямого маршрута (мимо WARP)
+# --- WARP маршрутизация ---
+# "interface1[,interface2][=subnet1[,subnet2]]"
 WARP_LIST=(
 <WARP_LIST>
 )
-# --- Локальная сеть между клиентами ---
+
+# --- Группы локальных сетей ---
 LAN_ALLOW=(
   "<SERVER_ADDR>"
 )
+
 # --- Пробросы портов ---
 PORT_FORWARDING_RULES=(
   #"ЛокальныйIPv4'/+'[,v6]:ВнешнийПорт[-Диапазон][>ВнутреннийПорт[-Диапазон]][:[TCP]'/+'[,UDP]][:[SNAT]'/+'[,IFACE]][:[Список_IPv4]'/+'[,v6_подсетей]]"
@@ -147,13 +142,14 @@ PORT_FORWARDING_RULES=(
 )
 
 # --- Режим логирования ---
-# 0 = выключен (по умолчанию), 1 = включён
+# 0 = выключен, 1 = включён
 # UPLOG=1 — включить лог для up скрипта
 # DOWNLOG=1 — включить лог для down скрипта
 # TESTLOG=1 — включить лог для проверочного скрипта
 UPLOG=0
 DOWNLOG=0
 TESTLOG=0
+
 
 # ==========================================
 # === Python Helpers (вся работа с IP) ===
