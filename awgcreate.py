@@ -119,7 +119,7 @@ LOCAL_SUBNETS="<SERVER_ADDR>"
 
 # --- Лимиты скорости ---
 SUBNETS_LIMITS=(
-  "<SERVER_ADDR>:<RATE_LIMIT>:<RATE_LIMIT>"
+  "<SERVER_ADDR>:<RATE_LIMIT>"
 )
 BRIDGE="9999:10000mbit:4400"
 
@@ -2608,7 +2608,7 @@ fi
   for entry in "${SUBNETS_LIMITS[@]}"; do
     _rate=$(parse_entry "$entry" | cut -d'|' -f2)
     if [ -n "$_rate" ] && [ "$_rate" != "0" ]; then
-      _rate="${_rate//[kmgtpKMGTP]/}"
+      _rate="${_rate//[kmgtpKMGTP:]/}"
       case "$_rate" in
         ''|*[!0-9]*) ;;
         *) HAS_ACTIVE_LIMIT=1; break ;;
@@ -4069,127 +4069,99 @@ def _generate_h_params_ranges() -> Tuple[str, str, str, str]:
 
 
 def _generate_i_params() -> Dict[str, str]:
-    """Генерация I1-I5 (CPS-пакеты для маскировки под критическую инфраструктуру).
+    """Генерация I1-I5 (CPS-пакеты для маскировки под легитимные UDP протоколы).
 
-    I1-I5 — это ОТДЕЛЬНЫЕ пакеты-приманки (decoy packets) которые отправляются
-    ПЕРЕД настоящим WireGuard handshake для обхода DPI.
-
-    I1: DNS (порт 53)
-    I2: QUIC (порт 443) — Google, YouTube, Chrome
-    I3: DTLS 1.2 (порт 443) — WebRTC, Zoom, Teams
-    I4: NTP (порт 123) — синхронизация времени
-    I5: DTLS 1.3 (порт 443)
-
-    Используются все теги CPS по документации AmneziaWG:
-    - <b 0xHEX> — static bytes (сигнатура протокола, базовая + расширения)
-    - <t> — timestamp (4 байта Unix time)
-    - <r N> — N случайных байт (бинарные данные)
-    - <rc N> — N случайных букв/цифр [A-Za-z0-9]
-    - <rd N> — N случайных цифр [0-9]
-
-    Параметры подобраны для максимального сходства с реальными протоколами:
-    - DNS: 100-250 байт (реальный DNS запрос 50-512 байт)
-    - QUIC: 400-900 байт (реальный QUIC Initial 200-1200 байт)
-    - DTLS 1.2: 500-1000 байт (реальный DTLS ClientHello 300-1200 байт)
-    - NTP: 48 байт (фиксировано, как в реальности)
-    - DTLS 1.3: 200-400 байт (реальный DTLS 1.3 ClientHello 200-600 байт)
+    Из пула 6 протоколов (A-F) случайно выбирается 3-5 неповторяющихся
+    и распределяются в случайном порядке по I1-IN.
+    Генерируются ТОЛЬКО выбранные протоколы — без накладных расходов.
     """
-    return {
-        # I1: DNS (порт 53) — DNS запрос
-        # Реальный DNS запрос: 50-512 байт (типичный 80-200)
-        # Структура: Header (12) + Question (домен + тип) + Additional records
-        "I1": generate_cps_packet(
-            static_bytes="0x01",          # DNS query ID (первый байт)
-            static_bytes_range=10,        # 1-11 байт (база + расширения EDNS)
-            use_timestamp=False,           # DNS не всегда использует timestamp
-            random_bytes=30,              # Padding + дополнительные байты (30-60)
-            random_bytes_range=30,
-            random_ascii=60,              # Доменное имя + query (60-120 символов)
-            random_ascii_range=60,
-            random_digits=10,             # Transaction ID + flags + counts (10-16 цифр)
-            random_digits_range=6,        # 10/10 — реалистичный DNS
-        ),
+    # Пул протоколов в виде функций — генерируется только при вызове
+    def _gen_dns():
+        return generate_cps_packet(
+            static_bytes="0x01", static_bytes_range=10, use_timestamp=False,
+            random_bytes=30, random_bytes_range=30,
+            random_ascii=60, random_ascii_range=60,
+            random_digits=10, random_digits_range=6,
+        )
 
-        # I2: QUIC (порт 443) — QUIC Initial packet
-        # Реальный QUIC Initial: 200-1200 байт (типичный 500-900)
-        # Структура: Header (1) + Version (4) + Connection ID (8-20) + Token + Crypto data
-        "I2": generate_cps_packet(
-            static_bytes="0xc7",          # QUIC Initial packet type + version
-            static_bytes_range=20,        # 1-21 байт (header + version + extensions)
-            use_timestamp=True,           # QUIC использует timestamp для защиты от replay
-            random_bytes=120,             # Connection ID + token (120-200 байт)
-            random_bytes_range=80,
-            random_ascii=180,             # HTTP/3 заголовки + crypto data (180-320 символов)
-            random_ascii_range=140,
-            random_digits=12,             # Version, packet numbers, stream IDs (12-18 цифр)
-            random_digits_range=6,         # 10/10 — реалистичный QUIC
-        ),
+    def _gen_quic():
+        return generate_cps_packet(
+            static_bytes="0xc7", static_bytes_range=20, use_timestamp=True,
+            random_bytes=120, random_bytes_range=80,
+            random_ascii=180, random_ascii_range=140,
+            random_digits=12, random_digits_range=6,
+        )
 
-        # I3: DTLS 1.2 (порт 443) — DTLS ClientHello
-        # Реальный DTLS ClientHello: 300-1200 байт (типичный 500-900)
-        # Структура: Handshake (1) + Version (2) + Length (2) + Random (32) + Session ID + Cipher Suites + Certificates
-        "I3": generate_cps_packet(
-            static_bytes="0x16FEFD",      # Handshake (0x16) + DTLS 1.2 version (0xFEFD)
-            static_bytes_range=15,        # 3-18 байт (handshake + version + extensions)
-            use_timestamp=True,           # DTLS использует timestamp в handshake
-            random_bytes=80,               # ClientHello random + session ID (80-150 байт)
-            random_bytes_range=70,
-            random_ascii=200,             # Сертификаты (PEM base64), расширения (200-400 символов)
-            random_ascii_range=200,
-            random_digits=8,              # Version, sequence numbers, cipher suite IDs (8-14 цифр)
-            random_digits_range=6,        # 10/10 — реалистичный DTLS 1.2
-        ),
+    def _gen_dtls():
+        return generate_cps_packet(
+            static_bytes="0x16FEFD", static_bytes_range=15, use_timestamp=True,
+            random_bytes=80, random_bytes_range=70,
+            random_ascii=200, random_ascii_range=200,
+            random_digits=8, random_digits_range=6,
+        )
 
-        # I4: NTP (порт 123) — NTP пакет
-        # Реальный NTP пакет: 48 байт (фиксировано)
-        # Структура: LI+VN+Mode (1) + Stratum (1) + Poll (1) + Precision (1) + Timestamps (32) + Extension Fields + ...
-        "I4": generate_cps_packet(
-            static_bytes="0x1B",          # LEAP=0, Version=3, Mode=3 (клиент)
-            static_bytes_range=3,         # 1-4 байта (база + NTP расширения)
-            use_timestamp=True,           # NTP основан на timestamp (время отправки)
-            random_bytes=0,               # В NTP нет случайных байт
-            random_bytes_range=0,
-            random_ascii=0,               # В NTP нет текстовых полей
-            random_ascii_range=0,
-            random_digits=42,             # Stratum, poll, precision, timestamps (42-48 цифр)
-            random_digits_range=6,        # 10/10 — идеальный NTP (48 байт)
-        ),
+    def _gen_ntp():
+        return generate_cps_packet(
+            static_bytes="0x1B", static_bytes_range=3, use_timestamp=True,
+            random_bytes=0, random_bytes_range=0,
+            random_ascii=0, random_ascii_range=0,
+            random_digits=42, random_digits_range=6,
+        )
 
-        # I5: Кастомный протокол со случайной сигнатурой
-        # Каждый раз генерируется новая сигнатура — выглядит как неизвестный/редкий UDP протокол
-        # DPI не знает что это — не может заблокировать
-        "I5": generate_cps_packet(
-            static_bytes=f"0x{secrets.token_hex(2)}",  # 2 байта случайной сигнатуры (каждый раз новая)
-            static_bytes_range=2,                       # 2-4 байта (сигнатура + немного данных)
-            use_timestamp=False,
-            random_bytes=40,                           # Случайные данные (40-80)
-            random_bytes_range=40,
-            random_ascii=50,                           # Дополнительные символы (50-100)
-            random_ascii_range=50,
-            random_digits=0,
-            random_digits_range=0,
-        ),
-    }
+    def _gen_random():
+        return generate_cps_packet(
+            static_bytes=f"0x{secrets.token_hex(2)}", static_bytes_range=2, use_timestamp=False,
+            random_bytes=40, random_bytes_range=40,
+            random_ascii=50, random_ascii_range=50,
+            random_digits=0, random_digits_range=0,
+        )
+
+    def _gen_srtp():
+        return generate_cps_packet(
+            static_bytes="0x8060", static_bytes_range=4, use_timestamp=True,
+            random_bytes=20, random_bytes_range=60,
+            random_ascii=0, random_ascii_range=0,
+            random_digits=8, random_digits_range=4,
+        )
+
+    pool_fns = [_gen_dns, _gen_quic, _gen_dtls, _gen_ntp, _gen_random, _gen_srtp]
+
+    # Случайное количество: 3-5
+    count = random.randint(3, 5)
+
+    # Выбираем count неповторяющихся функций и вызываем их
+    selected = [fn() for fn in random.sample(pool_fns, count)]
+
+    # Перемешиваем порядок уже сгенерированных пакетов
+    random.shuffle(selected)
+
+    # Распределяем по I1-IN
+    result = {}
+    for i, packet in enumerate(selected, start=1):
+        result[f"I{i}"] = packet
+
+    return result
 
 
 
-def generate_all_params(version: str, for_client: bool = False, for_server: bool = True) -> dict:
+def generate_all_params(version: str, for_client: bool = False, for_server: bool = True, for_warp: bool = False) -> dict:
     """
     УНИВЕРСАЛЬНАЯ ФУНКЦИЯ — генерирует ВСЕ параметры обфускации сразу.
 
     Возвращает полный набор параметров, но неподдерживаемые версии = None.
 
     Таблица реализации:
-    ┌────────┬──────────────┬───────────────┬──────────────┬────────────┬──────────────┐
-    │ Версия │ Jc,Jmin,Jmax │ S1,S2         │ H1-H4        │ I1-I5      │ S3,S4        │
-    ├────────┼──────────────┼───────────────┼──────────────┼────────────┼──────────────┤
-    │ WG     │ - коммент    │ - коммент     │ - коммент    │ - коммент  │ - коммент    │
-    │ AWG    │ + разные     │ + одинаковые  │ - коммент    │ - коммент  │ - коммент    │
-    │ AWG1.0 │ + разные     │ + одинаковые  │ + статичные  │ - коммент  │ - коммент    │
-    │ AWG1.5 │ + разные     │ + одинаковые  │ + статичные  │ + клиент   │ - коммент    │
-    │ AWG2.0 │ + разные     │ + одинаковые  │ + диапазоны  │ + клиент   │ + одинаковые │
-    └────────┴──────────────┴───────────────┴──────────────┴────────────┴──────────────┘
-
+Эта таблица описывает сервер/клиент
+┌────────┬──────────────┬───────────────┬──────────────┬────────────┬──────────────┐
+│ Версия │ Jc,Jmin,Jmax │ S1,S2         │ H1-H4        │ I1-I5      │ S3,S4        │
+├────────┼──────────────┼───────────────┼──────────────┼────────────┼──────────────┤
+│ WG     │ - коммент    │ - коммент     │ - коммент    │ - коммент  │ - коммент    │
+│ AWG    │ + разные     │ + одинаковые  │ - коммент    │ - коммент  │ - коммент    │
+│ AWG1.0 │ + разные     │ + одинаковые  │ + статичные  │ - коммент  │ - коммент    │
+│ AWG1.5 │ + разные     │ + одинаковые  │ + статичные  │ + клиент   │ - коммент    │
+│ AWG2.0 │ + разные     │ + одинаковые  │ + диапазоны  │ + клиент   │ + одинаковые │
+└────────┴──────────────┴───────────────┴──────────────┴────────────┴──────────────┘
+Эта таблица описывает сервер/клиент, warp сервер/клиент
 ┌────────┬───────────────────┬────────────────────────────┬────────────────────────────┬────────────────────┬────────────────────────────┐
 │ Версия │ Jc,Jmin,Jmax      │ S1,S2                      │ H1-H4                      │ I1-I5              │ S3,S4                      │
 ├────────┼───────────────────┼────────────────────────────┼────────────────────────────┼────────────────────┼────────────────────────────┤
@@ -4232,64 +4204,59 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
     if supports_jc:
         result.update({"Jc": Jc, "Jmin": Jmin, "Jmax": Jmax})
     else:
-        if for_server:
+        if for_server and not for_warp:
             result.update({"Jc": Jc, "Jmin": Jmin, "Jmax": Jmax, "_J_comment": "AWG+"})
         else:
             result.update({"Jc": None, "Jmin": None, "Jmax": None})
 
-    # S1, S2
-    if supports_s1_s2:
-        # Клиент читает S1, S2 из серверного конфига
-        if for_server:
-            result.update({"S1": S1, "S2": S2})
-        else:
-            result.update({"S1": None, "S2": None})
+    # S1, S2 — не генерируются для WARP
+    if supports_s1_s2 and not for_warp:
+        # с/к:одинаковые — клиент получает те же значения
+        result.update({"S1": S1, "S2": S2})
     else:
-        if for_server:
+        if for_server and not for_warp:
             result.update({"S1": S1, "S2": S2, "_S12_comment": "AWG+"})
         else:
             result.update({"S1": None, "S2": None})
 
-    # S3, S4
-    if supports_s3_s4:
-        # AWG2.0 поддерживает S3, S4, но клиент читает их из серверного конфига
-        if for_server:
-            result.update({"S3": S3, "S4": S4})
-        else:
-            result.update({"S3": None, "S4": None})
+    # S3, S4 — не генерируются для WARP
+    if supports_s3_s4 and not for_warp:
+        # с/к:одинаковые — клиент получает те же значения
+        result.update({"S3": S3, "S4": S4})
     else:
-        if for_server:
+        if for_server and not for_warp:
             result.update({"S3": S3, "S4": S4, "_S34_comment": "AWG2.0"})
         else:
             result.update({"S3": None, "S4": None})
 
-    # H1-H4
-    if supports_h:
-        # Клиент читает H1-H4 из серверного конфига
-        if for_server:
-            result.update({"H1": H1, "H2": H2, "H3": H3, "H4": H4})
-        else:
-            result.update({"H1": None, "H2": None, "H3": None, "H4": None})
+    # H1-H4 — не генерируются для WARP
+    if supports_h and not for_warp:
+        # с/к:одинаковые — клиент получает те же значения
+        result.update({"H1": H1, "H2": H2, "H3": H3, "H4": H4})
     else:
-        if for_server:
+        if for_server and not for_warp:
             result.update({"H1": H1, "H2": H2, "H3": H3, "H4": H4, "_H_comment": "AWG1.0+"})
         else:
             result.update({"H1": None, "H2": None, "H3": None, "H4": None})
 
-    # I1-I5 — генерируем всегда для сервера, чтобы были закомментированные значения
-    if supports_i or for_server:
-        i_params = _generate_i_params()
-        if supports_i:
-            result.update(i_params)
-        else:
-            # WG, AWG, AWG1.0 — закомментированные значения
-            result.update({
-                "I1": i_params["I1"], "I2": i_params["I2"], "I3": i_params["I3"],
-                "I4": i_params["I4"], "I5": i_params["I5"]
-            })
+    # I1-I5 — пакеты-приманки
+    # AWG1.5, AWG2.0: активные значения для всех конфигов
+    # WG, AWG, AWG1.0: коммент для сервера, нет для клиента/WARP
+    if supports_i:
+        result.update(_generate_i_params())
     else:
-        # Клиент без I1-I5
-        result.update({"I1": None, "I2": None, "I3": None, "I4": None, "I5": None})
+        if for_server and not for_warp:
+            i_params = _generate_i_params()
+            result.update({
+                "I1": i_params.get("I1"),
+                "I2": i_params.get("I2"),
+                "I3": i_params.get("I3"),
+                "I4": i_params.get("I4"),
+                "I5": i_params.get("I5"),
+                "_I_comment": "AWG1.5+"
+            })
+        else:
+            result.update({"I1": None, "I2": None, "I3": None, "I4": None, "I5": None})
 
     return result
 
@@ -4891,7 +4858,8 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
 
     # Генерируем все параметры обфускации через общую функцию
     # WARP это клиентский конфиг, поэтому for_client=True
-    warp_obf_params = generate_all_params(version, for_client=True, for_server=False)
+    # for_warp=True — чтобы соответствовать таблице (S1,S2, H1-H4, S3,S4 = нет для WARP)
+    warp_obf_params = generate_all_params(version, for_client=True, for_server=False, for_warp=True)
 
     persistent_keepalive = _generate_persistent_keepalive()
     out = g_warp_config
@@ -4916,11 +4884,12 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
 
     # I1-I5
     if warp_obf_params.get("I1") is not None:
-        out = out.replace("<I1_LINE>", f"I1 = {warp_obf_params['I1']}\n")
-        out = out.replace("<I2_LINE>", f"I2 = {warp_obf_params['I2']}\n")
-        out = out.replace("<I3_LINE>", f"I3 = {warp_obf_params['I3']}\n")
-        out = out.replace("<I4_LINE>", f"I4 = {warp_obf_params['I4']}\n")
-        out = out.replace("<I5_LINE>", f"I5 = {warp_obf_params['I5']}\n")
+        for i in range(1, 6):
+            key = f"I{i}"
+            if warp_obf_params.get(key):
+                out = out.replace(f"<{key}_LINE>", f"{key} = {warp_obf_params[key]}\n")
+            else:
+                out = out.replace(f"<{key}_LINE>", "")
     else:
         # Без I1-I5 для WG, AWG, AWG1.0 — удаляем всё включая переносы
         out = out.replace("<I1_LINE>", "")
@@ -5562,19 +5531,21 @@ def _fill_obfuscation_params(out: str, obf_params: dict) -> str:
 
     # I1-I5
     if obf_params.get("I1") and not obf_params.get("_I_comment"):
-        # AWG1.5, AWG2.0 — активные I1-I5
-        out = out.replace("<I1_LINE>", f"I1 = {obf_params['I1']}\n")
-        out = out.replace("<I2_LINE>", f"I2 = {obf_params['I2']}\n")
-        out = out.replace("<I3_LINE>", f"I3 = {obf_params['I3']}\n")
-        out = out.replace("<I4_LINE>", f"I4 = {obf_params['I4']}\n")
-        out = out.replace("<I5_LINE>", f"I5 = {obf_params['I5']}\n")
+        # AWG1.5, AWG2.0 — активные I1-I5 (поштучно)
+        for i in range(1, 6):
+            key = f"I{i}"
+            if obf_params.get(key):
+                out = out.replace(f"<{key}_LINE>", f"{key} = {obf_params[key]}\n")
+            else:
+                out = out.replace(f"<{key}_LINE>", "")
     elif obf_params.get("I1"):
-        # WG, AWG, AWG1.0 — закомментированные значения (без комментария версии)
-        out = out.replace("<I1_LINE>", f"# I1 = {obf_params['I1']}\n")
-        out = out.replace("<I2_LINE>", f"# I2 = {obf_params['I2']}\n")
-        out = out.replace("<I3_LINE>", f"# I3 = {obf_params['I3']}\n")
-        out = out.replace("<I4_LINE>", f"# I4 = {obf_params['I4']}\n")
-        out = out.replace("<I5_LINE>", f"# I5 = {obf_params['I5']}\n")
+        # WG, AWG, AWG1.0 — закомментированные значения (поштучно)
+        for i in range(1, 6):
+            key = f"I{i}"
+            if obf_params.get(key):
+                out = out.replace(f"<{key}_LINE>", f"# {key} = {obf_params[key]}\n")
+            else:
+                out = out.replace(f"<{key}_LINE>", "")
     else:
         # Клиент без I1-I5
         out = out.replace("<I1_LINE>", "")
@@ -6095,11 +6066,12 @@ def _fill_client_obfuscation_params(out_base: str, client_obf_params: dict,
 
     # I1-I5
     if client_obf_params.get("I1") is not None:
-        out_base = out_base.replace("<I1_LINE>", f"I1 = {client_obf_params['I1']}\n")
-        out_base = out_base.replace("<I2_LINE>", f"I2 = {client_obf_params['I2']}\n")
-        out_base = out_base.replace("<I3_LINE>", f"I3 = {client_obf_params['I3']}\n")
-        out_base = out_base.replace("<I4_LINE>", f"I4 = {client_obf_params['I4'] if client_obf_params['I4'] else ''}\n")
-        out_base = out_base.replace("<I5_LINE>", f"I5 = {client_obf_params['I5'] if client_obf_params['I5'] else ''}\n")
+        for i in range(1, 6):
+            key = f"I{i}"
+            if client_obf_params.get(key):
+                out_base = out_base.replace(f"<{key}_LINE>", f"{key} = {client_obf_params[key]}\n")
+            else:
+                out_base = out_base.replace(f"<{key}_LINE>", "")
     else:
         out_base = out_base.replace("<I1_LINE>", "")
         out_base = out_base.replace("<I2_LINE>", "")
