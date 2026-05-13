@@ -117,6 +117,7 @@ IFACE="<SERVER_IFACE>"
 TUN="<SERVER_TUN>"
 LOCAL_SUBNETS="<SERVER_ADDR>"
 
+
 # --- Лимиты скорости ---
 SUBNETS_LIMITS=(
   "<SERVER_ADDR>:<RATE_LIMIT>"
@@ -140,6 +141,7 @@ PORT_FORWARDING_RULES=(
   #"10.1.0.1:80:TCP"
   #"10.1.0.2:443:TCP:SNAT"
 )
+
 
 # --- Режим логирования ---
 # 0 = выключен, 1 = включён
