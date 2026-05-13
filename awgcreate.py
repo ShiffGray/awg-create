@@ -668,7 +668,10 @@ else:
 
 # === Конец Python Helpers ===
 
-# === Bash Helpers (общие для up/down/check) ===
+
+# ==========================================
+# === Bash Helpers  ===
+# ==========================================
 
 # Вычисление MARK_BASE из имени туннеля
 calc_mark_base() {
@@ -708,6 +711,7 @@ parse_local_subnets() {
 }
 
 # === Конец Bash Helpers ===
+
 
 # ================================================================
 # === ПРОВЕРОЧНЫЙ СКРИПТ (запускается при прямом вызове bash) ===
@@ -2060,10 +2064,7 @@ cp "$PARAMS_FILE" "$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh" 2>/dev/null || true
 
 # IPv4 Broadcast
 if [ -n "$LOCAL_SUBNETS_IPV4" ] && [ -n "$BROADCAST_ADDR" ] && [ "$SERVER_ON_NETWORK" -eq 0 ]; then
-    # Для каждой группы в LAN_ALLOW создаём уникальные mark
-    # Используем MARK_BASE чтобы mark были уникальны для каждого туннеля
-    # ВАЖНО: MARK должен увеличиваться для КАЖДОЙ группы чтобы быть синхронным с down.sh
-    MARK=$((MARK_BASE + 1000))
+    GROUP_IDX=0
     for rule in "${LAN_ALLOW[@]}"; do
       IFS=',' read -ra PARTS <<< "$rule"
 
@@ -2077,20 +2078,21 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ] && [ -n "$BROADCAST_ADDR" ] && [ "$SERVER_ON_NET
 
       # Если в группе есть IPv4 участники — настраиваем broadcast
       if [ ${#IPV4_PARTS[@]} -gt 0 ]; then
-        # 1. Маркируем broadcast от каждого участника группы
+        [ $GROUP_IDX -lt 31 ] && BIT=$((1 << GROUP_IDX)) || continue
+        # 1. Маркируем broadcast от каждого участника группы (накапливаем биты через --or-mark)
         for src in "${IPV4_PARTS[@]}"; do
-          iptables -t mangle -A FORWARD -s "$src" -d "$BROADCAST_ADDR" -j MARK --set-mark $MARK 2>/dev/null || true
-          iptables -t mangle -A FORWARD -s "$src" -d 255.255.255.255 -j MARK --set-mark $MARK 2>/dev/null || true
+          iptables -t mangle -A FORWARD -i "$TUN" -s "$src" -d "$BROADCAST_ADDR" -j MARK --or-mark $BIT 2>/dev/null || true
+          iptables -t mangle -A FORWARD -i "$TUN" -s "$src" -d 255.255.255.255 -j MARK --or-mark $BIT 2>/dev/null || true
         done
 
-        # 2. Разрешаем получать broadcast ТОЛЬКО участникам этой группы (В НАЧАЛО цепи, поверх DROP!)
+        # 2. Разрешаем получать broadcast ТОЛЬКО участникам этой группы
+        # --mark BIT/BIT проверяет только свой бит, остальные игнорирует
         for dst in "${IPV4_PARTS[@]}"; do
-          iptables -I FORWARD -i "$TUN" -o "$TUN" -m mark --mark $MARK -d "$dst" -j ACCEPT 2>/dev/null || true
+          iptables -I FORWARD -i "$TUN" -o "$TUN" -m mark --mark $BIT/$BIT -d "$dst" -j ACCEPT 2>/dev/null || true
         done
       fi
 
-      # Увеличиваем mark для следующей группы (ВСЕГДА, даже если broadcast не создавался)
-      MARK=$((MARK + 1))
+      GROUP_IDX=$((GROUP_IDX + 1))
     done
     
     # DROP не нужен — если mark не разрешён через ACCEPT, он блокируется автоматически
@@ -2103,9 +2105,7 @@ fi
 # ВАЖНО: Multicast работает ТОЛЬКО если сервер НЕ на network адресе (как и broadcast)
 # ВАЖНО: MARK должен увеличиваться для КАЖДОЙ группы чтобы быть синхронным с down.sh
 if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
-    # Для каждой группы в LAN_ALLOW создаём уникальные mark (те же что и для IPv4)
-    # Используем MARK_BASE чтобы mark были уникальны для каждого туннеля
-    MARK=$((MARK_BASE + 1000))
+    GROUP_IDX=0
     for rule in "${LAN_ALLOW[@]}"; do
       IFS=',' read -ra PARTS <<< "$rule"
 
@@ -2119,22 +2119,20 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
 
       # Если в группе есть IPv6 участники — настраиваем multicast
       if [ ${#IPV6_PARTS[@]} -gt 0 ]; then
-        # 1. Маркируем multicast от каждого участника группы
+        [ $GROUP_IDX -lt 31 ] && BIT=$((1 << GROUP_IDX)) || continue
+        # 1. Маркируем multicast от каждого участника группы (накапливаем биты через --or-mark)
         for src in "${IPV6_PARTS[@]}"; do
-          ip6tables -t mangle -A FORWARD -s "$src" -d "ff02::1" -j MARK --set-mark $MARK 2>/dev/null || true
+          ip6tables -t mangle -A FORWARD -i "$TUN" -s "$src" -d "ff02::1" -j MARK --or-mark $BIT 2>/dev/null || true
         done
 
-        # 2. Разрешаем получать multicast ТОЛЬКО участникам этой группы (В НАЧАЛО цепи, поверх DROP!)
+        # 2. Разрешаем получать multicast ТОЛЬКО участникам этой группы
         for dst in "${IPV6_PARTS[@]}"; do
-          ip6tables -I FORWARD -i "$TUN" -o "$TUN" -m mark --mark $MARK -d "$dst" -j ACCEPT 2>/dev/null || true
+          ip6tables -I FORWARD -i "$TUN" -o "$TUN" -m mark --mark $BIT/$BIT -d "$dst" -j ACCEPT 2>/dev/null || true
         done
       fi
 
-      # Увеличиваем mark для следующей группы (ВСЕГДА, даже если multicast не создавался)
-      MARK=$((MARK + 1))
+      GROUP_IDX=$((GROUP_IDX + 1))
     done
-
-    # DROP не нужен — если mark не разрешён через ACCEPT, он блокируется автоматически
 fi
 
 # --- Добавление правил для каждого проброса ---
@@ -3583,16 +3581,12 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   BROADCAST_ADDR=$(get_broadcast_addr "$LOCAL_SUBNETS_IPV4")
 fi
 
-# IPv4 Broadcast очистка (mangle mark)
-# Правила созданы как: iptables -t mangle -A FORWARD -s "$src" -d "$BROADCAST_ADDR" -j MARK --set-mark $MARK
-# Поэтому удаляем с теми же параметрами
-# ВАЖНО: Очищаем ТОЛЬКО если broadcast был включён (сервер НЕ на network адресе)
+# IPv4 Broadcast очистка (mangle mark) — с --or-mark + -i "$TUN"
 if [ -n "$BROADCAST_ADDR" ] && [ "$SERVER_ON_NETWORK" -eq 0 ]; then
-  MARK=$((MARK_BASE + 1000))
+  GROUP_IDX=0
   for rule in "${LAN_ALLOW[@]}"; do
     IFS=',' read -ra PARTS <<< "$rule"
 
-    # Собираем только IPv4 участников (так же как в up.sh)
     IPV4_PARTS=()
     for part in "${PARTS[@]}"; do
       part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -3600,47 +3594,42 @@ if [ -n "$BROADCAST_ADDR" ] && [ "$SERVER_ON_NETWORK" -eq 0 ]; then
       [[ "$part" != *:* ]] && IPV4_PARTS+=("$part")
     done
 
-    # Удаляем правила маркировки broadcast для каждого IPv4 участника
+    [ $GROUP_IDX -lt 31 ] && BIT=$((1 << GROUP_IDX)) || continue
     for src in "${IPV4_PARTS[@]}"; do
-      iptables -t mangle -D FORWARD -s "$src" -d "$BROADCAST_ADDR" -j MARK --set-mark $MARK 2>/dev/null || true
-      iptables -t mangle -D FORWARD -s "$src" -d 255.255.255.255 -j MARK --set-mark $MARK 2>/dev/null || true
+      iptables -t mangle -D FORWARD -i "$TUN" -s "$src" -d "$BROADCAST_ADDR" -j MARK --or-mark $BIT 2>/dev/null || true
+      iptables -t mangle -D FORWARD -i "$TUN" -s "$src" -d 255.255.255.255 -j MARK --or-mark $BIT 2>/dev/null || true
     done
 
-    MARK=$((MARK + 1))
+    GROUP_IDX=$((GROUP_IDX + 1))
   done
 fi
 
-# Очищаем ACCEPT правила для broadcast (filter таблица)
-# Правила созданы как: iptables -I FORWARD -i "$TUN" -o "$TUN" -m mark --mark $MARK -d "$dst" -j ACCEPT
-MARK=$((MARK_BASE + 1000))
+# Очищаем ACCEPT правила для broadcast (filter таблица) — с --mark BIT/BIT
+GROUP_IDX=0
 for rule in "${LAN_ALLOW[@]}"; do
   IFS=',' read -ra PARTS <<< "$rule"
-  
-  # Собираем только IPv4 участников (так же как в up.sh)
+
   IPV4_PARTS=()
   for part in "${PARTS[@]}"; do
     part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$part" ] && continue
     [[ "$part" != *:* ]] && IPV4_PARTS+=("$part")
   done
-  
-  # Удаляем ACCEPT правила для каждого IPv4 участника
+
+  [ $GROUP_IDX -lt 31 ] && BIT=$((1 << GROUP_IDX)) || continue
   for dst in "${IPV4_PARTS[@]}"; do
-    iptables -D FORWARD -i "$TUN" -o "$TUN" -m mark --mark $MARK -d "$dst" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$TUN" -o "$TUN" -m mark --mark $BIT/$BIT -d "$dst" -j ACCEPT 2>/dev/null || true
   done
-  
-  MARK=$((MARK + 1))
+
+  GROUP_IDX=$((GROUP_IDX + 1))
 done
 
-# IPv6 Multicast очистка (mangle mark)
-# Правила созданы как: ip6tables -t mangle -A FORWARD -s "$src" -d "ff02::1" -j MARK --set-mark $MARK
-# ВАЖНО: Очищаем ТОЛЬКО если multicast был включён (сервер НЕ на network адресе)
+# IPv6 Multicast очистка (mangle mark) — с --or-mark + -i "$TUN"
 if [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
-  MARK=$((MARK_BASE + 1000))
+  GROUP_IDX=0
   for rule in "${LAN_ALLOW[@]}"; do
     IFS=',' read -ra PARTS <<< "$rule"
 
-    # Собираем только IPv6 участников (так же как в up.sh)
     IPV6_PARTS=()
     for part in "${PARTS[@]}"; do
       part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -3648,37 +3637,35 @@ if [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
       [[ "$part" == *:* ]] && IPV6_PARTS+=("$part")
     done
 
-    # Удаляем правила маркировки multicast для каждого IPv6 участника
+    [ $GROUP_IDX -lt 31 ] && BIT=$((1 << GROUP_IDX)) || continue
     for src in "${IPV6_PARTS[@]}"; do
-      ip6tables -t mangle -D FORWARD -s "$src" -d "ff02::1" -j MARK --set-mark $MARK 2>/dev/null || true
+      ip6tables -t mangle -D FORWARD -i "$TUN" -s "$src" -d "ff02::1" -j MARK --or-mark $BIT 2>/dev/null || true
     done
 
-    MARK=$((MARK + 1))
+    GROUP_IDX=$((GROUP_IDX + 1))
   done
 fi
 
-# Очищаем ACCEPT правила для multicast (filter таблица)
-# ВАЖНО: Очищаем ТОЛЬКО если multicast был включён (сервер НЕ на network адресе)
+# Очищаем ACCEPT правила для multicast (filter таблица) — с --mark BIT/BIT
 if [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
-  MARK=$((MARK_BASE + 1000))
-  for rule in "${LAN_ALLOW[@]}"; do
-    IFS=',' read -ra PARTS <<< "$rule"
+   GROUP_IDX=0
+   for rule in "${LAN_ALLOW[@]}"; do
+     IFS=',' read -ra PARTS <<< "$rule"
 
-    # Собираем только IPv6 участников (так же как в up.sh)
-    IPV6_PARTS=()
-    for part in "${PARTS[@]}"; do
-      part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-      [ -z "$part" ] && continue
-      [[ "$part" == *:* ]] && IPV6_PARTS+=("$part")
-    done
+     IPV6_PARTS=()
+     for part in "${PARTS[@]}"; do
+       part="$(echo "$part" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+       [ -z "$part" ] && continue
+       [[ "$part" == *:* ]] && IPV6_PARTS+=("$part")
+     done
 
-    # Удаляем ACCEPT правила для каждого IPv6 участника
-    for dst in "${IPV6_PARTS[@]}"; do
-      ip6tables -D FORWARD -i "$TUN" -o "$TUN" -m mark --mark $MARK -d "$dst" -j ACCEPT 2>/dev/null || true
-    done
+     [ $GROUP_IDX -lt 31 ] && BIT=$((1 << GROUP_IDX)) || continue
+     for dst in "${IPV6_PARTS[@]}"; do
+       ip6tables -D FORWARD -i "$TUN" -o "$TUN" -m mark --mark $BIT/$BIT -d "$dst" -j ACCEPT 2>/dev/null || true
+     done
 
-    MARK=$((MARK + 1))
-  done
+     GROUP_IDX=$((GROUP_IDX + 1))
+   done
 fi
 
 # --- Полное удаление цепочек проброса портов (специфично для туннеля) ---
