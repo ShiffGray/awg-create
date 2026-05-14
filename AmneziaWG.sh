@@ -785,11 +785,11 @@ main() {
     # Порядок ВАЖЕН!
     disable_systemd_resolved
     purge_resolvconf
+    setup_dns              # 1. DNS (ДО install_deps — systemd-resolved уже отключён)
     unlock_dpkg
-    setup_kernel_modules   # 1. ПОДГОТОВКА МОДУЛЕЙ ЯДРА (ifb для лимитов)
-    install_deps           # 2. apt update + зависимости
-    install_resolvconf     # 3. openresolv/resolvconf
-    setup_dns              # 4. DNS
+    setup_kernel_modules   # 2. ПОДГОТОВКА МОДУЛЕЙ ЯДРА (ifb для лимитов)
+    install_deps           # 3. apt update + зависимости (DNS уже работает)
+    install_resolvconf     # 4. openresolv/resolvconf
     add_repo "$codename"   # 5. Репозиторий Amnezia
     install_amneziawg      # 6. AmneziaWG
     restore_resolvconf     # 7. Восстановление resolv.conf
