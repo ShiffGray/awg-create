@@ -5,11 +5,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/hea
 
 ---
 
-## CLI: опции и команды
-Скопировать и скачать скрипт на сервер:
-```bash
-wget -O awgcreate.py https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/awgcreate.py
-```
+## CLI
 Примеры команд скрипта:
 ```bash
 ## python3 awgcreate.py [опции]
