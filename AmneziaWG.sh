@@ -303,6 +303,9 @@ install_resolvconf() {
 setup_dns() {
     log_info "Настройка DNS..."
 
+    # Снимаем защиту (если была от предыдущего запуска или restore_resolvconf)
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
     # Отключаем systemd-resolved (чтобы не перезаписывал DNS)
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         log_info "Отключаем systemd-resolved..."
@@ -627,17 +630,25 @@ install_default_mode() {
     fi
 }
 
-# Восстановление resolv.conf
+# Восстановление resolv.conf (создаёт рабочий DNS, НЕ восстанавливает битый symlink)
 restore_resolvconf() {
-    log_info "Восстановление resolv.conf..."
+    log_info "Восстановление DNS..."
 
     # Снимаем защиту
     chattr -i /etc/resolv.conf 2>/dev/null || true
 
-    # Восстанавливаем оригинал
-    [ -f /etc/resolv.conf.original ] && cp /etc/resolv.conf.original /etc/resolv.conf
+    # Создаём рабочий статический DNS (не systemd stub!)
+    cat > /etc/resolv.conf <<EOF
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+nameserver 2606:4700:4700::1111
+nameserver 2606:4700:4700::1001
+EOF
 
-    log_success "resolv.conf восстановлен"
+    # Фиксируем от systemd-resolved
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+
+    log_success "DNS восстановлен"
 }
 
 # Проверка установки
