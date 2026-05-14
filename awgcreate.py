@@ -2628,9 +2628,11 @@ fi
   IFB_OUT="ifb_${TUN_SAFE}_out"
   IFB_MIX="ifb_${TUN_SAFE}_mix"
 
-  if ! modprobe ifb; then
-    echo "Ошибка: не удалось загрузить модуль ifb"
-    exit 1
+  if [ ! -d /sys/module/ifb ]; then
+    if ! modprobe ifb; then
+      echo "Ошибка: не удалось загрузить модуль ifb"
+      exit 1
+    fi
   fi
 
   # Устанавливаем TUN_SUBNET4/6 из уже распарсенных LOCAL_SUBNETS
