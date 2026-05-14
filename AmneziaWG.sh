@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# AmneziaWG Installer v6.0
-# Ubuntu 20.04-25.04 | Debian 11-13
+# AmneziaWG Installer v6.1
+# Ubuntu 20.04-26.04 | Debian 11-13
 # Режимы: --go/-g (go из исходников), --kernel/-k (dkms), без флага (meta-пакет)
 # Чистый код с учётом всех ошибок
 #
@@ -115,6 +115,7 @@ get_codename() {
             24.04) echo "noble" ;;
             24.10) echo "oracular" ;;
             25.04) echo "plucky" ;;
+            25.10|26.04) echo "noble" ;;
             *) echo "focal" ;;
         esac
     else
@@ -768,8 +769,8 @@ main() {
 
     echo
     echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   AmneziaWG Installer v6.0             ║${NC}"
-    echo -e "${GREEN}║   Ubuntu 20-25 | Debian 11-13          ║${NC}"
+    echo -e "${GREEN}║   AmneziaWG Installer v6.1             ║${NC}"
+    echo -e "${GREEN}║   Ubuntu 20-26 | Debian 11-13          ║${NC}"
     echo -e "${GREEN}║   + disable systemd-resolved           ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
     echo -e "    Режим: ${INSTALL_MODE}"
