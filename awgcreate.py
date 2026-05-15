@@ -5813,30 +5813,33 @@ def _backup_file(path: pathlib.Path, suffix: str = '.bak') -> Optional[pathlib.P
     return backup_path
 
 
-def _generate_qr_image(conf_text: str, output_path: pathlib.Path) -> None:
+def _generate_qr_image(conf_text: str, output_path: pathlib.Path, start_version: int = 1) -> int:
     """
     Генерация QR-кода из текста конфига.
-    
-    Алгоритм:
-    1. Перебираем version 1-40 с error correction H (30%)
-    2. Если H не влез ни в один version — пробуем version 40 с L (7%)
-    
+
+    Перебирает version от start_version до 40 с error correction H (30%).
+    Если H не влез — пробует version 40 с L (7%).
+
     Args:
         conf_text: Текст конфига для кодирования в QR
         output_path: Путь для сохранения PNG файла
-    
+        start_version: Начинать поиск с этой версии (для ускорения)
+
+    Returns:
+        Версию QR, которая подошла
+
     Raises:
         RuntimeError: Если QR не помещается даже с version=40 и error correction=L
     """
     if qrcode is None:
         raise RuntimeError('Пакет qrcode не установлен')
-    
+
     # Проверяем размер конфига
     if len(conf_text) > 2048:
         logger.warning('⚠  Конфиг >2KB, возможно QR не получится')
-    
-    # Шаг 1: Перебираем version 1-40 с H (30%)
-    for version in range(1, 41):
+
+    # Шаг 1: Перебираем version start_version..40 с H (30%)
+    for version in range(start_version, 41):
         try:
             qr = qrcode.QRCode(
                 version=version,
@@ -5846,16 +5849,16 @@ def _generate_qr_image(conf_text: str, output_path: pathlib.Path) -> None:
             )
             qr.add_data(conf_text)
             qr.make(fit=False)
-            
+
             # Успех!
             img = qr.make_image(fill_color="black", back_color="white")
             img.save(str(output_path))
-            return
-            
+            return version
+
         except (qrcode.exceptions.DataOverflowError, ValueError):
             # Не влезло в эту версию — пробуем следующую
             continue
-    
+
     # Шаг 2: H не влез ни в один version — пробуем L (7%) с version 40
     try:
         qr = qrcode.QRCode(
@@ -5866,16 +5869,15 @@ def _generate_qr_image(conf_text: str, output_path: pathlib.Path) -> None:
         )
         qr.add_data(conf_text)
         qr.make(fit=False)
-        
+
         # Успех!
         img = qr.make_image(fill_color="black", back_color="white")
         img.save(str(output_path))
-        #logger.info('✅ QR-код: %s (version=40, error_correction=L (7%%))', str(output_path))
-        return
-        
+        return 40
+
     except (qrcode.exceptions.DataOverflowError, ValueError):
         pass
-    
+
     # Ни одно не сработало
     raise RuntimeError(f"Конфиг слишком большой для QR кода (max version=40, min error_correction=L)")
 
@@ -6377,21 +6379,23 @@ def handle_delete(opt) -> None:
     logger.info('✅ Удалён "%s". Освобождён IP=%s', p_name, ipaddr)
 
 
-def handle_warp_gen(opt, need_conf: bool = True, need_qr: bool = False, want_zip: bool = False) -> None:
+def handle_warp_gen(opt, need_conf: bool = True) -> List[str]:
     """
     Автономная генерация WARP конфигов (без серверного интерфейса).
     Сохраняет в папку WARP/ рядом со скриптом.
-    Поддерживает -c, -q, -z как для клиентских конфигов.
-    
+
+    QR и ZIP генерация теперь в общем коде (generate_qr_codes).
+
     Args:
         opt: аргументы командной строки
-        need_conf: нужны ли конфиги (True если -c или -q или -z)
-        need_qr: нужны ли QR (True если -q или -z)
-        want_zip: нужен ли ZIP (True если -z)
+        need_conf: нужны ли конфиги
+
+    Returns:
+        Список путей к сгенерированным WARP конфигам
     """
     # Определяем версию протокола
     awg_version = getattr(opt, 'version', 'AWG2.0')
-    
+
     # Создаём папку WARP/ рядом со скриптом
     warp_dir = SCRIPT_DIR.joinpath("WARP")
     warp_dir.mkdir(parents=True, exist_ok=True)
@@ -6417,10 +6421,10 @@ def handle_warp_gen(opt, need_conf: bool = True, need_qr: bool = False, want_zip
     # Генерируем WARP конфиги
     num_warps = opt.warp if opt.warp > 0 else 1
     logger.info("🌀 Генерация %d WARP конфигов (версия: %s)...", num_warps, awg_version)
-    
+
     warp_configs: List[str] = []
     last_error = None
-    
+
     for i in range(num_warps):
         success = False
         for attempt in range(3):
@@ -6443,47 +6447,17 @@ def handle_warp_gen(opt, need_conf: bool = True, need_qr: bool = False, want_zip
                 last_error = str(e)
                 time.sleep(1 + attempt)
                 continue
-        
+
         if not success:
             logger.error("❌ Не удалось сгенерировать WARP %d", i)
             if last_error:
                 logger.error("📝 Ошибка: %s", last_error)
-    
-    if warp_configs:
-        logger.info("✅ Сгенерировано WARP конфигов: %d", len(warp_configs))
 
-        # Генерация QR-кодов если нужно (как в клиентских конфигах: need_qr = want_qr or want_zip)
-        if need_qr:
-            logger.info("📱 Генерация QR-кодов для WARP...")
-            for conf_path in warp_configs:
-                try:
-                    # Читаем конфиг
-                    conf_text = pathlib.Path(conf_path).read_text(encoding='utf-8')
-
-                    # Генерируем QR
-                    png_path = pathlib.Path(conf_path).with_suffix('.png')
-                    _generate_qr_image(conf_text, png_path)
-
-                except Exception as e:
-                    logger.error("❌ Ошибка генерации QR для %s: %s", conf_path, e)
-
-        # Создание ZIP-архивов если нужно
-        if want_zip:
-            logger.info("📦 Создание ZIP-архивов для WARP...")
-            for conf_path in warp_configs:
-                try:
-                    base_name = pathlib.Path(conf_path).stem
-                    zip_path = warp_dir.joinpath(f"{base_name}.zip")
-                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                        _add_file_to_zip(zipf, conf_path, f"{base_name}.conf")
-                        # Добавляем QR если есть
-                        png_path = pathlib.Path(conf_path).with_suffix('.png')
-                        if png_path.exists():
-                            _add_file_to_zip(zipf, png_path, f"{base_name}.png")
-                except Exception as e:
-                    logger.error("❌ Ошибка создания ZIP для %s: %s", conf_path, e)
-    else:
+    if not warp_configs:
         raise RuntimeError("Не удалось сгенерировать WARP конфиги")
+
+    logger.info("✅ Сгенерировано WARP конфигов: %d", len(warp_configs))
+    return warp_configs
 
 
 def handle_confgen(opt) -> Set[str]:
@@ -6688,71 +6662,75 @@ def handle_confgen(opt) -> Set[str]:
     return qr_enabled_names
 
 
-def generate_qr_codes(qr_filter: Optional[Set[str]] = None) -> None:
+def generate_qr_codes(
+    qr_filter: Optional[Set[str]] = None,
+    warp_configs: Optional[List[str]] = None,
+) -> None:
     """
-    Генерирует QR.
-    qr_filter: множество имен IP-списков, для которых генерировать QR (например {'All', 'Tg'}).
+    Генерирует QR для клиентских и WARP конфигов.
+    Один next_version для всех — ускорение перебора версий QR.
+
+    Args:
+        qr_filter: множество имен IP-списков для клиентских конфигов
+        warp_configs: список путей к WARP конфигам
     """
-    logger.info('📱 Генерация QR-кодов...')
     if qrcode is None:
         raise RuntimeError('Пакет qrcode не установлен')
-        
-    # Если фильтр не передан (например, вызван только -q), попробуем прочитать из файла
+
+    # Собираем все конфиги в один список
+    all_configs: List[str] = []
+    client_matched_stems: Set[str] = set()
+
+    # --- Клиентские конфиги (с фильтром) ---
     if qr_filter is None:
         try:
-            # Читаем конфиг, чтобы узнать какие списки помечены как qr
             if g_allowedips_config_fn.exists():
                 _, qr_filter = parse_allowedips_config(g_allowedips_config_fn.read_text('utf-8'))
             else:
-                qr_filter = {'All'} # Default fallback
+                qr_filter = {'All'}
         except Exception:
             qr_filter = {'All'}
 
-    # Очистка старых PNG
-    for fn in glob.glob(str(g_conf_dir.joinpath("*.png"))):
-        try: os.remove(fn)
-        except Exception: pass
-    
-    # Поиск подходящих конфигов.
-    # Файлы именуются: {Peer}{IPList}{EpLabel}.conf
-    # Нам нужно найти в имени файла вхождение одного из ключей qr_filter.
-    
-    flst = []
     for p in g_conf_dir.glob("*.conf"):
-        if p.name == g_main_config_fn.name: continue
-        
-        # Проверяем, содержит ли имя файла одну из разрешенных подстрок
+        if g_main_config_fn and p.name == g_main_config_fn.name:
+            continue
         stem = p.stem
-        # Логика: если фильтр {'All', 'Tg'}, то берем sniffAll.conf, sniffTgMSK.conf
-        # но НЕ sniffDsYt.conf
-        
-        is_target = False
-        for tag in qr_filter:
-            if tag in stem:
-                is_target = True
-                break
-        
-        if is_target:
-            flst.append(str(p))
-            
-    if not flst:
-        logger.warning('⚠  Нет файлов, подходящих под QR фильтр: %s', qr_filter)
+        if any(tag in stem for tag in qr_filter):
+            all_configs.append(str(p))
+            client_matched_stems.add(stem)
+
+    # --- WARP конфиги (все подряд) ---
+    if warp_configs:
+        all_configs.extend(warp_configs)
+
+    if not all_configs:
+        logger.warning('⚠  Нет файлов для генерации QR (фильтр: %s, WARP: %d)', qr_filter, len(warp_configs or []))
         return
 
-    for fn in flst:
-        with open(fn, 'r', encoding='utf-8') as file:
-            conf = file.read()
-        name = os.path.splitext(os.path.basename(fn))[0]
-        png_path = g_conf_dir.joinpath(f"{name}.png")
+    # Очистка старых PNG клиентских конфигов (WARP очищает handle_warp_gen)
+    for png in g_conf_dir.glob("*.png"):
         try:
-            _generate_qr_image(conf, png_path)
-            #logger.info("✅ QR-код: %s", png_path)
+            os.remove(str(png))
+        except Exception:
+            pass
+
+    # --- Единый цикл генерации QR ---
+    logger.info('📱 Генерация QR-кодов (%d конфигов)...', len(all_configs))
+    next_version = 1
+    for fn in all_configs:
+        try:
+            with open(fn, 'r', encoding='utf-8') as file:
+                conf = file.read()
+            png_path = pathlib.Path(fn).with_suffix('.png')
+            next_version = _generate_qr_image(conf, png_path, start_version=next_version)
         except Exception as e:
             logger.error('❌ Ошибка генерации QR для %s: %s', fn, e)
 
 
-def zip_client_files(client_name: str) -> None:
-    zip_filename = g_conf_dir.joinpath(f"{client_name}.zip")
+def zip_client_files(client_name: str, base_dir: Optional[pathlib.Path] = None) -> None:
+    if base_dir is None:
+        base_dir = g_conf_dir
+    zip_filename = base_dir.joinpath(f"{client_name}.zip")
     
     suffixes = []
     if g_allowedips_config_fn.exists():
@@ -6771,7 +6749,7 @@ def zip_client_files(client_name: str) -> None:
     pattern_file = re.compile(pattern_str)
     
     with zipfile.ZipFile(str(zip_filename), 'w', compression=zipfile.ZIP_DEFLATED) as zipf:
-        for file in sorted(g_conf_dir.iterdir()):
+        for file in sorted(base_dir.iterdir()):
             if not file.is_file():
                 continue
             if pattern_file.match(file.name):
@@ -6801,11 +6779,15 @@ def zip_client_files(client_name: str) -> None:
                         logger.warning("⚠  Не удалось добавить %s в %s: %s", full_path, zip_filename, e)
 
 
-def zip_all() -> None:
+def zip_all(warp_configs: Optional[List[str]] = None) -> None:
     logger.info('📦 Упаковка конфигов в ZIP...')
     names = list(dict.fromkeys(clients_for_zip))
     for name in names:
         zip_client_files(name)
+    if warp_configs:
+        for cp in warp_configs:
+            p = pathlib.Path(cp)
+            zip_client_files(p.stem, base_dir=p.parent)
 
 
 def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip: bool = False,
@@ -7004,11 +6986,22 @@ def main() -> None:
 
     # Автономная генерация WARP конфигов (без серверного интерфейса)
     if opt.warp > 0 and not opt.makecfg and not opt.server_cfg:
-        handle_warp_gen(opt, need_conf=need_conf, need_qr=need_qr, want_zip=want_zip)
-        
+        warp_configs = handle_warp_gen(opt, need_conf=need_conf)
+
+        # QR для WARP через общую функцию (единый next_v)
+        if need_qr:
+            generate_qr_codes(
+                qr_filter=None,
+                warp_configs=warp_configs,
+            )
+
+        # ZIP для WARP через общий механизм
+        if want_zip:
+            zip_all(warp_configs=warp_configs)
+
         # Очистка лишних файлов после генерации (для WARP своя логика)
         warp_dir = SCRIPT_DIR.joinpath("WARP")
-        
+
         # Для WARP: -z сохраняет только .zip, -q сохраняет .conf+.png, -c сохраняет .conf
         if want_zip and not opt.qrcode and not opt.confgen:
             # Только -z → удаляем .conf и .png
@@ -7027,7 +7020,7 @@ def main() -> None:
                     except Exception:
                         pass
         # В остальных случаях оставляем всё
-        
+
         return
 
     if opt.makecfg:
@@ -7054,7 +7047,6 @@ def main() -> None:
         qr_filter = handle_confgen(opt)
 
     if need_qr:
-        # Передаем полученный фильтр
         generate_qr_codes(qr_filter)
 
     if want_zip:
