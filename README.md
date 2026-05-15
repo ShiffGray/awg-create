@@ -10,9 +10,8 @@ bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/hea
 ```bash
 ## python3 awgcreate.py [опции]
 
-# Создать серверный интерфейс с именем awg0, подсетью 10.1.0.0/24, портом 44567, лимитом скорости для пользователей 99Мб/сек,
-# MTU 1388 и 3 WARP конфига между которыми будет балансироваться трафик пользователей
-python3 awgcreate.py --make /etc/amnezia/amneziawg/awg1.conf -i 10.1.0.0/24 -p 44567 -l 99 --mtu 1388 --warp 3
+# Можно примерно вот так вота создать интерфейс
+python3 awgcreate.py --make awg1 -i 10.1.0.1/24,fd10:1::1/112 -p 44567 -l 99 --mtu 1388 --warp 3
 
 # Создать пользователя с именем test на awg0
 python3 awgcreate.py -s awg1 -a test
@@ -26,7 +25,13 @@ python3 awgcreate.py -s awg1 -u test
 # -o test,test2,test3 , без него генерация будет для всех пользователей
 python3 awgcreate.py -s awg1 -z -o test
 ```
-После создания/удаления/пересоздания пользователя для применения настроек необходимо перезагрузить интерфейс!
+Да кстати если добавлять много пользователей то это можно сделать вот так:
+```bash
+for ip in $(seq 2 24); do
+  python3 awgcreate.py -s awg1 -a "$ip"
+done
+```
+
 Команды для управления самим интерфейсом:
 ```bash
 # Запустить интерфейс
