@@ -6982,7 +6982,7 @@ def main() -> None:
     want_qr = opt.qrcode
     want_zip = opt.zip
     need_conf = want_conf or want_qr or want_zip
-    need_qr = want_qr or want_zip
+    need_qr = want_qr or (want_zip and not want_conf)
 
     # Автономная генерация WARP конфигов (без серверного интерфейса)
     if opt.warp > 0 and not opt.makecfg and not opt.server_cfg:
