@@ -4364,7 +4364,9 @@ def get_main_iface() -> Optional[str]:
         if "<BROADCAST" in line and "state UP" in line:
             parts = line.split(":")
             if len(parts) >= 2:
-                return parts[1].strip()
+                iface = parts[1].strip()
+                # Отрезаем @ifN (veth peer index внутри контейнера)
+                return iface.split("@")[0]
     return None
 
 
