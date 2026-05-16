@@ -6893,9 +6893,9 @@ parser.add_argument("-l", "--limit", type=int, default=0, help="Limit (Mbit)")
 parser.add_argument("-f", "--iface", default="", help="Сетевой интерфейс (например ens3)")
 parser.add_argument("-v", "--version", type=str, default="AWG2.0", choices=["WG", "AWG", "AWG1.0", "AWG1.5", "AWG2.0"], help="Версия протокола")
 parser.add_argument("--make", dest="makecfg", default="", help="Создать серверный конфиг")
-parser.add_argument("--mtu", type=int, default=1388, help="MTU")
+parser.add_argument("--mtu", type=int, default=1400, help="MTU")
 parser.add_argument("--warp", type=int, default=0, help="WARP конфиги")
-parser.add_argument("--proxy", default="", help="Proxy сервер для WARP API (например http://proxy:8080, socks5://127.0.0.1:9050, или 'tor' для авто)")
+parser.add_argument("--proxy", default="", help="Proxy сервер для WARP API (например http://proxy:8080, socks5://127.0.0.1:9050, или 'tor')")
 opt = parser.parse_args()
 
 
