@@ -3984,7 +3984,7 @@ def _generate_s_params() -> Tuple[int, int, int, int]:
         S1 = random.randint(61, 255)
         S2 = random.randint(29, 127)
         S3 = random.randint(13, 63)
-        S4 = random.randint(3, 31)
+        S4 = random.randint(6, 18)
 
         s_values = [S1, S2, S3, S4]
         min_diff_ok = all(abs(s_values[i] - s_values[j]) >= 3
@@ -4078,7 +4078,20 @@ def _generate_i_params() -> Dict[str, str]:
     Из пула 6 протоколов (A-F) случайно выбирается 3-5 неповторяющихся
     и распределяются в случайном порядке по I1-IN.
     Генерируются ТОЛЬКО выбранные протоколы — без накладных расходов.
+
+    Контролируемые диапазоны (можно менять под свои нужды):
+      I_TEXT_MIN/I_TEXT_MAX — длина текста I-строк в конфиге (символы)
+      I_TRAFFIC_MIN/I_TRAFFIC_MAX — сумма <r>+<rc>+<rd> (байт трафика)
+      Если результат выходит за диапазон — генерация повторяется.
     """
+    # ─── Настраиваемые диапазоны ─────────────────────────────────
+    I_TEXT_MIN = 60     # Мин. длина текста всех I-строк в конфиге
+    I_TEXT_MAX = 180    # Макс. длина текста всех I-строк в конфиге
+    I_TRAFFIC_MIN = 600 # Мин. объём генерируемого трафика (r+rc+rd)
+    I_TRAFFIC_MAX = 900 # Макс. объём генерируемого трафика (r+rc+rd)
+    MAX_ATTEMPTS = 10   # Лимит попыток чтобы не зависнуть
+    # ──────────────────────────────────────────────────────────────
+
     # Пул протоколов в виде функций — генерируется только при вызове
     def _gen_dns():
         return generate_cps_packet(
@@ -4130,11 +4143,38 @@ def _generate_i_params() -> Dict[str, str]:
 
     pool_fns = [_gen_dns, _gen_quic, _gen_dtls, _gen_ntp, _gen_random, _gen_srtp]
 
-    # Случайное количество: 3-5
-    count = random.randint(3, 5)
+    # Генерация с валидацией диапазонов
+    selected = []
+    best_selected = None
+    best_distance = float('inf')
+    for attempt in range(MAX_ATTEMPTS):
+        count = random.randint(3, 5)
+        current = [fn() for fn in random.sample(pool_fns, count)]
 
-    # Выбираем count неповторяющихся функций и вызываем их
-    selected = [fn() for fn in random.sample(pool_fns, count)]
+        # Проверка веса строк и объёма трафика
+        text_total = sum(len(s) for s in current)
+        traffic_total = sum(
+            sum(int(x) for x in re.findall(r'<r (\d+)>', s)) +
+            sum(int(x) for x in re.findall(r'<rc (\d+)>', s)) +
+            sum(int(x) for x in re.findall(r'<rd (\d+)>', s))
+            for s in current
+        )
+
+        if I_TEXT_MIN <= text_total <= I_TEXT_MAX and I_TRAFFIC_MIN <= traffic_total <= I_TRAFFIC_MAX:
+            selected = current
+            break
+
+        # Отклонения от диапазонов
+        text_err = max(0, I_TEXT_MIN - text_total) + max(0, text_total - I_TEXT_MAX)
+        traffic_err = max(0, I_TRAFFIC_MIN - traffic_total) + max(0, traffic_total - I_TRAFFIC_MAX)
+        distance = text_err + traffic_err
+        if distance < best_distance:
+            best_distance = distance
+            best_selected = current
+
+    else:
+        # Не нашли идеального — используем лучший
+        selected = best_selected if best_selected else selected
 
     # Перемешиваем порядок уже сгенерированных пакетов
     random.shuffle(selected)
@@ -5050,6 +5090,17 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
     for p in tokens:
         raw = p
         label = ""
+        mtu_val = ""
+
+        # Опциональный MTU: ;mtu=1300 в конце строки
+        if ";mtu=" in p:
+            p, mtu_part = p.split(";mtu=", 1)
+            mtu_str = mtu_part.split(",")[0].strip()
+            if mtu_str.isdigit():
+                m = int(mtu_str)
+                if 1280 <= m <= 1440:
+                    mtu_val = mtu_str
+
         hostport = p
         if hostport.startswith('['):
             try:
@@ -5080,7 +5131,7 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
                             port = default_port
                     except Exception:
                         port = default_port
-                out.append({"host": host, "port": str(port), "label": label})
+                out.append({"host": host, "port": str(port), "label": label, "mtu": mtu_val})
                 continue
             except ValueError:
                 hostport = p
@@ -5106,7 +5157,7 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
                 lbl = ""
 
         if hostpart.count(':') >= 2:
-            out.append({"host": hostpart.strip(), "port": default_port, "label": lbl})
+            out.append({"host": hostpart.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
             continue
 
         if ':' in hostpart:
@@ -5116,18 +5167,18 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
                 try:
                     prt_int = int(prt_val)
                     if 1 <= prt_int <= 65535:
-                        out.append({"host": h.strip(), "port": str(prt_int), "label": lbl})
+                        out.append({"host": h.strip(), "port": str(prt_int), "label": lbl, "mtu": mtu_val})
                     else:
-                        out.append({"host": h.strip(), "port": default_port, "label": lbl})
+                        out.append({"host": h.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
                 except Exception:
-                    out.append({"host": h.strip(), "port": default_port, "label": lbl})
+                    out.append({"host": h.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
                 continue
             else:
-                out.append({"host": hostpart.strip(), "port": default_port, "label": lbl})
+                out.append({"host": hostpart.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
                 continue
         else:
             h = hostpart.strip()
-            out.append({"host": h, "port": default_port, "label": lbl})
+            out.append({"host": h, "port": default_port, "label": lbl, "mtu": mtu_val})
     return out
 
 def get_server_public_address(cfg) -> str:
@@ -6597,14 +6648,18 @@ def handle_confgen(opt) -> Set[str]:
             host = ep.get('host', '')
             port = ep.get('port', default_port)
             raw_label = ep.get('label', '')
-            
+
+            # Per-endpoint MTU (если указан в _endpoint.config как ;mtu=N)
+            ep_mtu = ep.get('mtu', '')
+            use_mtu = ep_mtu if ep_mtu else mtu
+
             if single_endpoint:
                 ep_label = "" if not raw_label else raw_label
             else:
                 ep_label = raw_label if raw_label else str(idx)
 
             out_base = tmpcfg[:]
-            out_base = out_base.replace('<MTU>', mtu)
+            out_base = out_base.replace('<MTU>', use_mtu)
             out_base = out_base.replace('<CLIENT_PRIVATE_KEY>', peer['PrivateKey'])
 
             # Исправляем маску клиента на маску подсети сервера
@@ -6975,8 +7030,8 @@ def main() -> None:
         logger.error("❌ Этот скрипт работает только на Linux. Windows не поддерживается.")
         sys.exit(1)
 
-    if not (1280 <= opt.mtu <= 1420):
-        raise ValueError("MTU должен быть в диапазоне 1280..1420")
+    if not (1280 <= opt.mtu <= 1440):
+        raise ValueError("MTU должен быть в диапазоне 1280..1440")
 
     want_conf = opt.confgen
     want_qr = opt.qrcode
