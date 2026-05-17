@@ -3984,7 +3984,7 @@ def _generate_s_params() -> Tuple[int, int, int, int]:
         S1 = random.randint(61, 255)
         S2 = random.randint(29, 127)
         S3 = random.randint(13, 63)
-        S4 = random.randint(6, 18)
+        S4 = random.randint(5, 9)
 
         s_values = [S1, S2, S3, S4]
         min_diff_ok = all(abs(s_values[i] - s_values[j]) >= 3
