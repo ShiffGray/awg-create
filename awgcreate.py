@@ -2834,6 +2834,9 @@ fi
           LIM_UP="$_lim_part"
       fi
 
+      _BURST_DOWN=$(( LIM_DOWN * 1500 * 2 ))
+      _BURST_UP=$(( LIM_UP * 1500 * 2 ))
+
       # Определяем тип правила: MIX (одно значение) или SEPARATE (два значения через :)
       _rule_type="mix"
       if echo "$_lim_part" | grep -q ':'; then
@@ -2944,7 +2947,7 @@ fi
               _major="${_mix_major}:"
 
               if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                  tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                  tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit burst $_BURST_DOWN cburst $_BURST_DOWN quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
                       tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
@@ -2965,7 +2968,7 @@ fi
               _major="${_out_major}:"
 
               if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                  tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                  tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit burst $_BURST_DOWN cburst $_BURST_DOWN quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # OUT на parent 1: (egress) = download = dst клиента
                       tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
@@ -2985,7 +2988,7 @@ fi
               _major="${_in_major}:"
 
               if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
-                  tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
+                  tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit burst $_BURST_UP cburst $_BURST_UP quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # IN на parent ffff: (ingress) = upload = src клиента
                       tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
@@ -3045,7 +3048,7 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                     _major="${_mix_major}:"
 
                     if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                        tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                        tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit burst $_BURST_DOWN cburst $_BURST_DOWN quantum "$QUANT" 2>/dev/null || true
                     fi
                 else
                     _out_client_num=$((_out_client_num + 1))
@@ -3058,7 +3061,7 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                     _major="${_out_major}:"
 
                     if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                        tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                        tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit burst $_BURST_DOWN cburst $_BURST_DOWN quantum "$QUANT" 2>/dev/null || true
                     fi
 
                     _in_client_num=$((_in_client_num + 1))
@@ -3071,7 +3074,7 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                     _major="${_in_major}:"
 
                     if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
-                        tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
+                        tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit burst $_BURST_UP cburst $_BURST_UP quantum "$QUANT" 2>/dev/null || true
                     fi
                 fi
 
