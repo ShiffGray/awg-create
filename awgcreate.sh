@@ -13,7 +13,7 @@ fi
 
 # 1. Установка AmneziaWG
 echo ">>> Установка AmneziaWG..."
-bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/AmneziaWG.sh) -g
+bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/AmneziaWG.sh)
 
 # 2. Установка Python зависимостей
 echo ">>> Установка Python зависимостей..."
