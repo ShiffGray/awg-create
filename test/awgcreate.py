@@ -7030,10 +7030,10 @@ def get_main_config_path(check: bool = True, override: Optional[str] = None) -> 
     return str(g_main_config_fn)
 
 
-def _handle_reload() -> None:
+def _handle_reload(override: Optional[str] = None) -> None:
     """Перезагрузить конфиг работающего интерфейса без отключения (strip + syncconf)."""
     if g_main_config_fn is None:
-        get_main_config_path(check=True)
+        get_main_config_path(check=True, override=override)
     if g_main_config_fn is None or not g_main_config_fn.exists():
         raise RuntimeError("Не найден серверный конфиг")
 
@@ -7077,7 +7077,7 @@ def main() -> None:
         raise ValueError("MTU должен быть в диапазоне 1280..1440")
 
     if opt.reload:
-        _handle_reload()
+        _handle_reload(override=opt.server_cfg)
         return
 
     want_conf = opt.confgen
