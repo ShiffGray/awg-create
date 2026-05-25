@@ -6856,7 +6856,7 @@ def generate_qr_codes(
                 try:
                     idx = _QR_STEPS.index((next_version, next_ec))
                     step = QR_BACKWARD_DIGIT_STEP if idx <= 39 else QR_BACKWARD_LETTER_STEP
-                    new_idx = max(0, idx - max(1, step))
+                    new_idx = max(0, idx - step)
                     next_version, next_ec = _QR_STEPS[new_idx]
                 except ValueError:
                     pass  # не найдено в списке — оставляем как есть
