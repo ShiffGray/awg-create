@@ -5864,73 +5864,105 @@ def _backup_file(path: pathlib.Path, suffix: str = '.bak') -> Optional[pathlib.P
     return backup_path
 
 
-def _generate_qr_image(conf_text: str, output_path: pathlib.Path, start_version: int = 1) -> int:
-    """
-    Генерация QR-кода из текста конфига.
+# ─── Шаги поиска/передачи версии QR ─────────────────────────────
+QR_FORWARD_DIGIT_STEP   = 1   # шаг вперёд по цифрам (1..40)
+QR_FORWARD_LETTER_STEP  = 1   # шаг вперёд по буквам (Q→M→L)
+QR_BACKWARD_DIGIT_STEP  = 1   # шаг назад по цифрам
+QR_BACKWARD_LETTER_STEP = 1   # шаг назад по буквам
 
-    Перебирает version от start_version до 40 с error correction H (30%).
-    Если H не влез — пробует version 40 с L (7%).
+# Полный список ступеней: H1..H40, Q40, M40, L40
+_QR_STEPS: List[Tuple[int, int]] = []
+for v in range(1, 41):
+    _QR_STEPS.append((v, qrcode.constants.ERROR_CORRECT_H if qrcode else -1))
+if qrcode:
+    for ec in [qrcode.constants.ERROR_CORRECT_Q, qrcode.constants.ERROR_CORRECT_M, qrcode.constants.ERROR_CORRECT_L]:
+        _QR_STEPS.append((40, ec))
+# ─────────────────────────────────────────────────────────────────
+
+def _generate_qr_image(
+    conf_text: str,
+    output_path: pathlib.Path,
+    start_version: int = 1,
+    start_ec: int = -1,
+) -> Tuple[int, int]:
+    """
+    Генерация QR-кода из текста конфига — ручной перебор.
+
+    1. Пробует start_version с start_ec (fit=False) — быстрое совпадение.
+    2. Если не влез — перебирает version start_version..40 с H (30%).
+    3. Если H не влез ни в один — Q (25%) → M (15%) → L (7%) с version 40.
+    4. Если ничего не влезло — RuntimeError.
 
     Args:
         conf_text: Текст конфига для кодирования в QR
         output_path: Путь для сохранения PNG файла
-        start_version: Начинать поиск с этой версии (для ускорения)
+        start_version: Версия, с которой начать (из предыдущей генерации)
+        start_ec:  Уровень коррекции, с которого начать (из предыдущей)
 
     Returns:
-        Версию QR, которая подошла
-
-    Raises:
-        RuntimeError: Если QR не помещается даже с version=40 и error correction=L
+        (version, ec) — подошедшие версия и уровень коррекции
     """
     if qrcode is None:
         raise RuntimeError('Пакет qrcode не установлен')
 
-    # Проверяем размер конфига
-    if len(conf_text) > 2048:
-        logger.warning('⚠  Конфиг >2KB, возможно QR не получится')
+    # Шаг 0: пробуем предыдущие параметры (быстрый путь)
+    if start_ec != -1 and start_version > 0:
+        try:
+            qr = qrcode.QRCode(
+                version=start_version,
+                error_correction=start_ec,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(conf_text)
+            qr.make(fit=False)
+            img = qr.make_image(fill_color="black", back_color="white")
+            img.save(str(output_path))
+            return start_version, start_ec
+        except (qrcode.exceptions.DataOverflowError, ValueError):
+            pass
 
-    # Шаг 1: Перебираем version start_version..40 с H (30%)
-    for version in range(start_version, 41):
+    # Шаг 1: перебор цифр 1..40 с шагом QR_FORWARD_DIGIT_STEP (все с H)
+    for version in range(start_version, 41, max(1, QR_FORWARD_DIGIT_STEP)):
         try:
             qr = qrcode.QRCode(
                 version=version,
                 error_correction=qrcode.constants.ERROR_CORRECT_H,
                 box_size=10,
-                border=4
+                border=4,
             )
             qr.add_data(conf_text)
             qr.make(fit=False)
-
-            # Успех!
             img = qr.make_image(fill_color="black", back_color="white")
             img.save(str(output_path))
-            return version
-
+            return version, qrcode.constants.ERROR_CORRECT_H
         except (qrcode.exceptions.DataOverflowError, ValueError):
-            # Не влезло в эту версию — пробуем следующую
             continue
 
-    # Шаг 2: H не влез ни в один version — пробуем L (7%) с version 40
-    try:
-        qr = qrcode.QRCode(
-            version=40,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4
-        )
-        qr.add_data(conf_text)
-        qr.make(fit=False)
+    # Шаг 2: перебор букв Q→M→L (version=40) с шагом QR_FORWARD_LETTER_STEP
+    letters = [
+        qrcode.constants.ERROR_CORRECT_Q,
+        qrcode.constants.ERROR_CORRECT_M,
+        qrcode.constants.ERROR_CORRECT_L,
+    ]
+    for i in range(0, len(letters), max(1, QR_FORWARD_LETTER_STEP)):
+        ec = letters[i]
+        try:
+            qr = qrcode.QRCode(
+                version=40,
+                error_correction=ec,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(conf_text)
+            qr.make(fit=False)
+            img = qr.make_image(fill_color="black", back_color="white")
+            img.save(str(output_path))
+            return 40, ec
+        except (qrcode.exceptions.DataOverflowError, ValueError):
+            continue
 
-        # Успех!
-        img = qr.make_image(fill_color="black", back_color="white")
-        img.save(str(output_path))
-        return 40
-
-    except (qrcode.exceptions.DataOverflowError, ValueError):
-        pass
-
-    # Ни одно не сработало
-    raise RuntimeError(f"Конфиг слишком большой для QR кода (max version=40, min error_correction=L)")
+    raise RuntimeError("Конфиг слишком большой для QR кода")
 
 
 def _add_file_to_zip(zipf: zipfile.ZipFile, file_path: str, arcname: Optional[str] = None) -> bool:
@@ -6735,6 +6767,8 @@ def generate_qr_codes(
     # Собираем все конфиги в один список
     all_configs: List[str] = []
     client_matched_stems: Set[str] = set()
+    # Сортируем по (суффикс, метка_эндпоинта, клиент) — группируем по AllowedIPs/Endpoint
+    client_configs: List[Tuple[str, str, str, str]] = []
 
     # --- Клиентские конфиги (с фильтром) ---
     if qr_filter is None:
@@ -6750,9 +6784,25 @@ def generate_qr_codes(
         if g_main_config_fn and p.name == g_main_config_fn.name:
             continue
         stem = p.stem
-        if any(tag in stem for tag in qr_filter):
-            all_configs.append(str(p))
+        # Ищем суффикс (первый совпадающий тег из qr_filter)
+        suffix = ""
+        client = stem
+        ep_label = ""
+        for tag in sorted(qr_filter, key=len, reverse=True):
+            if tag and tag in stem:
+                pos = stem.index(tag)
+                if pos >= 0:
+                    suffix = tag
+                    client = stem[:pos]
+                    ep_label = stem[pos + len(tag):]
+                    break
+        if suffix:
+            client_configs.append((suffix, ep_label, client, str(p)))
             client_matched_stems.add(stem)
+
+    # Сортируем по (суффикс, метка, клиент)
+    client_configs.sort(key=lambda x: (x[0], x[1], x[2]))
+    all_configs = [item[3] for item in client_configs]
 
     # --- WARP конфиги (все подряд) ---
     if warp_configs:
@@ -6772,12 +6822,44 @@ def generate_qr_codes(
     # --- Единый цикл генерации QR ---
     logger.info('📱 Генерация QR-кодов (%d конфигов)...', len(all_configs))
     next_version = 1
+    next_ec = -1
+    last_group = ("", "")
     for fn in all_configs:
         try:
+            # Определяем группу (суффикс, ep_label) для сброса при смене
+            stem = pathlib.Path(fn).stem
+            cur_suffix = ""
+            cur_ep = ""
+            for tag in sorted(qr_filter, key=len, reverse=True) if qr_filter else []:
+                if tag and tag in stem:
+                    pos = stem.index(tag)
+                    if pos >= 0:
+                        cur_suffix = tag
+                        cur_ep = stem[pos + len(tag):]
+                        break
+            group = (cur_suffix, cur_ep)
+            if group != last_group:
+                next_version = 1
+                next_ec = -1
+                last_group = group
+
             with open(fn, 'r', encoding='utf-8') as file:
                 conf = file.read()
             png_path = pathlib.Path(fn).with_suffix('.png')
-            next_version = _generate_qr_image(conf, png_path, start_version=next_version)
+            next_version, next_ec = _generate_qr_image(
+                conf, png_path,
+                start_version=next_version,
+                start_ec=next_ec,
+            )
+            # Уменьшаем на шаг для следующего конфига (backward)
+            if _QR_STEPS:
+                try:
+                    idx = _QR_STEPS.index((next_version, next_ec))
+                    step = QR_BACKWARD_DIGIT_STEP if idx <= 39 else QR_BACKWARD_LETTER_STEP
+                    new_idx = max(0, idx - max(1, step))
+                    next_version, next_ec = _QR_STEPS[new_idx]
+                except ValueError:
+                    pass  # не найдено в списке — оставляем как есть
         except Exception as e:
             logger.error('❌ Ошибка генерации QR для %s: %s', fn, e)
 
