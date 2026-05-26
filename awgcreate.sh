@@ -18,7 +18,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/hea
 # 2. Установка Python зависимостей
 echo ">>> Установка Python зависимостей..."
 apt-get update -qq
-apt-get install -y -qq python3 python3-pip python3-qrcode python3-requests python3-socks
+apt-get install -y -qq python3 python3-pip python3-qrcode python3-requests python3-socks python3-cryptography
 
 # 3. Создание папки и загрузка awgcreate.py
 echo ">>> Загрузка awgcreate.py..."
