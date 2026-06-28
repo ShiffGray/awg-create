@@ -37,6 +37,11 @@ try:
 except ImportError:
     qrcode = None
 
+try:
+    import cryptography
+except ImportError:
+    cryptography = None
+
 # ----------------- Настройки логирования -----------------
 # Короткий формат: время (час:мин:сек) + смайлик уровня + сообщение
 logging.basicConfig(
@@ -4072,12 +4077,14 @@ def _generate_h_params_ranges() -> Tuple[str, str, str, str]:
             f"{ranges[3][0]}-{ranges[3][1]}")
 
 
-def _generate_i_params() -> Dict[str, str]:
+def _generate_i_params(for_client: bool = False, for_server: bool = True, domain: str = "", seed: str = "") -> Dict[str, str]:
     """Генерация I1-I5 (CPS-пакеты для маскировки под легитимные UDP протоколы).
 
-    Из пула 6 протоколов (A-F) случайно выбирается 3-5 неповторяющихся
-    и распределяются в случайном порядке по I1-IN.
-    Генерируются ТОЛЬКО выбранные протоколы — без накладных расходов.
+    Если указан domain — генерируются QUIC ClientHello с его SNI (для клиента)
+    или QUIC ServerHello (для сервера). Если domain не указан — старый пул из 6 протоколов.
+
+    Если доступна библиотека cryptography — QUIC пакеты шифруются (AES-128-GCM + Header Protection),
+    что делает их неотличимыми от настоящих QUIC Initial/Handshake.
 
     Контролируемые диапазоны (можно менять под свои нужды):
       I_TEXT_MIN/I_TEXT_MAX — длина текста I-строк в конфиге (символы)
@@ -4089,7 +4096,16 @@ def _generate_i_params() -> Dict[str, str]:
     I_TEXT_MAX = 180    # Макс. длина текста всех I-строк в конфиге
     I_TRAFFIC_MIN = 600 # Мин. объём генерируемого трафика (r+rc+rd)
     I_TRAFFIC_MAX = 900 # Макс. объём генерируемого трафика (r+rc+rd)
+    I_COUNT_MIN = 3     # Мин. количество I-строк (старый пул)
+    I_COUNT_MAX = 5     # Макс. количество I-строк (старый пул)
     MAX_ATTEMPTS = 10   # Лимит попыток чтобы не зависнуть
+    # Для пулов с 1 протоколом (domain / server) — мягкие рамки
+    I_SNI_TEXT_MIN = 30
+    I_SNI_TEXT_MAX = 120
+    I_SNI_TRAFFIC_MIN = 200
+    I_SNI_TRAFFIC_MAX = 600
+    I_SNI_COUNT_MIN = 3     # Количество I-строк для single-pool
+    I_SNI_COUNT_MAX = 5
     # ──────────────────────────────────────────────────────────────
 
     # Пул протоколов в виде функций — генерируется только при вызове
@@ -4141,17 +4157,280 @@ def _generate_i_params() -> Dict[str, str]:
             random_digits=8, random_digits_range=4,
         )
 
-    pool_fns = [_gen_dns, _gen_quic, _gen_dtls, _gen_ntp, _gen_random, _gen_srtp]
+    # ────────────────────────────────────────────────────────────────
+
+    # Протоколы для маскировки под конкретный домен (через ;domain=)
+    # ─── Шифрование QUIC Initial (AES-128-GCM + Header Protection) ───
+    _QUIC_INITIAL_SALT = bytes.fromhex('38762cf7f55934b34d179ae6a4c80cadccbb7f0a')
+    try_AESGCM = None
+    if cryptography is not None:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.backends import default_backend
+        import hmac, hashlib
+
+        def _hkdf_extract(salt, ikm):
+            return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+        def _hkdf_expand(prk, info, length):
+            hkdf = HKDFExpand(algorithm=hashes.SHA256(), length=length, info=info, backend=default_backend())
+            return hkdf.derive(prk)
+
+        def _quic_encrypt_initial(dcid_hex: str, scid_hex: str, plaintext_hex: str) -> str:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+            dcid = bytes.fromhex(dcid_hex)
+            scid = bytes.fromhex(scid_hex)
+            prk = _hkdf_extract(_QUIC_INITIAL_SALT, dcid)
+            key = _hkdf_expand(prk, b'tls13 quic key', 16)
+            iv  = _hkdf_expand(prk, b'tls13 quic iv', 12)
+            hp  = _hkdf_expand(prk, b'tls13 quic hp', 16)
+
+            plaintext = bytes.fromhex(plaintext_hex)
+            pn = 0
+            pn_bytes = pn.to_bytes(1, 'big')
+            # AAD = type + version + DCID_len + DCID + SCID_len + SCID + Token_len + Length
+            aad = (b'\xc0\x00\x00\x00\x01'
+                   b'\x08' + dcid +
+                   b'\x08' + scid +
+                   b'\x00')
+            payload_len = len(plaintext) + 1 + 16  # +1 PN byte, +16 GCM tag
+            aad += payload_len.to_bytes(2, 'big')
+            # Nonce = IV[0..n] XOR PN, IV[n+1..11] без изменений (n=0 для 1-byte PN)
+            nonce = bytearray(iv)
+            nonce[0] ^= pn
+            nonce = bytes(nonce)
+            # AES-128-GCM encrypt
+            aesgcm = AESGCM(key)
+            ct = aesgcm.encrypt(nonce, plaintext, aad)
+            encrypted = ct[:-16]
+            tag = ct[-16:]
+            # Header Protection: sample = encrypted bytes 0..15
+            sample = encrypted[:16]
+            ecb_cipher = Cipher(algorithms.AES(hp), modes.ECB(), backend=default_backend())
+            ecb_enc = ecb_cipher.encryptor()
+            mask = ecb_enc.update(sample) + ecb_enc.finalize()
+
+            first_byte = 0xc0 ^ (mask[0] & 0x0f)
+            pn_protected = bytes([pn_bytes[0] ^ (mask[1] if len(mask) > 1 else 0)])
+
+            result_hex = (
+                first_byte.to_bytes(1, 'big').hex() +
+                aad[1:].hex() +
+                pn_protected.hex() +
+                encrypted.hex() +
+                tag.hex()
+            )
+            return result_hex
+
+        try_AESGCM = _quic_encrypt_initial
+
+    def _build_quic_packet(crypto_hex: str, default_range: int = 60,
+                           scid_hex_preset: str = "") -> Tuple[str, int]:
+        """Оборачивает hex CRYPTO frame в QUIC Long Header (с шифрованием если доступно)."""
+        dcid_hex = secrets.token_hex(8)
+        scid_hex = scid_hex_preset or secrets.token_hex(8)
+        if try_AESGCM is not None:
+            return try_AESGCM(dcid_hex, scid_hex, crypto_hex), 0
+        payload_len = len(crypto_hex) // 2 + 1
+        quic_hex = (f"c000000001"
+                    f"08{dcid_hex}"
+                    f"08{scid_hex}"
+                    f"00"
+                    f"{payload_len:04x}"
+                    f"00"
+                    f"{crypto_hex}")
+        return quic_hex, default_range
+
+    # ────────────────────────────────────────────────────────────────
+
+    def _gen_quic_client():
+        """QUIC Initial с полноценным TLS 1.2 ClientHello + SNI."""
+        sni_bytes = domain.encode('utf-8')
+        sni_hex = sni_bytes.hex()
+        random_hex = secrets.token_hex(32)
+        session_id_hex = secrets.token_hex(32)
+
+        # TLS 1.2 cipher suites (первый — детерминированный от seed, совпадает с сервером)
+        suites_pool = ["c02b", "c02f", "c02c", "c030", "cca8", "cca9",
+                       "c013", "c014", "0033", "0039", "002f", "009c"]
+        if seed:
+            # Тот же seed и тот же пул что на сервере → одинаковый выбранный cipher
+            rnd = random.Random(seed)
+            preferred = rnd.choice(["c02b", "c02f", "c02c", "c030", "cca8", "cca9"])
+            suites_pool.remove(preferred)
+            suites_pool.insert(0, preferred)
+        cipher_hex = "".join(suites_pool)
+        cipher_len = len(cipher_hex) // 2
+        # SNI extension
+        sni_ext_hex = f"0000{len(sni_bytes)+5:04x}00{len(sni_bytes):04x}{sni_hex}"
+        # supported_groups (x25519, secp256r1, secp384r1)
+        groups_hex = ("000a00140012001d0017001800190100"
+                      "1c000b000a000900080007")
+        # signature_algorithms (ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, ...)
+        sigalgs_hex = ("000d0020001e06010602060305010502"
+                       "050304010402040308040804050806")
+        # ALPN (h2, http/1.1)
+        alpn_hex = "0010000e000c02683208687474702f312e31"
+        # supported_versions: только TLS 1.2 (0x0303)
+        sv_hex = "002b0003020303"
+        # ec_point_formats: uncompressed
+        ecpt_hex = "000b00020100"
+        # QUIC Transport Parameters
+        scid_hex = secrets.token_hex(8)
+        tp_body = (
+            "00" + f"{len(scid_hex)//2:04x}" + scid_hex +        # initial_source_connection_id
+            "01" + "0002" + "7530" +                              # max_idle_timeout (30000ms)
+            "03" + "0002" + "04b0" +                              # max_udp_payload_size (1200)
+            "04" + "0004" + "00010000" +                          # initial_max_data (65536)
+            "06" + "0002" + "0100" +                              # initial_max_streams_bidi (256)
+            "07" + "0002" + "0100"                                # initial_max_streams_uni (256)
+        )
+        qtp_hex = "0039" + f"{len(tp_body)//2:04x}" + tp_body
+        # key_share (X25519 dummy public key)
+        ks_hex = "0033" + "0026" + "0024" + "001d" + "0020" + secrets.token_hex(32)
+        # All extensions
+        ext_hex = (f"0000{len(sni_ext_hex)//2:04x}{sni_ext_hex}"  # SNI
+                   f"{groups_hex}"                                 # supported_groups
+                   f"{sigalgs_hex}"                                # signature_algorithms
+                   f"{sv_hex}"                                     # supported_versions
+                   f"{alpn_hex}"                                   # ALPN
+                   f"{ecpt_hex}"                                   # ec_point_formats
+                   f"{qtp_hex}"                                    # QUIC transport params
+                   f"ff01000100"                                   # renegotiation_info
+                   f"00120000"                                     # signed_certificate_timestamp (empty)
+                   f"{ks_hex}")                                    # key_share
+        ext_len = len(ext_hex) // 2
+        # ClientHello body
+        ch_body = (f"0303{random_hex}20{session_id_hex}"  # version + random + session
+                   f"{cipher_len:04x}{cipher_hex}"         # cipher suites
+                   f"0100"                                 # compression: null
+                   f"{ext_len:04x}{ext_hex}")              # extensions
+        ch_len = len(ch_body) // 2
+        ch_hex = f"01{ch_len:06x}{ch_body}"
+        # QUIC CRYPTO Frame (plaintext для шифрования)
+        crypto_hex = f"06" + "00000000" + f"{len(ch_hex)//2:08x}{ch_hex}"
+        quic_hex, qr_static_range = _build_quic_packet(crypto_hex, scid_hex_preset=scid_hex)
+        if try_AESGCM is not None:
+            # Шифрованный пакет — мусор после tag выдаст DPI
+            rb, rbr, ra, rar, rd, rdr = 0, 0, 0, 0, 0, 0
+        else:
+            rb, rbr, ra, rar, rd, rdr = 400, 200, 200, 200, 20, 10
+        return generate_cps_packet(
+            static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
+            use_timestamp=True,
+            random_bytes=rb, random_bytes_range=rbr,
+            random_ascii=ra, random_ascii_range=rar,
+            random_digits=rd, random_digits_range=rdr,
+        )
+
+    def _gen_quic_client_handshake():
+        """QUIC Handshake (завершение рукопожатия клиента)."""
+        payload = secrets.token_hex(64)
+        handshake_hex = (f"e000000001{secrets.token_hex(8)}{secrets.token_hex(8)}"
+                         f"00"                                           # Token_len=0
+                         f"{len(payload)//2:04x}"                        # Length
+                         f"00"                                           # PN=0
+                         f"{payload}")
+        return generate_cps_packet(
+            static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
+            use_timestamp=True,
+            random_bytes=200, random_bytes_range=100,
+            random_ascii=100, random_ascii_range=100,
+            random_digits=10, random_digits_range=5,
+        )
+
+    def _gen_quic_server():
+        """QUIC с TLS 1.2 ServerHello."""
+        random_hex = secrets.token_hex(32)
+        session_id_hex = secrets.token_hex(32)
+        chosen_cipher = (random.Random(seed).choice([
+            "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
+        ]) if seed else secrets.choice([
+            "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
+        ]))
+        sh_body = (f"0303{random_hex}20{session_id_hex}"
+                   f"{chosen_cipher}"
+                   f"00")
+        sh_len = len(sh_body) // 2
+        sh_hex = f"02{sh_len:06x}{sh_body}"
+        crypto_hex = f"06" + "00000000" + f"{len(sh_hex)//2:08x}{sh_hex}"
+        quic_hex, qr_static_range = _build_quic_packet(crypto_hex, default_range=40)
+
+        if try_AESGCM is not None:
+            rb, rbr, ra, rar, rd, rdr = 0, 0, 0, 0, 0, 0
+        else:
+            rb, rbr, ra, rar, rd, rdr = 300, 200, 300, 200, 20, 10
+        return generate_cps_packet(
+            static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
+            use_timestamp=True,
+            random_bytes=rb, random_bytes_range=rbr,
+            random_ascii=ra, random_ascii_range=rar,
+            random_digits=rd, random_digits_range=rdr,
+        )
+
+    def _gen_quic_server_handshake():
+        """QUIC серверное завершение handshake."""
+        payload = secrets.token_hex(48)
+        handshake_hex = (f"e000000001{secrets.token_hex(8)}{secrets.token_hex(8)}"
+                         f"00"
+                         f"{len(payload)//2:04x}"
+                         f"00"
+                         f"{payload}")
+        return generate_cps_packet(
+            static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
+            use_timestamp=True,
+            random_bytes=200, random_bytes_range=100,
+            random_ascii=150, random_ascii_range=100,
+            random_digits=10, random_digits_range=5,
+        )
+
+    # Определяем пул в зависимости от направления и domain
+    if for_server:
+        # Сервер — всегда сигнатуры ответа
+        pool_fns = [_gen_quic_server, _gen_quic_server_handshake]
+    elif domain:
+        pool_fns = [_gen_quic_client, _gen_quic_client_handshake]
+    else:
+        # Стандартный случайный пул
+        pool_fns = [_gen_dns, _gen_quic, _gen_dtls, _gen_ntp, _gen_random, _gen_srtp]
 
     # Генерация с валидацией диапазонов
+    # Флаг для неслучайных пулов (domain / server) — строгий порядок Initial→Handshake
+    is_imitation_pool = for_server or bool(domain)
+
     selected = []
     best_selected = None
     best_distance = float('inf')
     for attempt in range(MAX_ATTEMPTS):
-        count = random.randint(3, 5)
-        current = [fn() for fn in random.sample(pool_fns, count)]
+        if is_imitation_pool:
+            # Циклическое заполнение: I1=Initial, I2=Handshake, I3=Initial, I4=Handshake...
+            count = random.randint(I_SNI_COUNT_MIN, I_SNI_COUNT_MAX)
+            current = [pool_fns[i % len(pool_fns)]() for i in range(count)]
+        else:
+            is_single_pool = len(pool_fns) == 1
+            if is_single_pool:
+                min_count = I_SNI_COUNT_MIN
+                max_possible = I_SNI_COUNT_MAX
+            else:
+                max_count = len(pool_fns)
+                min_count = min(I_COUNT_MIN, max_count)
+                max_possible = min(I_COUNT_MAX, max_count)
+            if min_count >= max_possible:
+                count = min_count
+            else:
+                count = random.randint(min_count, max_possible)
+            current = [fn() for fn in random.sample(pool_fns, min(count, len(pool_fns)))]
+            random.shuffle(current)
 
         # Проверка веса строк и объёма трафика
+        use_sni_ranges = is_imitation_pool or (len(pool_fns) == 1)
+        t_min = I_SNI_TEXT_MIN if use_sni_ranges else I_TEXT_MIN
+        t_max = I_SNI_TEXT_MAX if use_sni_ranges else I_TEXT_MAX
+        tr_min = I_SNI_TRAFFIC_MIN if use_sni_ranges else I_TRAFFIC_MIN
+        tr_max = I_SNI_TRAFFIC_MAX if use_sni_ranges else I_TRAFFIC_MAX
+
         text_total = sum(len(s) for s in current)
         traffic_total = sum(
             sum(int(x) for x in re.findall(r'<r (\d+)>', s)) +
@@ -4160,13 +4439,13 @@ def _generate_i_params() -> Dict[str, str]:
             for s in current
         )
 
-        if I_TEXT_MIN <= text_total <= I_TEXT_MAX and I_TRAFFIC_MIN <= traffic_total <= I_TRAFFIC_MAX:
+        if t_min <= text_total <= t_max and tr_min <= traffic_total <= tr_max:
             selected = current
             break
 
         # Отклонения от диапазонов
-        text_err = max(0, I_TEXT_MIN - text_total) + max(0, text_total - I_TEXT_MAX)
-        traffic_err = max(0, I_TRAFFIC_MIN - traffic_total) + max(0, traffic_total - I_TRAFFIC_MAX)
+        text_err = max(0, t_min - text_total) + max(0, text_total - t_max)
+        traffic_err = max(0, tr_min - traffic_total) + max(0, traffic_total - tr_max)
         distance = text_err + traffic_err
         if distance < best_distance:
             best_distance = distance
@@ -4176,8 +4455,9 @@ def _generate_i_params() -> Dict[str, str]:
         # Не нашли идеального — используем лучший
         selected = best_selected if best_selected else selected
 
-    # Перемешиваем порядок уже сгенерированных пакетов
-    random.shuffle(selected)
+    # Перемешиваем порядок — только для случайных пулов
+    if not is_imitation_pool:
+        random.shuffle(selected)
 
     # Распределяем по I1-IN
     result = {}
@@ -4188,7 +4468,7 @@ def _generate_i_params() -> Dict[str, str]:
 
 
 
-def generate_all_params(version: str, for_client: bool = False, for_server: bool = True, for_warp: bool = False) -> dict:
+def generate_all_params(version: str, for_client: bool = False, for_server: bool = True, for_warp: bool = False, domain: str = "", tun_name: str = "", seed_override: str = "") -> dict:
     """
     УНИВЕРСАЛЬНАЯ ФУНКЦИЯ — генерирует ВСЕ параметры обфускации сразу.
 
@@ -4227,7 +4507,8 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
     # Генерируем полный набор параметров для максимальной версии (AWG2.0)
     Jc, Jmin, Jmax = _generate_j_params()
     S1, S2, S3, S4 = _generate_s_params()
-    
+    _i_seed = seed_override if seed_override else f"{S1}{S2}"
+
     # H1-H4: статичные для AWG1.0/1.5, диапазоны для AWG2.0
     if version == "AWG2.0":
         H1, H2, H3, H4 = _generate_h_params_ranges()
@@ -4287,10 +4568,10 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
     # AWG1.5, AWG2.0: активные значения для всех конфигов
     # WG, AWG, AWG1.0: коммент для сервера, нет для клиента/WARP
     if supports_i:
-        result.update(_generate_i_params())
+        result.update(_generate_i_params(for_client=for_client, for_server=for_server, domain=domain, seed=_i_seed))
     else:
         if for_server and not for_warp:
-            i_params = _generate_i_params()
+            i_params = _generate_i_params(for_client=for_client, for_server=for_server, domain=domain, seed=_i_seed)
             result.update({
                 "I1": i_params.get("I1"),
                 "I2": i_params.get("I2"),
@@ -5091,15 +5372,25 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
         raw = p
         label = ""
         mtu_val = ""
+        domain_val = ""
 
-        # Опциональный MTU: ;mtu=1300 в конце строки
-        if ";mtu=" in p:
-            p, mtu_part = p.split(";mtu=", 1)
-            mtu_str = mtu_part.split(",")[0].strip()
-            if mtu_str.isdigit():
-                m = int(mtu_str)
-                if 1280 <= m <= 1440:
-                    mtu_val = mtu_str
+        # Парсинг ;key=value,key=value
+        if ";" in p:
+            p, param_str = p.split(";", 1)
+            params = {}
+            for pair in param_str.split(","):
+                pair = pair.strip()
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    params[k.strip()] = v.strip()
+            m = params.get("mtu", "")
+            if m and m.isdigit():
+                mi = int(m)
+                if 1280 <= mi <= 1440:
+                    mtu_val = m
+            d = params.get("domain", "")
+            if d:
+                domain_val = d
 
         hostport = p
         if hostport.startswith('['):
@@ -5131,7 +5422,7 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
                             port = default_port
                     except Exception:
                         port = default_port
-                out.append({"host": host, "port": str(port), "label": label, "mtu": mtu_val})
+                out.append({"host": host, "port": str(port), "label": label, "mtu": mtu_val, "domain": domain_val})
                 continue
             except ValueError:
                 hostport = p
@@ -5157,7 +5448,7 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
                 lbl = ""
 
         if hostpart.count(':') >= 2:
-            out.append({"host": hostpart.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
+            out.append({"host": hostpart.strip(), "port": default_port, "label": lbl, "mtu": mtu_val, "domain": domain_val})
             continue
 
         if ':' in hostpart:
@@ -5167,18 +5458,18 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
                 try:
                     prt_int = int(prt_val)
                     if 1 <= prt_int <= 65535:
-                        out.append({"host": h.strip(), "port": str(prt_int), "label": lbl, "mtu": mtu_val})
+                        out.append({"host": h.strip(), "port": str(prt_int), "label": lbl, "mtu": mtu_val, "domain": domain_val})
                     else:
-                        out.append({"host": h.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
+                        out.append({"host": h.strip(), "port": default_port, "label": lbl, "mtu": mtu_val, "domain": domain_val})
                 except Exception:
-                    out.append({"host": h.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
+                    out.append({"host": h.strip(), "port": default_port, "label": lbl, "mtu": mtu_val, "domain": domain_val})
                 continue
             else:
-                out.append({"host": hostpart.strip(), "port": default_port, "label": lbl, "mtu": mtu_val})
+                out.append({"host": hostpart.strip(), "port": default_port, "label": lbl, "mtu": mtu_val, "domain": domain_val})
                 continue
         else:
             h = hostpart.strip()
-            out.append({"host": h, "port": default_port, "label": lbl, "mtu": mtu_val})
+            out.append({"host": h, "port": default_port, "label": lbl, "mtu": mtu_val, "domain": domain_val})
     return out
 
 def get_server_public_address(cfg) -> str:
@@ -6195,7 +6486,68 @@ def handle_makecfg(opt) -> None:
     g_main_config_fn = target_path.resolve()
 
     if g_main_config_fn.exists():
-        raise RuntimeError(f'Файл уже существует: {g_main_config_fn}')
+        # Обновление существующего: J, I, PersistentKeepalive
+        logger.info('🔄 Конфиг %s уже существует — обновление Jc/Jmin/Jmax, I1-I5, PersistentKeepalive', g_main_config_fn)
+        cfg = WGConfig(str(g_main_config_fn))
+
+        # Определяем версию протокола из существующего конфига
+        _file_version = "AWG1.0"
+        _line_start = cfg.lines[0] if cfg.lines else ""
+        if "# Protocol:" in _line_start:
+            _file_version = _line_start.split(":")[-1].strip()
+
+        srv = cfg.iface
+
+        # Генерируем новые J и I параметры
+        _server_domain = ""
+        if g_endpoint_config_fn and g_endpoint_config_fn.exists():
+            try:
+                _ep_text = g_endpoint_config_fn.read_text('utf-8')
+                if ";domain=" in _ep_text:
+                    _server_domain = "any"
+            except Exception:
+                pass
+        obf_params = generate_all_params(_file_version, for_client=False, for_server=True, tun_name=tun_name, domain=_server_domain)
+
+        # Обновляем Jc/Jmin/Jmax
+        for p in ['Jc', 'Jmin', 'Jmax']:
+            val = obf_params.get(p)
+            if val is not None:
+                k = f"__this_server__|{p}"
+                if k in cfg.idsline:
+                    cfg.lines[cfg.idsline[k]] = f"{p} = {val}"
+                elif p in srv:
+                    srv[p] = val
+
+        # Обновляем PersistentKeepalive у всех пиров (до I-lines, пока idsline актуален)
+        for pname in list(cfg.peer.keys()):
+            new_pk = _generate_persistent_keepalive()
+            pk_key = f"{pname}|PersistentKeepalive"
+            if pk_key in cfg.idsline:
+                cfg.lines[cfg.idsline[pk_key]] = f"PersistentKeepalive = {new_pk}"
+
+        # Обновляем I1-I5: добавляем/удаляем/заменяем строки
+        new_lines = []
+        i_added = set()
+        for line in cfg.lines:
+            match = re.match(r'^(#\s*)?(I[1-5])\s*=\s*(.+)$', line)
+            if match:
+                raw_key = match.group(2)
+                key_num = int(raw_key[1:])
+                val = obf_params.get(raw_key)
+                if val is not None:
+                    new_lines.append(f"{raw_key} = {val}")
+                    i_added.add(key_num)
+            else:
+                new_lines.append(line)
+        for i in range(1, 6):
+            if i not in i_added and obf_params.get(f"I{i}") is not None:
+                new_lines.append(f"I{i} = {obf_params[f'I{i}']}")
+        cfg.lines = new_lines
+
+        cfg.save()
+        logger.info('✅ Конфиг %s обновлён', g_main_config_fn)
+        return
 
     # Используем указанный интерфейс или определяем автоматически
     if opt.iface:
@@ -6224,8 +6576,18 @@ def handle_makecfg(opt) -> None:
     # Инициализируем random уникальным seed
     _init_random_seed()
 
-    # Генерируем параметры обфускации для СЕРВЕРА (for_client=False, for_server=True)
-    obf_params = generate_all_params(awg_version, for_client=False, for_server=True)
+    # Определяем нужна ли имитация рукопожатия на сервере (есть ли domain= в _endpoint.config)
+    _server_domain = ""
+    if g_endpoint_config_fn and g_endpoint_config_fn.exists():
+        try:
+            _ep_text = g_endpoint_config_fn.read_text('utf-8')
+            if ";domain=" in _ep_text:
+                _server_domain = "any"  # любое непустое значение — включает imitation pool
+        except Exception:
+            pass
+
+    # Генерируем параметры обфускации для СЕРВЕРА
+    obf_params = generate_all_params(awg_version, for_client=False, for_server=True, tun_name=tun_name, domain=_server_domain)
 
     up_path = g_main_config_fn.parent.joinpath(f"{tun_name}up.sh")
     down_path = g_main_config_fn.parent.joinpath(f"{tun_name}down.sh")
@@ -6662,11 +7024,6 @@ def handle_confgen(opt) -> Set[str]:
         # time.time_ns() ^ os.getpid() ^ hash(peer_name) = уникальный seed даже для пакетной генерации
         _init_random_seed(hash(peer_name))
 
-        # Генерируем параметры для КЛИЕНТА через общую функцию
-        # for_client=True — генерировать I1-I5 для клиента
-        # for_server=False — S1, S2, S3, S4, H1-H4 будут None (клиент читает из серверного конфига)
-        client_obf_params = generate_all_params(server_protocol, for_client=True, for_server=False)
-
         persistent_keepalive = _generate_persistent_keepalive()
         mtu = srv.get('MTU', str(opt.mtu))
 
@@ -6676,6 +7033,9 @@ def handle_confgen(opt) -> Set[str]:
         # Получаем параметры сервера
         server_params = _get_server_params(server_conf_text, server_protocol)
 
+        # seed для cipher suite должен совпадать с серверным (S1 + S2)
+        i_seed = f"{server_params.get('S1', '')}{server_params.get('S2', '')}"
+
         for idx, ep in enumerate(endpoints, start=1):
             host = ep.get('host', '')
             port = ep.get('port', default_port)
@@ -6684,6 +7044,18 @@ def handle_confgen(opt) -> Set[str]:
             # Per-endpoint MTU (если указан в _endpoint.config как ;mtu=N)
             ep_mtu = ep.get('mtu', '')
             use_mtu = ep_mtu if ep_mtu else mtu
+
+            # Per-endpoint domain (маскировка под конкретный сервис)
+            ep_domain = ep.get('domain', '')
+
+            # Генерируем обфускацию для этого эндпоинта (с учётом domain)
+            client_obf_params = generate_all_params(
+                server_protocol,
+                for_client=True,
+                for_server=False,
+                domain=ep_domain,
+                seed_override=i_seed,
+            )
 
             if single_endpoint:
                 ep_label = "" if not raw_label else raw_label
