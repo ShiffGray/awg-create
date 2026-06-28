@@ -632,6 +632,19 @@ install_kernel_mode() {
 install_default_mode() {
     log_info "Режим: установка пакета amneziawg (dkms + tools)..."
 
+    # Проверка заголовков ядра
+    if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
+        log_info "Заголовки ядра не найдены, устанавливаю..."
+        apt-get install -y linux-headers-$(uname -r) 2>/dev/null || {
+            apt-get install -y pve-headers-$(uname -r) 2>/dev/null || {
+                log_warning "Не удалось установить заголовки ядра. dkms может не собраться."
+            }
+        }
+        if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
+            log_warning "Заголовки ядра не установлены — dkms может не собраться"
+        fi
+    fi
+
     # Пробуем установить мета-пакет (он сам подтянет dkms и tools)
     apt-get install -y amneziawg 2>&1 | grep -v "Error\|dpkg:\|Errors were" || true
 
