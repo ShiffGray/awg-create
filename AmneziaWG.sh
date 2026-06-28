@@ -557,30 +557,33 @@ install_go_mode() {
     fi
 }
 
+# Проверка и установка заголовков ядра
+check_kernel_headers() {
+    if [ -d "/lib/modules/$(uname -r)/build" ]; then
+        return 0
+    fi
+    log_info "Заголовки ядра не найдены, устанавливаю..."
+    apt-get install -y linux-headers-$(uname -r) 2>/dev/null || {
+        apt-get install -y pve-headers-$(uname -r) 2>/dev/null || {
+            log_warning "Не удалось установить заголовки ядра. dkms может не собраться."
+            log_warning "Попробуйте: apt install linux-headers-$(uname -r)"
+            log_warning "Или используйте: AmneziaWG.sh -g (go-режим)"
+        }
+    }
+    if [ -d "/lib/modules/$(uname -r)/build" ]; then
+        log_success "Заголовки ядра установлены"
+        return 0
+    else
+        log_warning "Заголовки ядра не установлены — dkms может не собраться"
+        return 1
+    fi
+}
+
 # Режим KERNEL: amneziawg-dkms + amneziawg-tools (удалить go)
 install_kernel_mode() {
     log_info "Режим: amneziawg-dkms + amneziawg-tools (без go)..."
 
-    # 0. Проверка и установка заголовков ядра (нужны для dkms)
-    if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
-        log_info "Заголовки ядра не найдены, устанавливаю..."
-        # Debian/Ubuntu
-        apt-get install -y linux-headers-$(uname -r) 2>/dev/null || {
-            # Proxmox
-            apt-get install -y pve-headers-$(uname -r) 2>/dev/null || {
-                log_warning "Не удалось установить заголовки ядра. Kernel модуль не соберётся."
-                log_warning "Попробуйте: apt install linux-headers-$(uname -r)"
-                log_warning "Или используйте: AmneziaWG.sh -g (go-режим)"
-            }
-        }
-        if [ -d "/lib/modules/$(uname -r)/build" ]; then
-            log_success "Заголовки ядра установлены"
-        else
-            log_error "Заголовки ядра не установлены — dkms не сможет собрать модуль"
-        fi
-    else
-        log_success "Заголовки ядра уже установлены"
-    fi
+    check_kernel_headers
 
     # 1. СНАЧАЛА гарантируем наличие инструментов
     if ! dpkg -l | grep -q "^ii[[:space:]]*amneziawg-tools[[:space:]]" 2>/dev/null; then
@@ -632,18 +635,7 @@ install_kernel_mode() {
 install_default_mode() {
     log_info "Режим: установка пакета amneziawg (dkms + tools)..."
 
-    # Проверка заголовков ядра
-    if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
-        log_info "Заголовки ядра не найдены, устанавливаю..."
-        apt-get install -y linux-headers-$(uname -r) 2>/dev/null || {
-            apt-get install -y pve-headers-$(uname -r) 2>/dev/null || {
-                log_warning "Не удалось установить заголовки ядра. dkms может не собраться."
-            }
-        }
-        if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
-            log_warning "Заголовки ядра не установлены — dkms может не собраться"
-        fi
-    fi
+    check_kernel_headers
 
     # Пробуем установить мета-пакет (он сам подтянет dkms и tools)
     apt-get install -y amneziawg 2>&1 | grep -v "Error\|dpkg:\|Errors were" || true
