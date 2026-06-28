@@ -1,4 +1,11 @@
+Рекомендую перед установкой выполнить полное обновление системы и перезагрузиться:
+```sh
+apt update && apt full-upgrade -y && reboot
+```
+Это обновит ядро и установит актуальные заголовки (linux-headers),
+необходимые для сборки модуля AmneziaWG (DKMS).
 
+После:
 ```sh
 bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/heads/main/awgcreate.sh)
 ```
