@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# AmneziaWG Installer v6.1
+# AmneziaWG Installer v6.5
 # Ubuntu 20.04-26.04 | Debian 11-13
 # Режимы: --go/-g (go из исходников), --kernel/-k (dkms), без флага (meta-пакет)
 # Чистый код с учётом всех ошибок
@@ -278,6 +278,7 @@ install_resolvconf() {
 
     # Попытка 1: openresolv (предпочтительно)
     log_info "Устанавливаем openresolv..."
+    chattr -i /etc/resolv.conf 2>/dev/null || true
     if apt-get install -y --reinstall openresolv 2>/dev/null; then
         log_success "openresolv установлен"
         create_resolvconf_symlinks
@@ -286,6 +287,7 @@ install_resolvconf() {
 
     # Попытка 2: resolvconf
     log_info "Устанавливаем resolvconf..."
+    chattr -i /etc/resolv.conf 2>/dev/null || true
     if apt-get install -y --reinstall resolvconf 2>/dev/null; then
         log_success "resolvconf установлен"
         create_resolvconf_symlinks
@@ -559,6 +561,27 @@ install_go_mode() {
 install_kernel_mode() {
     log_info "Режим: amneziawg-dkms + amneziawg-tools (без go)..."
 
+    # 0. Проверка и установка заголовков ядра (нужны для dkms)
+    if [ ! -d "/lib/modules/$(uname -r)/build" ]; then
+        log_info "Заголовки ядра не найдены, устанавливаю..."
+        # Debian/Ubuntu
+        apt-get install -y linux-headers-$(uname -r) 2>/dev/null || {
+            # Proxmox
+            apt-get install -y pve-headers-$(uname -r) 2>/dev/null || {
+                log_warning "Не удалось установить заголовки ядра. Kernel модуль не соберётся."
+                log_warning "Попробуйте: apt install linux-headers-$(uname -r)"
+                log_warning "Или используйте: AmneziaWG.sh -g (go-режим)"
+            }
+        }
+        if [ -d "/lib/modules/$(uname -r)/build" ]; then
+            log_success "Заголовки ядра установлены"
+        else
+            log_error "Заголовки ядра не установлены — dkms не сможет собрать модуль"
+        fi
+    else
+        log_success "Заголовки ядра уже установлены"
+    fi
+
     # 1. СНАЧАЛА гарантируем наличие инструментов
     if ! dpkg -l | grep -q "^ii[[:space:]]*amneziawg-tools[[:space:]]" 2>/dev/null; then
         log_info "Установка amneziawg-tools..."
@@ -769,7 +792,7 @@ main() {
 
     echo
     echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   AmneziaWG Installer v6.1             ║${NC}"
+    echo -e "${GREEN}║   AmneziaWG Installer v6.5             ║${NC}"
     echo -e "${GREEN}║   Ubuntu 20-26 | Debian 11-13          ║${NC}"
     echo -e "${GREEN}║   + disable systemd-resolved           ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
