@@ -2752,11 +2752,18 @@ fi
         _match="ip"
       fi
 
+      # Определяем prio: IPv5 на step 1 вверх (разные протоколы не могут делить prio в u32)
+      if [[ "$_sub" == *:* ]]; then
+          _root_prio=$((_current_root_prio + 10))
+      else
+          _root_prio=$_current_root_prio
+      fi
+
       # Добавляем фильтры на root 1: для маршрутизации в указанный мост
       # DST матч — для download трафика (пакет на IFB имеет dst=клиент VPN)
-      tc filter add dev "$_ifb" parent 1: protocol $_proto prio $_current_root_prio u32 match $_match dst "$_sub" flowid $_major 2>/dev/null || true
+      tc filter add dev "$_ifb" parent 1: protocol $_proto prio $_root_prio u32 match $_match dst "$_sub" flowid $_major || echo "⚠️ Ошибка root filter ($_proto dst $_sub)" >&2
       # SRC матч — для upload трафика (пакет на IFB имеет src=клиент VPN)
-      tc filter add dev "$_ifb" parent 1: protocol $_proto prio $_current_root_prio u32 match $_match src "$_sub" flowid $_major 2>/dev/null || true
+      tc filter add dev "$_ifb" parent 1: protocol $_proto prio $_root_prio u32 match $_match src "$_sub" flowid $_major || echo "⚠️ Ошибка root filter ($_proto src $_sub)" >&2
     done
   }
 
@@ -2803,18 +2810,18 @@ fi
   # Catch-all mirred: трафик вне SUBNETS_LIMITS попадает на IFB_MIX (BRIDGE лимит)
   # Per-subnet mirred внутри loop имеют приоритет (first-match-wins)
   if [ "$_needs_mix" = "1" ]; then
-    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
-    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
-    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
-    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
   fi
   if [ "$_needs_out" = "1" ]; then
-    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" 2>/dev/null || true
-    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" 2>/dev/null || true
+    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" || echo "⚠️ tc filter" >&2
   fi
   if [ "$_needs_in" = "1" ]; then
-    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" 2>/dev/null || true
-    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" 2>/dev/null || true
+    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" || echo "⚠️ tc filter" >&2
   fi
 
   echo "📊 Установка лимитов скорости для подсетей"
@@ -2884,15 +2891,15 @@ fi
         fi
         if [ "$_rule_type" = "mix" ]; then
             # MIX: оба направления на IFB_MIX
-            tc filter add dev "$TUN" parent 1: protocol $_mirred_proto u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
-            tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" 2>/dev/null || true
+            tc filter add dev "$TUN" parent 1: protocol $_mirred_proto u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
+            tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
         else
             # Separate: OUT на parent 1: (egress=download=dst), IN на parent ffff: (ingress=upload=src)
             if [ "$_create_down" = "1" ]; then
-                tc filter add dev "$TUN" parent 1: protocol $_mirred_proto u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_OUT" 2>/dev/null || true
+                tc filter add dev "$TUN" parent 1: protocol $_mirred_proto u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_OUT" || echo "⚠️ tc filter" >&2
             fi
             if [ "$_create_up" = "1" ]; then
-                tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_IN" 2>/dev/null || true
+                tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_IN" || echo "⚠️ tc filter" >&2
             fi
         fi
   done
@@ -2951,11 +2958,11 @@ fi
               if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
                   tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
-                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
-                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $ip flowid $_classid || echo "⚠️ tc filter" >&2
                   else
-                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $ip flowid $_classid 2>/dev/null || true
-                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $ip flowid $_classid || echo "⚠️ tc filter" >&2
                   fi
                   tc qdisc add dev "$IFB_MIX" parent $_classid fq_codel 2>/dev/null || true
               fi
@@ -2973,9 +2980,9 @@ fi
                   tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # OUT на parent 1: (egress) = download = dst клиента
-                      tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 1 u32 match ip6 dst $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
                   else
-                      tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
                   fi
                   tc qdisc add dev "$IFB_OUT" parent $_classid fq_codel 2>/dev/null || true
               fi
@@ -2993,9 +3000,9 @@ fi
                   tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # IN на parent ffff: (ingress) = upload = src клиента
-                      tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 1 u32 match ip6 src $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $ip flowid $_classid || echo "⚠️ tc filter" >&2
                   else
-                      tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $ip flowid $_classid 2>/dev/null || true
+                      tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $ip flowid $_classid || echo "⚠️ tc filter" >&2
                   fi
                   tc qdisc add dev "$IFB_IN" parent $_classid fq_codel 2>/dev/null || true
               fi
@@ -3081,7 +3088,7 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                 fi
 
                 i=0
-                for sub_info in $(echo "$RATIO_INFO" | cut -d'|' -f2-); do
+                for sub_info in $(echo "$RATIO_INFO" | cut -d'|' -f2- | tr '|' ' '); do
                   [ -z "$sub_info" ] && continue
 
                   count=$(echo "$sub_info" | cut -d':' -f1)
@@ -3103,28 +3110,28 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                       if [ "$_rule_type" = "mix" ]; then
                           if [ "$_create_down" = "1" ]; then
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid 2>/dev/null || true
-                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
                               else
-                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid 2>/dev/null || true
-                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
                               fi
                           fi
                       else
                           if [ "$_create_down" = "1" ]; then
                               # OUT на parent 1: (egress) = download = dst клиента
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
                               else
-                                  tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
                               fi
                           fi
                           if [ "$_create_up" = "1" ]; then
                               # IN на parent ffff: (ingress) = upload = src клиента
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
                               else
-                                  tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid 2>/dev/null || true
+                                  tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
                               fi
                           fi
                       fi
