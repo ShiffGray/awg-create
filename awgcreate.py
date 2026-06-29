@@ -976,6 +976,46 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   fi
   echo ""
 
+  # Проверка per-client фильтров на внутренних qdisc
+  echo "   🔍 Per-client фильтры (внутренние qdisc):"
+  for _ifb_check in "$IFB_MIX" "$IFB_OUT" "$IFB_IN"; do
+    if ip link show "$_ifb_check" &>/dev/null; then
+      for _inner_handle in $(tc qdisc show dev "$_ifb_check" 2>/dev/null | grep "htb" | grep -v "root" | awk '{print $3}' | sed 's/://'); do
+        [ -z "$_inner_handle" ] && continue
+        _v4=$(tc filter show dev "$_ifb_check" parent ${_inner_handle}: protocol ip 2>/dev/null | grep -c "flowid" || echo "0")
+        _v6=$(tc filter show dev "$_ifb_check" parent ${_inner_handle}: protocol ipv6 2>/dev/null | grep -c "flowid" || echo "0")
+        _unclass=$(tc -s qdisc show dev "$_ifb_check" 2>/dev/null | grep "htb ${_inner_handle}:" | grep -oP 'direct_packets_stat \K[0-9]+' || echo "?")
+        _classes=$(tc class show dev "$_ifb_check" 2>/dev/null | grep -c "rate" || echo "0")
+        echo "   $_ifb_check parent ${_inner_handle}:"
+        echo "     IPv4 per-client: $_v4 (ожидается N*2)"
+        echo "     IPv6 per-client: $_v6 (ожидается N*2)"
+        echo "     Unclassified с момента запуска: $_unclass (0 = ок)"
+        echo "     HTB классов: $_classes"
+        if [ "$_v4" -eq 0 ] && [ "$_v6" -eq 0 ]; then
+          echo "     ⚠️  Per-client фильтры ОТСУТСТВУЮТ — весь трафик идёт в дефолтный класс!"
+        fi
+      done
+    fi
+  done
+  echo ""
+
+  # Топ классов по трафику (мосты + пиры отдельно)
+  echo "   📊 Топ bridge классов (1:X):"
+  for _ifb_check in "$IFB_MIX" "$IFB_OUT" "$IFB_IN"; do
+    if ip link show "$_ifb_check" &>/dev/null; then
+      tc -s class show dev "$_ifb_check" 2>/dev/null | awk '/^class htb 1:/{c=$0} /^class / && !/^class htb 1:/{c=""} /^ Sent/{if(c) print c" | "$2}' | sort -t'|' -k2 -rnu 2>/dev/null | head -5 | while IFS= read -r _line; do echo "     $_line"; done
+    fi
+  done
+  echo ""
+  echo "   📊 Топ per-client классов (2+:):"
+  for _ifb_check in "$IFB_MIX" "$IFB_OUT" "$IFB_IN"; do
+    if ip link show "$_ifb_check" &>/dev/null; then
+      tc -s class show dev "$_ifb_check" 2>/dev/null | awk '/^class htb [2-9]/{c=$0} /^class / && !/^class htb [2-9]/{c=""} /^ Sent/{if(c) print c" | "$2}' | sort -t'|' -k2 -rnu 2>/dev/null | head -10 | while IFS= read -r _line; do echo "     $_line"; done
+    fi
+  done
+  echo ""
+  echo ""
+
   # Проверка ip rules с prio 100 (маршрутизация VPN трафика через TUN)
   echo "   📋 ip rules prio 100 (маршрутизация через TUN):"
   _ip4_rules=$(ip rule show 2>/dev/null | grep -E "^100:")
@@ -1148,7 +1188,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "✅ Проверка завершена"
   echo "═══════════════════════════════════════════════════════════"
   echo ""
-  echo "📄 Лог сохранён: $LOG_FILE"
+  if [ "$TESTLOG" = "1" ]; then
+    echo "📄 Лог сохранён: $LOG_FILE"
+  fi
 fi
 '''
 
@@ -2581,8 +2623,7 @@ done
 # Формат: "subnet:rate" или "subnet:rate_in:rate_out" или "subnet" (без лимита)
 # ВАЖНО: валидация через validate_subnet_mask() которая уже есть в скрипте!
 if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
-  echo "⚡ Настройка лимитов скорости"
-  
+
   # Валидация подсетей через validate_subnet_mask()
   VALID_SUBNETS_LIMITS=()
   for entry in "${SUBNETS_LIMITS[@]}"; do
@@ -2824,7 +2865,7 @@ fi
     tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" || echo "⚠️ tc filter" >&2
   fi
 
-  echo "📊 Установка лимитов скорости для подсетей"
+  echo "📊 Настройка лимитов скорости..."
 
   for entry in "${SUBNETS_LIMITS[@]}"; do
       # Парсим лимиты (формат: "subnet1, subnet2:LIM" или "subnet1:LIM_D:LIM_U")
@@ -3163,7 +3204,11 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
     echo "✅ Лимиты скорости настроены"
   fi
 fi
+
 echo "————————————————————————————————"
+if [ "$UPLOG" = "1" ]; then
+  echo "📄 Лог сохранён: $LOG_FILE"
+fi
 
 exit 0
 '''
@@ -3704,7 +3749,7 @@ iptables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 ip6tables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 
 # ПОТОМ очищаем цепочки (IPv4 + IPv6)
-echo "   Очистка цепочек..."
+echo "🧹 Очистка цепочек..."
 
 # PF_CHAIN_NAT
 iptables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
@@ -3902,6 +3947,9 @@ ip link delete "$IFB_MIX" 2>/dev/null || true
 rm -f "$TUNNEL_PARAMS_FILE" 2>/dev/null || true
 
 echo "————————————————————————————————"
+if [ "$DOWNLOG" = "1" ]; then
+  echo "📄 Лог сохранён: $LOG_FILE"
+fi
 '''
 
 # ----------------- Генерация параметров обфускации -----------------
