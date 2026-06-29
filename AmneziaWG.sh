@@ -815,8 +815,8 @@ main() {
     purge_resolvconf
     setup_dns              # 1. DNS (ДО install_deps — systemd-resolved уже отключён)
     unlock_dpkg
-    setup_kernel_modules   # 2. ПОДГОТОВКА МОДУЛЕЙ ЯДРА (ifb для лимитов)
-    install_deps           # 3. apt update + зависимости (DNS уже работает)
+    install_deps           # 2. apt update + зависимости (kmod, lsmod, git, make)
+    setup_kernel_modules   # 3. ПОДГОТОВКА МОДУЛЕЙ ЯДРА (ifb для лимитов) — после kmod
     install_resolvconf     # 4. openresolv/resolvconf
     add_repo "$codename"   # 5. Репозиторий Amnezia
     install_amneziawg      # 6. AmneziaWG
