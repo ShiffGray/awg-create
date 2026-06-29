@@ -4100,12 +4100,12 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     I_COUNT_MAX = 5     # Макс. количество I-строк (старый пул)
     MAX_ATTEMPTS = 10   # Лимит попыток чтобы не зависнуть
     # Для пулов с 1 протоколом (domain / server) — мягкие рамки
-    I_SNI_TEXT_MIN = 1500
-    I_SNI_TEXT_MAX = 3000
-    I_SNI_TRAFFIC_MIN = 900
-    I_SNI_TRAFFIC_MAX = 4200
+    I_SNI_TEXT_MIN = 600
+    I_SNI_TEXT_MAX = 1800
+    I_SNI_TRAFFIC_MIN = 600
+    I_SNI_TRAFFIC_MAX = 1800
     I_SNI_COUNT_MIN = 3     # Количество I-строк для single-pool
-    I_SNI_COUNT_MAX = 5
+    I_SNI_COUNT_MAX = 4
     # ──────────────────────────────────────────────────────────────
 
     # Пул протоколов в виде функций — генерируется только при вызове
@@ -6526,11 +6526,12 @@ def handle_makecfg(opt) -> None:
             if pk_key in cfg.idsline:
                 cfg.lines[cfg.idsline[pk_key]] = f"PersistentKeepalive = {new_pk}"
 
-        # Обновляем I1-I5: добавляем/удаляем/заменяем строки
+        # Обновляем I1-I5: заменяем существующие, добавляем новые перед MTU
         new_lines = []
         i_added = set()
-        for line in cfg.lines:
-            match = re.match(r'^(#\s*)?(I[1-5])\s*=\s*(.+)$', line)
+        mtu_pos = None
+        for idx, line in enumerate(cfg.lines):
+            match = re.match(r'^\s*(#\s*)?(I[1-5])\s*=\s*(.+)$', line)
             if match:
                 raw_key = match.group(2)
                 key_num = int(raw_key[1:])
@@ -6540,9 +6541,19 @@ def handle_makecfg(opt) -> None:
                     i_added.add(key_num)
             else:
                 new_lines.append(line)
-        for i in range(1, 6):
-            if i not in i_added and obf_params.get(f"I{i}") is not None:
-                new_lines.append(f"I{i} = {obf_params[f'I{i}']}")
+                if mtu_pos is None and re.match(r'^\s*MTU\s*=', line):
+                    mtu_pos = len(new_lines) - 1  # позиция MTU
+
+        # Добавляем новые I-строки перед MTU
+        if mtu_pos is not None:
+            for i in range(5, 0, -1):
+                if i not in i_added and obf_params.get(f"I{i}") is not None:
+                    new_lines.insert(mtu_pos, f"I{i} = {obf_params[f'I{i}']}")
+        else:
+            # Fallback: в конец
+            for i in range(1, 6):
+                if i not in i_added and obf_params.get(f"I{i}") is not None:
+                    new_lines.append(f"I{i} = {obf_params[f'I{i}']}")
         cfg.lines = new_lines
 
         cfg.save()
