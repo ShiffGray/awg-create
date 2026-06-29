@@ -210,6 +210,7 @@ install_deps() {
         ca-certificates \
         iptables \
         coreutils \
+        kmod \
         git \
         make
 
