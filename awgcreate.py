@@ -4100,8 +4100,8 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     I_COUNT_MAX = 5     # Макс. количество I-строк (старый пул)
     MAX_ATTEMPTS = 10   # Лимит попыток чтобы не зависнуть
     # Для пулов с 1 протоколом (domain / server) — мягкие рамки
-    I_SNI_TEXT_MIN = 20
-    I_SNI_TEXT_MAX = 800
+    I_SNI_TEXT_MIN = 180
+    I_SNI_TEXT_MAX = 540
     I_SNI_TRAFFIC_MIN = 100
     I_SNI_TRAFFIC_MAX = 600
     I_SNI_COUNT_MIN = 3     # Количество I-строк для single-pool
