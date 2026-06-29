@@ -4156,9 +4156,9 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     MAX_ATTEMPTS = 10   # Лимит попыток чтобы не зависнуть
     # Для пулов с 1 протоколом (domain / server) — мягкие рамки
     I_SNI_TEXT_MIN = 600
-    I_SNI_TEXT_MAX = 1800
+    I_SNI_TEXT_MAX = 2400
     I_SNI_TRAFFIC_MIN = 600
-    I_SNI_TRAFFIC_MAX = 1800
+    I_SNI_TRAFFIC_MAX = 2400
     I_SNI_COUNT_MIN = 2     # Количество I-строк для single-pool
     I_SNI_COUNT_MAX = 4
     # ──────────────────────────────────────────────────────────────
@@ -5420,8 +5420,24 @@ def parse_endpoints_config(text: str, default_port: str) -> List[Dict[str, str]]
             line = line.split('#', 1)[0].strip()
             if not line:
                 continue
-        parts = [p.strip() for p in line.split(",") if p.strip()]
-        tokens.extend(parts)
+        # Разбиваем по пробелам (несколько эндпоинтов на строке)
+        for sub in line.split():
+            sub = sub.strip()
+            if not sub:
+                continue
+            # Разбиваем по запятым, потом склеиваем параметры (domain=, mtu=) обратно
+            parts = [p.strip() for p in sub.split(",") if p.strip()]
+            merged = []
+            for part in parts:
+                # Параметр = key=value без порта (domain=yandex.ru, mtu=1340, ;mtu=1340)
+                if "=" in part and ":" not in part:
+                    key_part = part.split("=", 1)[0].strip().lstrip(";")
+                    if key_part.isalpha():
+                        if merged:
+                            merged[-1] += "," + part
+                            continue
+                merged.append(part)
+            tokens.extend(merged)
 
     for p in tokens:
         raw = p
@@ -7661,6 +7677,7 @@ def main() -> None:
     if opt.delete:
         handle_delete(opt)
         return
+
     # Сначала генерируем конфиги (если нужно),
     # и получаем список имен для QR
     qr_filter = None
