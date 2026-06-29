@@ -7661,7 +7661,6 @@ def main() -> None:
     if opt.delete:
         handle_delete(opt)
         return
-
     # Сначала генерируем конфиги (если нужно),
     # и получаем список имен для QR
     qr_filter = None
