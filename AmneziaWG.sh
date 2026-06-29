@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# AmneziaWG Installer v6.5
+# AmneziaWG Installer v6.6
 # Ubuntu 20.04-26.04 | Debian 11-13
 # Режимы: --go/-g (go из исходников), --kernel/-k (dkms), без флага (meta-пакет)
 # Чистый код с учётом всех ошибок
@@ -798,7 +798,7 @@ main() {
 
     echo
     echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   AmneziaWG Installer v6.5             ║${NC}"
+    echo -e "${GREEN}║   AmneziaWG Installer v6.6             ║${NC}"
     echo -e "${GREEN}║   Ubuntu 20-26 | Debian 11-13          ║${NC}"
     echo -e "${GREEN}║   + disable systemd-resolved           ║${NC}"
     echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
