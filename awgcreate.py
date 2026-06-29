@@ -4100,9 +4100,9 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     I_COUNT_MAX = 5     # Макс. количество I-строк (старый пул)
     MAX_ATTEMPTS = 10   # Лимит попыток чтобы не зависнуть
     # Для пулов с 1 протоколом (domain / server) — мягкие рамки
-    I_SNI_TEXT_MIN = 30
+    I_SNI_TEXT_MIN = 20
     I_SNI_TEXT_MAX = 120
-    I_SNI_TRAFFIC_MIN = 200
+    I_SNI_TRAFFIC_MIN = 100
     I_SNI_TRAFFIC_MAX = 600
     I_SNI_COUNT_MIN = 3     # Количество I-строк для single-pool
     I_SNI_COUNT_MAX = 5
@@ -4313,8 +4313,8 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         crypto_hex = f"06" + "00000000" + f"{len(ch_hex)//2:08x}{ch_hex}"
         quic_hex, qr_static_range = _build_quic_packet(crypto_hex, scid_hex_preset=scid_hex)
         if try_AESGCM is not None:
-            # Шифрованный пакет — мусор после tag выдаст DPI
-            rb, rbr, ra, rar, rd, rdr = 0, 0, 0, 0, 0, 0
+            # random не обнуляются — DPI игнорирует мусор после GCM tag (QUIC padding)
+            rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
         else:
             rb, rbr, ra, rar, rd, rdr = 400, 200, 200, 200, 20, 10
         return generate_cps_packet(
@@ -4359,7 +4359,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         quic_hex, qr_static_range = _build_quic_packet(crypto_hex, default_range=40)
 
         if try_AESGCM is not None:
-            rb, rbr, ra, rar, rd, rdr = 0, 0, 0, 0, 0, 0
+            rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
         else:
             rb, rbr, ra, rar, rd, rdr = 300, 200, 300, 200, 20, 10
         return generate_cps_packet(
