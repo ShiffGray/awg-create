@@ -4104,7 +4104,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     I_SNI_TEXT_MAX = 1800
     I_SNI_TRAFFIC_MIN = 600
     I_SNI_TRAFFIC_MAX = 1800
-    I_SNI_COUNT_MIN = 3     # Количество I-строк для single-pool
+    I_SNI_COUNT_MIN = 2     # Количество I-строк для single-pool
     I_SNI_COUNT_MAX = 4
     # ──────────────────────────────────────────────────────────────
 
