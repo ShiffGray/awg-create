@@ -6578,8 +6578,8 @@ def handle_makecfg(opt) -> None:
             except Exception as e:
                 logger.warning("Ошибка чтения %s: %s", g_endpoint_config_fn, e)
         obf_params = generate_all_params(_file_version, for_client=False, for_server=True, tun_name=tun_name, domain=_server_domain)
-        _label = "имитация рукопожатия" if _server_domain else "случайные сигнатуры"
-        print(f"   🎭: {_label}", file=sys.stderr)
+        _label = "Имитация рукопожатия" if _server_domain else "Случайные сигнатуры"
+        logger.info("🎭 %s", _label)
 
         # Обновляем Jc/Jmin/Jmax
         for p in ['Jc', 'Jmin', 'Jmax']:
