@@ -4442,8 +4442,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         )
 
     # Определяем пул в зависимости от направления и domain
-    if for_server:
-        # Сервер — всегда сигнатуры ответа
+    if for_server and domain:
         pool_fns = [_gen_quic_server, _gen_quic_server_handshake]
     elif domain:
         pool_fns = [_gen_quic_client, _gen_quic_client_handshake]
@@ -4452,8 +4451,8 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         pool_fns = [_gen_dns, _gen_quic, _gen_dtls, _gen_ntp, _gen_random, _gen_srtp]
 
     # Генерация с валидацией диапазонов
-    # Флаг для неслучайных пулов (domain / server) — строгий порядок Initial→Handshake
-    is_imitation_pool = for_server or bool(domain)
+    # Флаг для domain-пулов — строгий порядок Initial→Handshake
+    is_imitation_pool = bool(domain)
 
     selected = []
     best_selected = None
@@ -6573,11 +6572,11 @@ def handle_makecfg(opt) -> None:
         _server_domain = ""
         if g_endpoint_config_fn and g_endpoint_config_fn.exists():
             try:
-                _ep_text = g_endpoint_config_fn.read_text('utf-8')
-                if ";domain=" in _ep_text:
+                _ep_text = g_endpoint_config_fn.read_bytes()
+                if b"domain=" in _ep_text:
                     _server_domain = "any"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Ошибка чтения %s: %s", g_endpoint_config_fn, e)
         obf_params = generate_all_params(_file_version, for_client=False, for_server=True, tun_name=tun_name, domain=_server_domain)
 
         # Обновляем Jc/Jmin/Jmax
@@ -6662,11 +6661,11 @@ def handle_makecfg(opt) -> None:
     _server_domain = ""
     if g_endpoint_config_fn and g_endpoint_config_fn.exists():
         try:
-            _ep_text = g_endpoint_config_fn.read_text('utf-8')
-            if ";domain=" in _ep_text:
-                _server_domain = "any"  # любое непустое значение — включает imitation pool
-        except Exception:
-            pass
+            _ep_text = g_endpoint_config_fn.read_bytes()
+            if b"domain=" in _ep_text:
+                _server_domain = "any"
+        except Exception as e:
+            logger.warning("Ошибка чтения %s: %s", g_endpoint_config_fn, e)
 
     # Генерируем параметры обфускации для СЕРВЕРА
     obf_params = generate_all_params(awg_version, for_client=False, for_server=True, tun_name=tun_name, domain=_server_domain)
