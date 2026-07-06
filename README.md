@@ -1,4 +1,4 @@
-## INSTAL
+# INSTAL
 Рекомендую перед установкой выполнить полное обновление системы и перезагрузиться:
 ```sh
 apt update && apt full-upgrade -y && reboot
