@@ -11,7 +11,6 @@ import datetime
 import glob
 import ipaddress
 import logging
-import math
 import os
 import pathlib
 import random
@@ -3074,7 +3073,7 @@ fi
 
       # Несколько подсетей — поддерживаем кратные соотношения
       # MULTIPLIER из Bash передаётся как параметр
-      RATIO_INFO=$(calc_subnet_ratios "$SUBNETS_PART" "$SUBNETS_LIMITS_STR")
+      RATIO_INFO=$(calc_subnet_ratios "$SUBNETS_PART")
           NUM_CLASSES=$(echo "$RATIO_INFO" | cut -d'|' -f1)
 
           # Подсчёт общего количества классов
