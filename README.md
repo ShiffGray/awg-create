@@ -13,7 +13,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/ShiffGray/awg-create/refs/hea
 
 ---
 
-## CLI
+# CLI
 Примеры команд скрипта:
 ```bash
 ## python3 awgcreate.py [опции]
