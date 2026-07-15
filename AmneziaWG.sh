@@ -332,10 +332,8 @@ nameserver 2606:4700:4700::1111
 nameserver 2606:4700:4700::1001
 EOF
 
-    # ЗАЩИТА ОТ СБРОСА (systemd-resolved и др.)
     log_info "Фиксация resolv.conf..."
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    log_success "resolv.conf зафиксирован (не будет перезаписан)"
+    log_success "resolv.conf зафиксирован"
 
     log_success "DNS настроен"
 }
@@ -675,9 +673,6 @@ nameserver 2606:4700:4700::1111
 nameserver 2606:4700:4700::1001
 EOF
 
-    # Фиксируем от systemd-resolved
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-
     log_success "DNS восстановлен"
 }
 
@@ -797,11 +792,11 @@ main() {
     parse_flags "$@"
 
     echo
-    echo -e "${GREEN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   AmneziaWG Installer v6.6             ║${NC}"
-    echo -e "${GREEN}║   Ubuntu 20-26 | Debian 11-13          ║${NC}"
-    echo -e "${GREEN}║   + disable systemd-resolved           ║${NC}"
-    echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
+    echo -e "${GREEN}╔══════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║   AmneziaWG Installer v6.6       ║${NC}"
+    echo -e "${GREEN}║   Ubuntu 20-26 | Debian 11-13    ║${NC}"
+    echo -e "${GREEN}║   + disable systemd-resolved     ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════╝${NC}"
     echo -e "    Режим: ${INSTALL_MODE}"
     echo
 
