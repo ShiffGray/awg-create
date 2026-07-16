@@ -1976,6 +1976,8 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
       lan_allow_group 4 IPV4_PARTS IPV4_UNIQUE
       lan_allow_group 6 IPV6_PARTS IPV6_UNIQUE
 
+      echo "   Межтуннельные правила:"
+
       # Проходим по каждой паре участников ОДНОГО ТИПА и создаём правила
       # IPv4 и IPv6 не могут общаться друг с другом — не создаём бесполезные правила
       for ((i=0; i<${#PARTS_CLEAN[@]}; i++)); do
