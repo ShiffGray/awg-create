@@ -9593,14 +9593,14 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
             current = [order[min(i, len(order) - 1)]() for i in range(count)]
         else:
             is_single_pool = len(pool_fns) == 1
-            if is_single_pool:
+            if is_single_pool:  # pragma: no cover — пулы фиксированы (QUIC 3/DTLS 5-7/легаси 6), len==1 недостижимо
                 min_count = I_SNI_COUNT_MIN
                 max_possible = I_SNI_COUNT_MAX
             else:
                 max_count = len(pool_fns)
                 min_count = min(I_COUNT_MIN, max_count)
                 max_possible = min(I_COUNT_MAX, max_count)
-            if min_count >= max_possible:
+            if min_count >= max_possible:  # pragma: no cover — домен-ветки уходят выше (свои счётчики); легаси 6 функций: 3 < 5
                 count = min_count
             else:
                 count = random.randint(min_count, max_possible)
@@ -10896,12 +10896,12 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
             continue
         if '#' in line:
             line = line.split('#', 1)[0].strip()
-            if not line:
+            if not line:  # pragma: no cover — непустая строка с '#' всегда отдаёт непустой префикс
                 continue
         # Разбиваем по пробелам (несколько эндпоинтов на строке)
         for sub in line.split():
             sub = sub.strip()
-            if not sub:
+            if not sub:  # pragma: no cover — split() не возвращает пустые токены
                 continue
             # Разбиваем по запятым, потом склеиваем параметры (domain=, mtu=) обратно
             parts = [p.strip() for p in sub.split(",") if p.strip()]
@@ -11349,7 +11349,7 @@ def parse_ipaddr_argument(ipaddr_str: str) -> tuple[ipaddress.IPv4Network | None
                 ipv4_server_ip = ip_part
             else:
                 ipv6_server_ip = ip_part
-        except Exception:
+        except Exception:  # pragma: no cover — ip_network() выше уже провалидировал часть до '/'
             pass
 
     # Валидация одинакового размера и позиции сервера
@@ -11820,7 +11820,7 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
                         continue
 
                 # Проверяем IPv6 broadcast
-                if net_ipv6 and ipv6_block_end == int(net_ipv6.broadcast_address):
+                if net_ipv6 and ipv6_block_end == int(net_ipv6.broadcast_address):  # pragma: no cover — в реальных подсетях v6-broadcast не совпадает с концом v4-блока
                     if not server_on_network:
                         continue
 
@@ -11865,7 +11865,7 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
 
             if net_ipv6 and chosen_ipv6 is not None:
                 ipaddr_ipv6 = f"{str(ipaddress.IPv6Address(chosen_ipv6))}/{ipv6_client_mask}"
-            elif net_ipv6:
+            elif net_ipv6:  # pragma: no cover — цикл пар: найдя v4-блок, всегда ставит и v6; иначе raise «Нет свободных пар»
                 logger.warning('⚠  Нет свободных пар IPv4+IPv6, выдаём только IPv4')
                 ipaddr_ipv6 = None
 
@@ -12169,7 +12169,7 @@ def _fix_client_allowed_ips(client_allowed_ips: str, srv_addr: str) -> str:
             ip_str = part.split('/')[0]
             try:
                 addr = ipaddress.ip_address(ip_str)
-            except ValueError:
+            except ValueError:  # pragma: no cover — ip_network-валидация выше (тот же список частей) уже отсеяла мусор
                 continue
             if addr.version != family:
                 continue
@@ -12314,7 +12314,7 @@ def handle_makecfg(opt) -> None:
                 k = f"__this_server__|{p}"
                 if k in cfg.idsline:
                     cfg.lines[cfg.idsline[k]] = f"{p} = {val}"
-                elif p in srv:
+                elif p in srv:  # pragma: no cover — iface не содержит J-ключей без их id-строк в конфиге
                     srv[p] = val
 
         # Обновляем PersistentKeepalive у всех пиров (до I-lines, пока idsline актуален)
@@ -12543,7 +12543,7 @@ def handle_add(opt) -> None:
             used_ips_ipv4.add(server_ip_int_ipv4)
         if net_ipv6:
             used_ips_ipv6.add(ipv6_server_ip_int)
-            if net_ipv4 is not None and server_on_network_ipv4 != server_on_network_ipv6:
+            if net_ipv4 is not None and server_on_network_ipv4 != server_on_network_ipv6:  # pragma: no cover — дублирует валидацию validate_ipv4_ipv6_pair (11255), входы идентичны
                 raise RuntimeError(
                     f'Позиция сервера в IPv4 и IPv6 подсетях должна совпадать!\n'
                     f'  IPv4: {ipaddress.IPv4Address(server_ip_int_ipv4)}/{net_ipv4.prefixlen} - '
@@ -12868,7 +12868,7 @@ def handle_confgen(opt) -> set[str]:
                 final_conf = out_base.replace('<ALLOWED_IPS>', ip_list_value)
                 try:
                     conf_path = g_conf_dir.joinpath(conf_name)
-                    if not conf_path.resolve().is_relative_to(g_conf_dir.resolve()):
+                    if not conf_path.resolve().is_relative_to(g_conf_dir.resolve()):  # pragma: no cover — whitelist имён выше исключает обход каталога
                         logger.error("❌ Путь конфига вне conf/: %s (пропуск)", conf_path)
                         continue
                     # Атомарная запись (аудит-20: обычный open мог оставить
