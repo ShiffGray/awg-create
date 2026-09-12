@@ -9044,22 +9044,22 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
             crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
             # PADDING-фреймы до 1200 байт (RFC 9000 §14.1) — иначе дроп
             quic_hex, qr_static_range = _build_quic_packet(crypto_hex, scid_hex_preset=scid_hex,
-                                                           pad_target=1200)
+                                                           pad_target=350)
             return generate_cps_packet(
                 static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
                 use_timestamp=True,
-                random_bytes=200, random_bytes_range=100,
-                random_ascii=100, random_ascii_range=100,
-                random_digits=10, random_digits_range=5,
+                random_bytes=32, random_bytes_range=16,
+                random_ascii=16, random_ascii_range=16,
+                random_digits=5, random_digits_range=3,
             )
         aio_hex = _quic_initial_via_aioquic(is_server=False)
         if aio_hex:
             return generate_cps_packet(
-                static_bytes=f"0x{aio_hex}", static_bytes_range=0,
+                static_bytes=f"0x{aio_hex[:700]}", static_bytes_range=0,
                 use_timestamp=True,
-                random_bytes=200, random_bytes_range=100,
-                random_ascii=100, random_ascii_range=100,
-                random_digits=10, random_digits_range=5,
+                random_bytes=32, random_bytes_range=16,
+                random_ascii=16, random_ascii_range=16,
+                random_digits=5, random_digits_range=3,
             )
         sni_bytes = domain.encode('utf-8')
         sni_hex = sni_bytes.hex()
@@ -9128,14 +9128,16 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
         quic_hex, qr_static_range = _build_quic_packet(
             crypto_hex, scid_hex_preset=scid_hex,
-            pad_target=1200 if try_AESGCM is not None else 0)
+            pad_target=350 if try_AESGCM is not None else 0)
         if try_AESGCM is not None:
             # Хвостовые <r>/<rc>/<rd> расширяются в датаграмме ПОСЛЕ валидного
             # Initial-пакета. Проверено на стенде: Cloudflare отвечает и на
             # датаграмму с таким хвостом (16.09.2026).
-            rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
+            # (16.09.2026, вечер: статика/хвосты урезаны — WARP-конфиг должен
+            # влезать в QR v40-L ~2953 байт; см. _generate_qr_image.)
+            rb, rbr, ra, rar, rd, rdr = 32, 16, 16, 16, 5, 3
         else:
-            rb, rbr, ra, rar, rd, rdr = 400, 200, 200, 200, 20, 10
+            rb, rbr, ra, rar, rd, rdr = 48, 24, 24, 24, 6, 4
         return generate_cps_packet(
             static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
             use_timestamp=True,
@@ -9159,9 +9161,9 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         return generate_cps_packet(
             static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
             use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
+            random_bytes=32, random_bytes_range=16,
+            random_ascii=16, random_ascii_range=16,
+            random_digits=5, random_digits_range=3,
         )
 
     def _gen_quic_server():
@@ -9259,9 +9261,9 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         return generate_cps_packet(
             static_bytes=f"0x{appdata_hex}", static_bytes_range=0,
             use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
+            random_bytes=32, random_bytes_range=16,
+            random_ascii=16, random_ascii_range=16,
+            random_digits=5, random_digits_range=3,
         )
 
     # ─── STUN имитация (WebRTC ICE / NAT traversal) ─────────────
