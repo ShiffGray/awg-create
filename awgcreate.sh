@@ -82,9 +82,15 @@ install_go() {
         log_success "$MSG_GO_INSTALLED" "$(go version)"
     fi
 
-    # Персистентный PATH для НОВЫХ сессий (фикс 16.09.2026): раньше export
-    # жил только внутри процесса скрипта, и в свежем shell `go` был не виден
-    # (awgcreate.py: "WARP-probe не собран: Go не найден" при работающем Go).
+    # Персистентный PATH для НОВЫХ сессий: симлинк /usr/local/bin/go →
+    # /usr/local/go/bin/go — канонический механизм (как у Debian-пакетов
+    # golang-*): /usr/local/bin есть в PATH любого root-шелла, работает и в
+    # не-login сессиях (в отличие от profile.d). Обновляется при переустановке Go.
+    if [ ! -e /usr/local/bin/go ]; then
+        ln -s /usr/local/go/bin/go /usr/local/bin/go 2>/dev/null || true
+    fi
+    # legacy profile.d: для систем, где /usr/local/bin вдруг не в PATH.
+    # Существующий файл не удаляем (создан прошлыми версиями скрипта).
     if [ ! -f /etc/profile.d/zz-awgcreate-go.sh ]; then
         printf 'export PATH=/usr/local/go/bin:$PATH\n' > /etc/profile.d/zz-awgcreate-go.sh
     fi
