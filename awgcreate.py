@@ -8756,37 +8756,40 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     # ──────────────────────────────────────────────────────────────
 
     # Пул протоколов в виде функций — генерируется только при вызове
+    # 16.09.2026: многосегментные структуры (парсер junk.c допускает любое
+    # число <b>-тегов в строке). Потолок тегов: нет чексумм/length-prefix —
+    # «полная настоящесть» недостижима, но заголовки теперь СТРУКТУРНЫЕ.
     def _gen_dns():
+        # DNS-запрос: ID(2)+FLAGS 0100+QD 0001+AN/NS/AR 0000 — ровный 12-байтный
+        # хедер; псевдо-qname из ascii; QTYPE/QCLASS.
         return generate_cps_packet(
-            static_bytes="0x01", static_bytes_range=10, use_timestamp=False,
-            random_bytes=30, random_bytes_range=30,
-            random_ascii=60, random_ascii_range=60,
-            random_digits=10, random_digits_range=6,
-        )
+            static_bytes="0x020301000001000000000000", static_bytes_range=0,
+            random_ascii=8, random_ascii_range=6,
+        ) + "<b 0x0001><b 0x0001>"
 
     def _gen_quic():
+        # QUIC v1 long-header (тип Initial): ver=1, DCID=8, SCID/token=0,
+        # длина-varint (0x40|len) и наполнение.
         return generate_cps_packet(
-            static_bytes="0xc7", static_bytes_range=20, use_timestamp=True,
-            random_bytes=120, random_bytes_range=80,
-            random_ascii=180, random_ascii_range=140,
-            random_digits=12, random_digits_range=6,
-        )
+            static_bytes="0xc000000001", static_bytes_range=0,
+            random_bytes=8, random_bytes_range=0,
+        ) + "<b 0x08><b 0x00><b 0x00><b 0x40><r 1><r 50>"
 
     def _gen_dtls():
+        # DTLS 1.2 record (ClientHello): type 0x16, ver FEFD, epoch 0, seq,
+        # длина 0x27, handshake 0x01 + len 0x001e00 + версия + 32-байтный random.
         return generate_cps_packet(
-            static_bytes="0x16FEFD", static_bytes_range=15, use_timestamp=True,
-            random_bytes=80, random_bytes_range=70,
-            random_ascii=200, random_ascii_range=200,
-            random_digits=8, random_digits_range=6,
-        )
+            static_bytes="0x16fefd0000", static_bytes_range=0,
+            random_bytes=6, random_bytes_range=0,
+        ) + "<b 0x0027><b 0x01><b 0x001e00><b 0xfefd><r 32><b 0x00>"
 
     def _gen_ntp():
+        # NTP-запрос 48B: LI/VN/Mode 0x1B + stratum/poll/precision, delay/disp/
+        # refid=0, reftime=0, recv/transmit=время (32 бита), fraction=0.
         return generate_cps_packet(
-            static_bytes="0x1B", static_bytes_range=3, use_timestamp=True,
-            random_bytes=0, random_bytes_range=0,
-            random_ascii=0, random_ascii_range=0,
-            random_digits=42, random_digits_range=6,
-        )
+            static_bytes="0x1b000afa", static_bytes_range=0,
+            random_bytes=0, random_ascii=0, random_digits=0, use_timestamp=False,
+        ) + "<b 0x00000000><b 0x00000000><b 0x00000000><b 0x0000000000000000><t><t><b 0x00000000>"
 
     def _gen_random():
         return generate_cps_packet(
@@ -8797,12 +8800,12 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         )
 
     def _gen_srtp():
+        # RTP-хедер: v2+PT, seq(рандом), timestamp(<t>), SSRC(рандом).
         return generate_cps_packet(
-            static_bytes="0x8060", static_bytes_range=4, use_timestamp=True,
-            random_bytes=20, random_bytes_range=60,
-            random_ascii=0, random_ascii_range=0,
-            random_digits=8, random_digits_range=4,
-        )
+            static_bytes="0x8060", static_bytes_range=0,
+            random_bytes=2, random_bytes_range=0,
+            random_ascii=0, random_digits=0, use_timestamp=False,
+        ) + "<t><r 4>"
 
     # ────────────────────────────────────────────────────────────────
 
@@ -9041,22 +9044,22 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
             crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
             # PADDING-фреймы до 1200 байт (RFC 9000 §14.1) — иначе дроп
             quic_hex, qr_static_range = _build_quic_packet(crypto_hex, scid_hex_preset=scid_hex,
-                                                           pad_target=1200)
+                                                           pad_target=800)
             return generate_cps_packet(
                 static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
                 use_timestamp=True,
-                random_bytes=200, random_bytes_range=100,
-                random_ascii=100, random_ascii_range=100,
-                random_digits=10, random_digits_range=5,
+                random_bytes=32, random_bytes_range=16,
+                random_ascii=16, random_ascii_range=16,
+                random_digits=5, random_digits_range=3,
             )
         aio_hex = _quic_initial_via_aioquic(is_server=False)
         if aio_hex:
             return generate_cps_packet(
-                static_bytes=f"0x{aio_hex}", static_bytes_range=0,
+                static_bytes=f"0x{aio_hex[:700]}", static_bytes_range=0,
                 use_timestamp=True,
-                random_bytes=200, random_bytes_range=100,
-                random_ascii=100, random_ascii_range=100,
-                random_digits=10, random_digits_range=5,
+                random_bytes=32, random_bytes_range=16,
+                random_ascii=16, random_ascii_range=16,
+                random_digits=5, random_digits_range=3,
             )
         sni_bytes = domain.encode('utf-8')
         sni_hex = sni_bytes.hex()
@@ -9125,14 +9128,16 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
         quic_hex, qr_static_range = _build_quic_packet(
             crypto_hex, scid_hex_preset=scid_hex,
-            pad_target=1200 if try_AESGCM is not None else 0)
+            pad_target=800 if try_AESGCM is not None else 0)
         if try_AESGCM is not None:
             # Хвостовые <r>/<rc>/<rd> расширяются в датаграмме ПОСЛЕ валидного
             # Initial-пакета. Проверено на стенде: Cloudflare отвечает и на
             # датаграмму с таким хвостом (16.09.2026).
-            rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
+            # (16.09.2026, вечер: статика/хвосты урезаны — WARP-конфиг должен
+            # влезать в QR v40-L ~2953 байт; см. _generate_qr_image.)
+            rb, rbr, ra, rar, rd, rdr = 32, 16, 16, 16, 5, 3
         else:
-            rb, rbr, ra, rar, rd, rdr = 400, 200, 200, 200, 20, 10
+            rb, rbr, ra, rar, rd, rdr = 48, 24, 24, 24, 6, 4
         return generate_cps_packet(
             static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
             use_timestamp=True,
@@ -9156,9 +9161,9 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         return generate_cps_packet(
             static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
             use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
+            random_bytes=32, random_bytes_range=16,
+            random_ascii=16, random_ascii_range=16,
+            random_digits=5, random_digits_range=3,
         )
 
     def _gen_quic_server():
@@ -9256,9 +9261,9 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         return generate_cps_packet(
             static_bytes=f"0x{appdata_hex}", static_bytes_range=0,
             use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
+            random_bytes=32, random_bytes_range=16,
+            random_ascii=16, random_ascii_range=16,
+            random_digits=5, random_digits_range=3,
         )
 
     # ─── STUN имитация (WebRTC ICE / NAT traversal) ─────────────
@@ -10722,7 +10727,11 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
     # Генерируем все параметры обфускации через общую функцию
     # WARP это клиентский конфиг, поэтому for_client=True
     # for_warp=True — чтобы соответствовать таблице (S1,S2, H1-H4, S3,S4 = нет для WARP)
-    warp_obf_params = generate_all_params(version, for_client=True, for_server=False, for_warp=True)
+    # 16.09.2026: domain=эндпоинт WARP — I1-I5 становятся ЭТАЛОННОЙ QUIC-имитацией
+    # (валидированной против Cloudflare), вместо легаси-пула 6 шаблонов.
+    warp_obf_params = generate_all_params(
+        version, for_client=True, for_server=False, for_warp=True,
+        domain="engage.cloudflareclient.com")
 
     persistent_keepalive = _generate_persistent_keepalive(version)
     out = g_warp_config
