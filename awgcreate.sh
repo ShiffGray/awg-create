@@ -95,7 +95,7 @@ install_python_deps() {
     log_info "$MSG_INSTALL_PYDEPS"
     apt-get update -qq
     apt-get install -y -qq python3 python3-pip ipset python3-qrcode python3-pil \
-        python3-requests python3-cryptography python3-socks tor
+        python3-requests python3-cryptography python3-socks python3-aioquic tor
     # tor — для --proxy tor (обход rate-limit Cloudflare через SOCKS);
     # смена выходного IP: systemctl restart tor@default. python3-socks —
     # обязателен для SOCKS-прокси в requests (без него — SOCKS support missing).
