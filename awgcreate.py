@@ -8603,7 +8603,7 @@ def _generate_h_params_ranges() -> tuple[str, str, str, str]:
             break
 
     # Создаём диапазоны
-    ranges = [(s, s + sz) for s, sz in zip(h_starts, h_sizes)]
+    ranges = [(s, s + sz) for s, sz in zip(h_starts, h_sizes, strict=True)]
     random.shuffle(ranges)
 
     return (f"{ranges[0][0]}-{ranges[0][1]}",
@@ -9558,7 +9558,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     selected = []
     best_selected = None
     best_distance = float('inf')
-    for attempt in range(MAX_ATTEMPTS):
+    for _attempt in range(MAX_ATTEMPTS):
         if proto == "stun":
             # STUN: серия Binding Request / Binding Response (ICE connectivity checks)
             count = random.randint(I_SNI_COUNT_MIN, I_SNI_COUNT_MAX)
@@ -9761,9 +9761,9 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
     # suppress_for_warp: True — параметр не генерируется для WARP (S/H), False — генерируется (J).
     def _add_param_group(keys, values, supported, comment_key, comment_val, suppress_for_warp=True):
         if supported and not (for_warp and suppress_for_warp):
-            result.update(dict(zip(keys, values)))
+            result.update(dict(zip(keys, values, strict=True)))
         elif for_server and not for_warp:
-            result.update(dict(zip(keys, values)))
+            result.update(dict(zip(keys, values, strict=True)))
             result[comment_key] = comment_val
         else:
             result.update({k: None for k in keys})
@@ -9911,7 +9911,7 @@ def gen_preshared_key() -> str:
     try:
         return base64.b64encode(os.urandom(32)).decode("ascii")
     except Exception:
-        raise RuntimeError("Не удалось сгенерировать preshared key")
+        raise RuntimeError("Не удалось сгенерировать preshared key") from None
 
 
 # ----------------- Утилиты -----------------
@@ -10678,7 +10678,7 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
         # Пробрасываем наверх: generate_warp_configs обрабатывает 429 (rate-limit)
         raise
     except Exception as e:
-        raise RuntimeError(f"Ошибка WARP API: {e}")
+        raise RuntimeError(f"Ошибка WARP API: {e}") from None
 
     # Валидация ответа API: не создаём заведомо нерабочий конфиг
     if not peer_pub:
@@ -11305,7 +11305,7 @@ def parse_ipaddr_argument(ipaddr_str: str) -> tuple[ipaddress.IPv4Network | None
         try:
             net = ipaddress.ip_network(subnet_str, strict=False)
         except ValueError as e:
-            raise RuntimeError(f'Некорректный IP адрес "{subnet_str}": {e}')
+            raise RuntimeError(f'Некорректный IP адрес "{subnet_str}": {e}') from None
 
         # Проверка размера подсети
         if isinstance(net, ipaddress.IPv4Network):
@@ -11445,7 +11445,7 @@ def _generate_warp_if_needed(tun_name: str, warp_count: int, mtu: int, proxy: st
                 logger.error("📝 Детали: %s", error_msg)
                 logger.info("💡 Попробуйте использовать прокси через флаг --proxy \"адрес прокси\", если не выйдет то без --warp")
 
-            raise RuntimeError("Генерация WARP не удалась — интерфейс не создан")
+            raise RuntimeError("Генерация WARP не удалась — интерфейс не создан") from None
 
         for c in warp_configs:
             logger.info("📄 WARP конфиг: %s", c)
@@ -12280,7 +12280,7 @@ def handle_makecfg(opt) -> None:
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            raise RuntimeError(f"Не удалось создать директорию {target_path.parent}: {e}")
+            raise RuntimeError(f"Не удалось создать директорию {target_path.parent}: {e}") from None
 
     g_main_config_fn = target_path.resolve()
 
@@ -12330,7 +12330,7 @@ def handle_makecfg(opt) -> None:
         new_lines = []
         i_added = set()
         mtu_pos = None
-        for idx, line in enumerate(cfg.lines):
+        for _idx, line in enumerate(cfg.lines):
             match = re.match(r'^\s*I([1-5])\s*=\s*(.+)$', line)
             if match:
                 key_num = int(match.group(1))
@@ -12731,7 +12731,7 @@ def handle_confgen(opt) -> set[str]:
             except Exception:
                 example_addr = "203.0.113.1"
             logger.error("Пример: %s", example_addr)
-            raise RuntimeError("Не удалось создать _endpoint.config — укажите Endpoint вручную")
+            raise RuntimeError("Не удалось создать _endpoint.config — укажите Endpoint вручную") from None
 
     # Очистка (кроме серверного конфига) — ПОСЛЕ валидаций --only и endpoint
     # (фикс аудита-D2: раньше удаление было первым, сбой генерации оставлял
@@ -12940,7 +12940,7 @@ def generate_qr_codes(
         raise RuntimeError(
             'Пакет pillow (PIL) не установлен — QR-коды генерировать нельзя. '
             'Установите: pip install pillow (или python3-pil через apt)'
-        )
+        ) from None
 
     # Собираем все конфиги в один список
     all_configs: list[str] = []
@@ -13057,7 +13057,7 @@ def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None) -> 
                 _add_file_to_zip(zipf, str(file), file.name)
 
         if g_file_dir.exists() and g_file_dir.is_dir():
-            for root, dirs, files in os.walk(g_file_dir):
+            for root, _dirs, files in os.walk(g_file_dir):
                 rel_root = os.path.relpath(root, g_file_dir)
                 if rel_root == ".":
                     rel_root = ""
