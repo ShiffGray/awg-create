@@ -81,6 +81,13 @@ install_go() {
         export PATH=/usr/local/go/bin:$PATH
         log_success "$MSG_GO_INSTALLED" "$(go version)"
     fi
+
+    # Персистентный PATH для НОВЫХ сессий (фикс 16.09.2026): раньше export
+    # жил только внутри процесса скрипта, и в свежем shell `go` был не виден
+    # (awgcreate.py: "WARP-probe не собран: Go не найден" при работающем Go).
+    if [ ! -f /etc/profile.d/zz-awgcreate-go.sh ]; then
+        printf 'export PATH=/usr/local/go/bin:$PATH\n' > /etc/profile.d/zz-awgcreate-go.sh
+    fi
 }
 
 # ─── Установка Python зависимостей (полный набор) ──
