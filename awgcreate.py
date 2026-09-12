@@ -8660,7 +8660,7 @@ def _generate_s_params_awg31() -> tuple[int, int, int, int]:
     return s, s, s, s
 
 
-def _generate_content_padding() -> str:
+def _generate_content_padding(rng: random.Random | None = None) -> str:
     """Генерация ContentPaddingAddition (AWG3.0+): случайный диапазон добавки.
 
     Добавляет случайные байты к транспортному payload (ломает кратность 16).
@@ -8670,12 +8670,15 @@ def _generate_content_padding() -> str:
     выбрана по замеру стоимости (16.09.2026): с hi 63..127 паддинг в среднем
     ~78 Б/пакет на 100-Б пакетах; с 31..63 ожидается ~32 Б/пакет — компромисс
     «джиттер размеров vs трафик для мобильных».
+    rng: при задании — случайный источник (для комментариев-подсказок 3.x
+    в конфигах младших версий: global random НЕ трогается — стрим-инвариант).
     """
-    hi = random.randint(31, 63)
+    rng = rng if rng is not None else random
+    hi = rng.randint(31, 63)
     return f"1-{hi}"
 
 
-def _generate_timing_params() -> dict[str, str]:
+def _generate_timing_params(rng: random.Random | None = None) -> dict[str, str]:
     """Генерация 5 таймингов-диапазонов (AWG3.0+).
 
     16.09.2026: RekeyAfterTime/RejectAfterTime рандомизируются на КАЖДЫЙ
@@ -8689,14 +8692,17 @@ def _generate_timing_params() -> dict[str, str]:
     Дополнительно (16.09.2026): RekeyTimeout, KeepaliveTimeout и
     MaxHandshakeAttempts тоже per-config: каждое "a-b" со СВОИМ случайным a=6..9,
     b=a+a (итог 6..18) — декорреляция локальных таймеров между конфигами.
+    rng: при задании — случайный источник (для комментариев-подсказок 3.x
+    в конфигах младших версий: global random НЕ трогается — стрим-инвариант).
     """
-    a = random.randint(240, 360)
-    b = a + random.randint(240, 360)
+    rng = rng if rng is not None else random
+    a = rng.randint(240, 360)
+    b = a + rng.randint(240, 360)
     c = b + 60
     d = c + 60
-    t_rt = random.randint(6, 9)
-    t_ka = random.randint(6, 9)
-    t_ma = random.randint(6, 9)
+    t_rt = rng.randint(6, 9)
+    t_ka = rng.randint(6, 9)
+    t_ma = rng.randint(6, 9)
     return {
         "RekeyAfterTime": f"{a}-{b}",
         "RekeyTimeout": f"{t_rt}-{t_rt * 2}",
@@ -9795,25 +9801,48 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
             result.update({"I1": None, "I2": None, "I3": None, "I4": None, "I5": None})
 
     # --- AWG3.0+ : аддитивные механизмы (без жертв со стороны старых параметров) ---
-    # ВАЖНО (осознанное отличие от J/S/H/I): параметры 3.x НЕ выводятся даже
-    # закомментированными в конфигах, где они не поддерживаются, и никогда — в
-    # WARP. Для J/S/H/I подсказка «# S3 = 54  # AWG2.0» полезна (значения
-    # сгенерированы для этого же конфига), а для 3.x она вводила бы в
-    # заблуждение: раскомментировать HeaderProtectionKey в 2.0/3.0-конфиге
-    # нельзя — ядро отвергнет такой конфиг (S < 12 и S не равны). Поэтому для
-    # неподдерживающих версий и для WARP — строго None (плейсхолдер очищается).
+    # ВАЖНО: БЕЗОБИДНЫЕ 3.x (5 таймингов, ContentPaddingAddition, DisableCookies)
+    # в серверных конфигах версий ниже 3.0 выводятся закомментированными
+    # («# KEY = val  # AWG3.0»), как у J/S/H/I — значения информационные,
+    # раскомментировать можно (ядро принимает их в любой конфигурации).
+    # НЕ комментируются никогда: HeaderProtectionKey (ядро отвергнет: в 2.0/3.0
+    # S4 = 5..9 < 12, не равны) и RandomTrailers (с неравными S — потери
+    # 25-65%). Для клиентов и WARP — строго None (комментарии только в
+    # серверных конфигах, как у J/S/H/I).
     _3x_on = supports_3x_add and not for_warp
     # 16.09.2026: 5 таймингов разрешены и в WARP (3.0/3.1) — локальные таймеры,
     # не влияют на провода; проволочные 3.x (паддинг, cookies, trailers, HP)
     # остаются WARP-запрещёнными (их не распарсит сторонний эндпоинт).
     _timings_on = supports_3x_add
+    # 16.09.2026: сервер ниже 3.0 — БЕЗОБИДНЫЕ 3.x выводятся комментариями-
+    # подсказками («# KEY = val  # AWG3.0»), как у S/H/J/I: значения
+    # информационные, раскомментировать можно (ядро принимает их в любой
+    # конфигурации — тайминги проверены даже при S=0 против ванильного WG).
+    # НЕ комментируются: HeaderProtectionKey (в 2.0/3.0 S4 = 5..9 < 12 — ядро
+    # отвергнет конфиг) и RandomTrailers (с неравными S — потери 25-65%).
+    # Значения комментариев берутся из ОТДЕЛЬНОГО локального RNG — global
+    # random не трогается (стрим-инвариант «старые версии = прежние значения»).
+    _3x_comment_mode = for_server and not for_warp and not supports_3x_add
 
-    result["ContentPaddingAddition"] = _padding if _3x_on else None
-    result["DisableCookies"] = "on" if _3x_on else None
+    if _3x_comment_mode:
+        _hint_rng = random.Random()
+        _pad_hint = _generate_content_padding(rng=_hint_rng)
+        _tim_hint = _generate_timing_params(rng=_hint_rng)
+        result["ContentPaddingAddition"] = _pad_hint
+        result["_PADDING_comment"] = "AWG3.0"
+        result["DisableCookies"] = "on"
+        result["_COOKIES_comment"] = "AWG3.0"
+        for _tk in ("RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
+                    "KeepaliveTimeout", "MaxHandshakeAttempts"):
+            result[_tk] = _tim_hint.get(_tk)
+        result["_TIMINGS_comment"] = "AWG3.0"
+    else:
+        result["ContentPaddingAddition"] = _padding if _3x_on else None
+        result["DisableCookies"] = "on" if _3x_on else None
+        for _tk in ("RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
+                    "KeepaliveTimeout", "MaxHandshakeAttempts"):
+            result[_tk] = _timings.get(_tk) if _timings_on else None
     result["RandomTrailers"] = "on" if (supports_3x_full and not for_warp) else None
-    for _tk in ("RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
-                "KeepaliveTimeout", "MaxHandshakeAttempts"):
-        result[_tk] = _timings.get(_tk) if _timings_on else None
 
     # HeaderProtectionKey — строго server-side и только 3.1: один ключ на сервер
     # и всех его клиентов. Клиентам он вшивается из серверного конфига
