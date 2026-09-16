@@ -11576,10 +11576,12 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
     up_script = up_script_template_warp
     down_script = down_script_template_warp
 
-    # Резервное копирование существующих файлов
-    _backup_file(up_path, '.sh.bak')
-    _backup_file(down_path, '.sh.bak')
-    _backup_file(params_path, '.sh.bak')
+    # Резервная копия ТОЛЬКО файла параметров: up/down перегенерируемы из кода,
+    # их бэкапы только копили мусор. Суффикс '.bak' (а не '.sh.bak') — раньше
+    # p.sh + '.sh.bak' давал двойное расширение p.sh.sh.bak. Конфиг интерфейса
+    # (невоспроизводим: ключи/обф-параметры/порт) бэкапится в перегенерационной
+    # ветке handle_makecfg.
+    _backup_file(params_path, '.bak')
 
     atomic_write_text(params_path, params_script)
     atomic_write_text(up_path, up_script)
@@ -12356,6 +12358,9 @@ def handle_makecfg(opt) -> None:
                     new_lines.append(f"I{i} = {obf_params[f'I{i}']}")
         cfg.lines = new_lines
 
+        # Конфиг интерфейса — самое ценное (ключи, обф-параметры, порт): из кода
+        # не воспроизводится, поэтому бэкапится при перегенерации.
+        _backup_file(g_main_config_fn, '.bak')
         cfg.save()
         logger.info('✅ Конфиг %s обновлён', g_main_config_fn)
 
