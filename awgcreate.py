@@ -380,6 +380,13 @@ except Exception:
 find_tunnel_for_subnet() {
   local target_subnet="$1"
   local script_dir="$(dirname "$(readlink -f "$0")")"
+  # Рев-27: выводы ip кэшируются на время выполнения скрипта (функция
+  # вызывается per-участник и per-пара LAN_ALLOW — раньше O(n²) вызовов ip).
+  if [ -z "${_FT_LINK_CACHE_SET:-}" ]; then
+    _FT_LINK_CACHE="$(ip -br link show 2>/dev/null)"
+    _FT_ADDR_CACHE="$(ip -o addr show 2>/dev/null)"
+    _FT_LINK_CACHE_SET=1
+  fi
 
   for conf_file in "$script_dir"/*.conf; do
     [ -f "$conf_file" ] || continue
@@ -400,9 +407,9 @@ find_tunnel_for_subnet() {
     done
   done
 
-  for iface in $(ip -br link show 2>/dev/null | awk '{print $1}'); do
+  for iface in $(echo "$_FT_LINK_CACHE" | awk '{print $1}'); do
     [ "$iface" = "${TUN:-}" ] && continue
-    for addr in $(ip -o addr show "$iface" 2>/dev/null | awk '{print $4}'); do
+    for addr in $(echo "$_FT_ADDR_CACHE" | awk -v i="$iface" '($2 == i || index($2, i "@") == 1) {print $4}'); do
       local overlaps
       overlaps=$(overlaps_py "$target_subnet" "$addr")
       if [ $? -eq 0 ]; then
@@ -610,14 +617,16 @@ is_flags_field() {
   local f_upper
   f_upper=$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')
   [ "$f_upper" = "SNAT" ] && return 0
+  # Рев-24: подстроки вида «SNATx»/«xSNAT» больше не считаются флагами —
+  # иначе PARSED_IFACE="SNATx" → iptables "unknown option" и правило
+  # проброса молча не строилось.
   [[ "$f" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] && return 0
-  [[ "$f_upper" == *"SNAT"* ]] && [[ "$f" =~ [a-zA-Z] ]] && return 0
   return 1
 }
 
 # Получение информации о подсети (кол-во адресов + префикс)
 get_subnet_info() {
-    SUBNET_ARG="$1" python3 << PYEOF
+    SUBNET_ARG="$1" python3 << PYEOF 2>/dev/null
 import ipaddress, os
 try:
     net = ipaddress.ip_network(os.environ.get('SUBNET_ARG', ''), strict=False)
@@ -625,7 +634,6 @@ try:
 except:
     print('0:0')
 PYEOF
- 2>/dev/null
 }
 
 # Перечисление IP в подсети с предупреждением для больших подсетей
@@ -2225,8 +2233,9 @@ ddos_bw_str() {
       echo "$((_num * 125000))kb/s"
       ;;
     *)
-      # Неизвестный суффикс — оставляем как есть
-      echo "${_val}/s"
+      # Рев-24: неизвестный суффикс — раньше отдавался «как есть» и iptables
+      # молча дропал правило. Отдаём валидный минимум (kb/s).
+      echo "${_num}kb/s"
       ;;
   esac
 }
@@ -2964,9 +2973,10 @@ pf_accept_or_ddos() {
   fi
   # Без DDOS или без активных параметров — ACCEPT
   if [ -n "$_subnet" ]; then
-    $_cmd -t filter -A "$PF_CHAIN_FILTER" -p $_proto -d $_dip --dport $_int_port -s $_subnet -j ACCEPT 2>/dev/null || true
+    $_cmd -t filter -A "$PF_CHAIN_FILTER" -p "$_proto" -d "$_dip" --dport "$_int_port" -s "$_subnet" -j ACCEPT 2>/dev/null || true
+    # Рев-24: все аргументы в кавычках (word splitting при пробелах в значениях)
   else
-    $_cmd -t filter -A "$PF_CHAIN_FILTER" -p $_proto -d $_dip --dport $_int_port -j ACCEPT 2>/dev/null || true
+    $_cmd -t filter -A "$PF_CHAIN_FILTER" -p "$_proto" -d "$_dip" --dport "$_int_port" -j ACCEPT 2>/dev/null || true
   fi
 }
 
@@ -3107,6 +3117,11 @@ STATE_BASE_DIR="$(dirname "$(readlink -f "$0")")/.data"
 mkdir -p "$STATE_BASE_DIR" 2>/dev/null || true
 mkdir -p "$STATE_BASE_DIR/warp" 2>/dev/null || true
 
+# Рев-24: ref-счётчики общих MASQUERADE-правил на внешний интерфейс
+# (правило общее для всех туннелей — снимается в down только последним)
+MASQ_REF_FILE="$STATE_BASE_DIR/masq_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
+MASQ6_REF_FILE="$STATE_BASE_DIR/masq6_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
+
 # Собираем все уникальные WARP интерфейсы из всех записей WARP_LIST
 declare -A ALL_WARP_INTERFACES
 for entry in "${WARP_LIST[@]}"; do
@@ -3152,7 +3167,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
   if [ "$WARP_RUNNING" -eq 0 ] && [ ! -f "$WARP_REF_FILE" ]; then
     # Случай 1: Нет интерфейса + Нет .ref → Запускаем интерфейс, создаём .ref=1
     echo "🔧 Запуск WARP: $warp (интерфейс не активен, .ref не найден)"
-    if awg-quick up "$SCRIPT_DIR/${warp}.conf" 2>/dev/null || awg-quick up "$warp" 2>/dev/null; then
+    if awg-quick up "$SCRIPT_DIR/${warp}.conf" 2>>"$LOG_FILE" || awg-quick up "$warp" 2>>"$LOG_FILE"; then
       atomic_ref_update "$WARP_REF_FILE" "set" "1" >/dev/null
       echo "✅ WARP $warp запущен (ref=1)"
     else
@@ -3162,7 +3177,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     # Случай 2: Нет интерфейса + Есть .ref → Запускаем интерфейс, пересоздаём .ref=1
     ref_count=$(atomic_ref_update "$WARP_REF_FILE" "get")
     echo "🔧 Перезапуск WARP: $warp (интерфейс не активен, ref=$ref_count)"
-    if awg-quick up "$SCRIPT_DIR/${warp}.conf" 2>/dev/null || awg-quick up "$warp" 2>/dev/null; then
+    if awg-quick up "$SCRIPT_DIR/${warp}.conf" 2>>"$LOG_FILE" || awg-quick up "$warp" 2>>"$LOG_FILE"; then
       atomic_ref_update "$WARP_REF_FILE" "set" "1" >/dev/null
       echo "✅ WARP $warp перезапущен (ref=1)"
     else
@@ -3216,11 +3231,11 @@ ip6tables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | whi
   _rule="${_line#-A }"
   ip6tables -D $_rule 2>/dev/null || true
 done
-iptables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i $TUN " | while read -r _line; do
+iptables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
   iptables -t mangle -D $_rule 2>/dev/null || true
 done
-ip6tables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i $TUN " | while read -r _line; do
+ip6tables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
   ip6tables -t mangle -D $_rule 2>/dev/null || true
 done
@@ -3506,7 +3521,9 @@ for _de in "${PORT_FORWARDING_DDOS[@]}"; do
   if { [ -z "$DDOS_FAMILY" ] || [[ ",${DDOS_FAMILY}," == *,v4,* ]]; } && [ -n "$LOCAL_SUBNETS_IPV4" ]; then
     ddos_apply_rules "iptables" "$INPUT_CHAIN" "udp" "" "$PORT" ""
   fi
-  if [ -z "$DDOS_FAMILY" ] || [[ ",${DDOS_FAMILY}," == *,v6,* ]]; then
+  if { [ -z "$DDOS_FAMILY" ] || [[ ",${DDOS_FAMILY}," == *,v6,* ]]; } && [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+    # Рев-24: без IPv6-подсети ip6tables-защита не применяется (было: тихо
+    # падало в несозданную цепочку)
     ddos_apply_rules "ip6tables" "$INPUT_CHAIN" "udp" "" "$PORT" ""
   fi
   break
@@ -3519,6 +3536,7 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
   iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+  atomic_ref_update "$MASQ_REF_FILE" "inc" >/dev/null 2>&1 || true
 fi
 
 # IPv6 правила (С NAT!)
@@ -3546,6 +3564,7 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
   ip6tables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   ip6tables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+  atomic_ref_update "$MASQ6_REF_FILE" "inc" >/dev/null 2>&1 || true
 fi
 
 # --- Hairpin NAT ---
@@ -4062,7 +4081,14 @@ fi
 # Убиваем прежние экземпляры БЕЗУСЛОВНО (фикс регресса: при опустевших
 # группах старый демон продолжал слать копии по старым адресам, которые могли
 # быть перевыданы новым клиентам).
-pkill -f "bc_relay_${TUN_SAFE}.py" 2>/dev/null || true
+# Рев-24: убиваем по pid-файлу (точное попадание), pkill остаётся страховкой
+# для процессов без pid-файла (якорный конец строки cmdline).
+_bc_pid="$(cat "$STATE_BASE_DIR/bc_relay_${TUN_SAFE}.pid" 2>/dev/null)"
+if [ -n "$_bc_pid" ]; then
+  kill "$_bc_pid" 2>/dev/null || true
+  rm -f "$STATE_BASE_DIR/bc_relay_${TUN_SAFE}.pid" 2>/dev/null || true
+fi
+pkill -f "bc_relay_${TUN_SAFE}\.py$" 2>/dev/null || true
 if [ -n "$BC_RELAY_GROUPS" ]; then
   BC_RELAY_MARK=$((MARK_BASE + 9000))
   iptables -t nat -I "$HAIRPIN_CHAIN" 1 -m mark --mark $BC_RELAY_MARK -j RETURN 2>/dev/null || true
@@ -5615,6 +5641,7 @@ done
 # префы назначаем УНИКАЛЬНЫЕ (5+idx) — общий «|5» для ≥2 legacy-наборов давал
 # им один pref, и off() одного набора сносил фильтры другого (вооружённые
 # хвосты без tc = послеквотный безлимит).
+mkdir -p "${QUOTA_DIR}" 2>/dev/null || true
 awk -F'|' 'NF==3 {print $0 "|" (5+NR)} NF>3 {print}' "${QUOTA_DIR}/${TUN_SAFE}.thr" > "${QUOTA_DIR}/${TUN_SAFE}.thr.mig" 2>/dev/null && mv -f "${QUOTA_DIR}/${TUN_SAFE}.thr.mig" "${QUOTA_DIR}/${TUN_SAFE}.thr"
 true
 # Зачистка устаревших throttle-записей (наборы вне текущих квот — конфиг
@@ -6345,29 +6372,34 @@ fi
               echo "⚠️  Суммарное число классов лимитов ($TOTAL_LIMIT_CLASSES) чрезмерно — up может зависнуть/исчерпать память" >&2
           fi
 
-for idx in $(seq 0 $((NUM_CLASSES - 1))); do
-                  # Сеть каждой подсети правила (для проверки «выровнена ли запись»)
-                  # — считаем один раз на правило, не на юнит.
-                  if [ -z "${_ANET_SET:-}" ]; then
-                    _ANET=()
-                    i2=0
-                    for _rs2 in "${SUBNET_ARRAY[@]}"; do
-                      _ANET[i2]=$(SUBNET_ARG="$_rs2" python3 -c \
-                        "import ipaddress,os; print(str(ipaddress.ip_network(os.environ['SUBNET_ARG'],strict=False).network_address))" 2>/dev/null)
-                      i2=$((i2+1))
-                    done
-                    _ANET_SET=1
-                  fi
+# Рев-26: ANET / _rule_has_main / _SUB_MAIN зависят только от ПРАВИЛА —
+          # считаем один раз до цикла юнитов (раньше на каждый юнит: для /16
+          # это 2×65536 форков python3 на правило).
+          _ANET=()
+          i2=0
+          for _rs2 in "${SUBNET_ARRAY[@]}"; do
+            _ANET[i2]=$(SUBNET_ARG="$_rs2" python3 -c \
+              "import ipaddress,os; print(str(ipaddress.ip_network(os.environ['SUBNET_ARG'],strict=False).network_address))" 2>/dev/null)
+            i2=$((i2+1))
+          done
+          _rule_has_main=0
+          _SUB_MAIN=()
+          i2=0
+          for _rsm in "${SUBNET_ARRAY[@]}"; do
+            _smi=0
+            if [ "$_rsm" = "$LOCAL_SUBNETS_IPV4" ] || [ "$_rsm" = "$LOCAL_SUBNETS_IPV6" ] \
+               || subnets_equal "$_rsm" "$LOCAL_SUBNETS_IPV4" \
+               || subnets_equal "$_rsm" "$LOCAL_SUBNETS_IPV6"; then
+              _rule_has_main=1
+              _smi=1
+            fi
+            _SUB_MAIN[i2]=$_smi
+            i2=$((i2+1))
+          done
+
+          for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                   # Пропуски резервов — только когда правило содержит главную
                   # подсеть (LOCAL_SUBNETS); для чужих подсетей — всё лимитируется.
-                  _rule_has_main=0
-                  for _rhm in "${SUBNET_ARRAY[@]}"; do
-                    if [ "$_rhm" = "$LOCAL_SUBNETS_IPV4" ] || [ "$_rhm" = "$LOCAL_SUBNETS_IPV6" ] \
-                       || subnets_equal "$_rhm" "$LOCAL_SUBNETS_IPV4" \
-                       || subnets_equal "$_rhm" "$LOCAL_SUBNETS_IPV6"; then
-                      _rule_has_main=1
-                    fi
-                  done
                   if [ "$_rule_has_main" = "1" ]; then
                   # Юнит 0 = группа network-адреса (не выдаётся клиентам) →
                   # пропускается (как серверная и broadcast-группы)
@@ -6394,12 +6426,8 @@ for idx in $(seq 0 $((NUM_CLASSES - 1))); do
                       # главной (LOCAL_SUBNETS): чужая подсеть лимитируется
                       # целиком, её адреса network/broadcast не пропускаются.
                       _sub_main=0
-                      [ "$_rsn" = "$LOCAL_SUBNETS_IPV4" ] && _sub_main=1
-                      [ "$_rsn" = "$LOCAL_SUBNETS_IPV6" ] && _sub_main=1
-                      if [ "$_sub_main" = "0" ]; then
-                        subnets_equal "$_rsn" "$LOCAL_SUBNETS_IPV4" && _sub_main=1
-                        subnets_equal "$_rsn" "$LOCAL_SUBNETS_IPV6" && _sub_main=1
-                      fi
+                      # Рев-26: предвычислено один раз на правило (_SUB_MAIN)
+                      _sub_main=${_SUB_MAIN[$i]:-0}
                       if [ "$_sub_main" = "1" ]; then
                       _srv=""
                       if [[ "$_rsn" == *:* ]]; then
@@ -6559,6 +6587,7 @@ fi
 # Lock уже удерживается с начала квотной секции (см. выше) — фаза идёт под ним.
 # Миграция дофиксового формата .thr (3 поля, без pref; фикс аудита-5x5 +
 # регресс): уникальные prefs (5+idx) — общий «|5» коллайдил между наборами
+mkdir -p "${SCRIPT_DIR%/}/.data/quota" 2>/dev/null || true
 awk -F'|' 'NF==3 {print $0 "|" (5+NR)} NF>3 {print}' "${SCRIPT_DIR%/}/.data/quota/${TUN_SAFE}.thr" > "${SCRIPT_DIR%/}/.data/quota/${TUN_SAFE}.thr.mig" 2>/dev/null && mv -f "${SCRIPT_DIR%/}/.data/quota/${TUN_SAFE}.thr.mig" "${SCRIPT_DIR%/}/.data/quota/${TUN_SAFE}.thr"
 true
 # Зачистка устаревших throttle-записей (наборы вне текущих квот: правило
@@ -6632,6 +6661,10 @@ SCRIPT_NAME="$(basename "$DOWN_SCRIPT_PATH" down.sh)"
 STATE_BASE_DIR="$SCRIPT_DIR/.data"
 TUNNELS_STATE_DIR="$STATE_BASE_DIR/temp"
 TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh"
+
+# Рев-24: те же ref-счётчики MASQUERADE, что и в up.sh (общий каталог .data)
+MASQ_REF_FILE="$STATE_BASE_DIR/masq_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
+MASQ6_REF_FILE="$STATE_BASE_DIR/masq6_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
 
 # Восстановление глобальных sysctl, изменённых up.sh (rp_filter и др.)
 # (сохранены в .data/<tun>_sysctl.save при up).
@@ -6825,7 +6858,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
       STOPPED_WARP_ZERO_REFS["$warp"]=1
       if [ "$WARP_RUNNING" -eq 1 ]; then
         # Предпочитаем конфиг рядом со скриптами (баг 1.16), иначе имя из стандартного каталога
-        if awg-quick down "$SCRIPT_DIR/${warp}.conf" 2>/dev/null || awg-quick down "$warp" 2>/dev/null; then
+        if awg-quick down "$SCRIPT_DIR/${warp}.conf" 2>>"$LOG_FILE" || awg-quick down "$warp" 2>>"$LOG_FILE"; then
           : # WARP остановлен
         else
           WARP_STOPPED_OK=0
@@ -6856,7 +6889,7 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
     STOPPED_WARP_ZERO_REFS["$warp"]=1
     if [ "$WARP_RUNNING" -eq 1 ]; then
       echo "⚠️  WARP $warp запущен но .ref не найден — очистка..."
-      if awg-quick down "$SCRIPT_DIR/${warp}.conf" 2>/dev/null || awg-quick down "$warp" 2>/dev/null; then
+      if awg-quick down "$SCRIPT_DIR/${warp}.conf" 2>>"$LOG_FILE" || awg-quick down "$warp" 2>>"$LOG_FILE"; then
         : # WARP остановлен
       else
         WARP_STOPPED_OK=0
@@ -7044,7 +7077,14 @@ if [ -f "$SCRIPT_DIR/.data/bc_relay_${TUN_SAFE}.pid" ]; then
     rm -f "$SCRIPT_DIR/.data/bc_relay_${TUN_SAFE}.pid" 2>/dev/null || true
 else
     # Фоллбэк pkill: pidfile потерян/не создан — демон мог остаться висеть
-    pkill -f "bc_relay_${TUN_SAFE}.py" 2>/dev/null || true
+    # Рев-24: убиваем по pid-файлу (точное попадание), pkill остаётся страховкой
+# для процессов без pid-файла (якорный конец строки cmdline).
+_bc_pid="$(cat "$STATE_BASE_DIR/bc_relay_${TUN_SAFE}.pid" 2>/dev/null)"
+if [ -n "$_bc_pid" ]; then
+  kill "$_bc_pid" 2>/dev/null || true
+  rm -f "$STATE_BASE_DIR/bc_relay_${TUN_SAFE}.pid" 2>/dev/null || true
+fi
+pkill -f "bc_relay_${TUN_SAFE}\.py$" 2>/dev/null || true
 fi
 rm -f "$SCRIPT_DIR/.data/bc_relay_${TUN_SAFE}.py" 2>/dev/null || true
 rm -f "$SCRIPT_DIR/.data/bc_relay_${TUN_SAFE}.log" 2>/dev/null || true
@@ -7352,21 +7392,37 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -D FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 fi
 
+# Рев-24: экранированный TUN для grep-очистки (имя с точкой не зацепит чужие правила)
+_TUN_RE="$(printf '%s' "$TUN" | sed 's/[][\.*^$+?()|{}]/\\&/g')"
+
+# Рев-24: общий MASQUERADE-правило снимаем ТОЛЬКО когда это последний туннель
+# на внешнем интерфейсе (ref-счётчик из up.sh; раньше правило висело вечно)
+_masq_left="$(atomic_ref_update "$MASQ_REF_FILE" "dec" 2>/dev/null || echo 1)"
+if [ "${_masq_left:-1}" -le 0 ]; then
+  iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+  rm -f "$MASQ_REF_FILE" 2>/dev/null || true
+fi
+_masq6_left="$(atomic_ref_update "$MASQ6_REF_FILE" "dec" 2>/dev/null || echo 1)"
+if [ "${_masq6_left:-1}" -le 0 ]; then
+  ip6tables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+  rm -f "$MASQ6_REF_FILE" 2>/dev/null || true
+fi
+
 # Очищаем все FORWARD правила для этого туннеля (LAN_ALLOW, broadcast, MARK)
-iptables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i $TUN " | while read -r _line; do
+iptables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
   iptables -D $_rule 2>/dev/null || true
 done
-ip6tables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i $TUN " | while read -r _line; do
+ip6tables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
   ip6tables -D $_rule 2>/dev/null || true
 done
 # Очищаем mangle FORWARD правила для этого туннеля (broadcast MARK)
-iptables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i $TUN " | while read -r _line; do
+iptables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
   iptables -t mangle -D $_rule 2>/dev/null || true
 done
-ip6tables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i $TUN " | while read -r _line; do
+ip6tables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
   ip6tables -t mangle -D $_rule 2>/dev/null || true
 done
@@ -7437,6 +7493,7 @@ quota_jump_del() {
 # Сериализация с cron/up (фикс аудита-fresh: down раньше не брал lock —
 # последний-писатель-побеждал по журналу и cron мог возрождать цепочки
 # мёртвого интерфейса).
+mkdir -p "$SCRIPT_DIR/.data/quota" 2>/dev/null || true
 exec 8>"$SCRIPT_DIR/.data/quota/${TUN_SAFE}.cron.lock"
 flock -w 300 8 2>/dev/null || echo "⚠️ quota-down: не удалось дождаться cron-lock (300с)" >&2
 # (иначе до 59 минут между cron-слепком и down терялись бы при восстановлении)
@@ -7568,18 +7625,22 @@ _IMITAT_SIDECAR_MAIN_GO = r'''// awg-imitat — единый сайдкар им
 package main
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math/big"
+	mathrand "math/rand"
 	"net"
 	"os"
 	"sync"
@@ -7699,9 +7760,26 @@ func buildServerHello(sessionID []byte, keyShareData []byte) []byte {
 }
 
 func runUTLS(sni, seed string) {
+	// Рев-25: при заданном seed keygen и выбор GREASE детерминированы —
+	// повторный запуск с тем же seed даёт тот же ClientHello
+	// (воспроизводимость I-строк и согласованность сервер↔клиент).
+	seeded := seed != ""
+	var rng *mathrand.Rand
+	var seedHash [32]byte
+	if seeded {
+		seedHash = sha256.Sum256([]byte(seed))
+		rng = mathrand.New(mathrand.NewSource(int64(binary.BigEndian.Uint64(seedHash[:8]))))
+	}
+
 	// Реальный X25519 публичный ключ для key_share
 	curve := ecdh.X25519()
-	priv, err := curve.GenerateKey(rand.Reader)
+	var priv *ecdh.PrivateKey
+	var err error
+	if seeded {
+		priv, err = curve.NewPrivateKey(seedHash[:])
+	} else {
+		priv, err = curve.GenerateKey(rand.Reader)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "keygen:", err)
 		os.Exit(1)
@@ -7710,7 +7788,12 @@ func runUTLS(sni, seed string) {
 
 	// SCID (8 байт) — идёт и в transport parameters, и в QUIC header
 	scid := make([]byte, 8)
-	if _, err := rand.Read(scid); err != nil {
+	if seeded {
+		// Рев-25: SCID детерминирован от seed (иначе ClientHello менялся
+		// между запусками даже при одном seed)
+		scidH := sha256.Sum256([]byte("scid:" + seed))
+		copy(scid, scidH[:8])
+	} else if _, err := rand.Read(scid); err != nil {
 		fmt.Fprintln(os.Stderr, "rand:", err)
 		os.Exit(1)
 	}
@@ -7751,16 +7834,21 @@ func runUTLS(sni, seed string) {
 			extList := []utls.TLSExtension{&utls.SNIExtension{ServerName: sni}}
 			used := map[int]bool{}
 			for len(used) < 3 {
-				n, err := rand.Int(rand.Reader, big.NewInt(int64(len(greasePool))))
-				if err != nil {
-					break
+				var gi int
+				if seeded {
+					gi = rng.Intn(len(greasePool))
+				} else {
+					n, err := rand.Int(rand.Reader, big.NewInt(int64(len(greasePool))))
+					if err != nil {
+						break
+					}
+					gi = int(n.Int64())
 				}
-				i := int(n.Int64())
-				if used[i] {
+				if used[gi] {
 					continue
 				}
-				used[i] = true
-				extList = append(extList, &utls.GenericExtension{Id: greasePool[i].id, Data: greasePool[i].body})
+				used[gi] = true
+				extList = append(extList, &utls.GenericExtension{Id: greasePool[gi].id, Data: greasePool[gi].body})
 			}
 			extList = append(extList, &utls.GenericExtension{Id: 0xfe0d, Data: octets("00000100011c0020a07ecc411c1c6ec6266ffe3ddff8f230e13790916fbb3f4811e6afa799cf601000f0827a0581671b4d6d0b9dce7e1451ea7d8bcb346b6904e3ae273809519d73dcafdcb8b23f060f6a65f5780166ac83f8f97d7dde5e7454feefddadc20470d50afc05dce4a7c04e4d011b97b891b9151a28da6ee32fd5553babd1ca74dd189e60afe54e491b291e262b003a5bc4c138904ba762be62bfcff699d528225059ab26d840259c8c1ff4e9c6b16221f2ef485b5481a473bacc05a6a99e71ee9c95e3179118ed4c2ef6ebb3f334f2c7e26e8c841c20ce1978e1ad7e972b55124dac9b2cee9006b6b2ba0046a40d6500768cdd2fe98ae4933dff55dedb15835ae771cd3a6cf583993972834addf30fe654fac442da")})
 			extList = append(extList, &utls.SupportedCurvesExtension{Curves: []utls.CurveID{
@@ -7910,6 +7998,32 @@ func genCert() (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
 
+func genCertFromSeed(seedStr string) (tls.Certificate, error) {
+	// Рев-25: детерминированный серверный сертификат от seed — реальные
+	// DTLS-серверы переиспользуют свой сертификат между сессиями, поэтому
+	// все конфиги одного интерфейса получают один server-identity.
+	h := sha256.Sum256([]byte(seedStr))
+	key, err := ecdsa.GenerateKey(elliptic.P256(), bytes.NewReader(h[:]))
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	serial := new(big.Int).SetBytes(h[8:28])
+	cn := fmt.Sprintf("webrtc-%x", h[4:10])
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+}
+
 func waitCaptured(c *captureConn) bool {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !c.hasCapture() {
@@ -7958,7 +8072,7 @@ func record(seq int, payload []byte) []byte {
 	return append(r, payload...)
 }
 
-func runDTLS(sni string) {
+func runDTLS(sni, seed string) {
 	// 1. ClientHello через Pion клиент
 	clientConn := &captureConn{done: make(chan struct{})}
 	go func() {
@@ -7985,6 +8099,13 @@ func runDTLS(sni string) {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "cert:", err)
 		os.Exit(1)
+	}
+	if seed != "" {
+		cert, err = genCertFromSeed(seed)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cert(seed):", err)
+			os.Exit(1)
+		}
 	}
 	srvConn := &captureConn{readData: ch, done: make(chan struct{})}
 	go func() {
@@ -8074,7 +8195,7 @@ func main() {
 	flag.Parse()
 	switch *mode {
 	case "dtls":
-		runDTLS(*sni)
+		runDTLS(*sni, *seed)
 	default:
 		runUTLS(*sni, *seed)
 	}
@@ -9061,7 +9182,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         sni_bytes = domain.encode('utf-8')
         sni_hex = sni_bytes.hex()
         random_hex = secrets.token_hex(32)
-        session_id_hex = secrets.token_hex(32)
+        session_id_hex = hashlib.sha256(seed.encode()).hexdigest() if seed else secrets.token_hex(32)  # рев-25: эхо session_id (RFC 5246): обе стороны — от seed → сервер эхо-отражает клиента
 
         # TLS 1.2 cipher suites (первый — детерминированный от seed, совпадает с сервером)
         suites_pool = ["c02b", "c02f", "c02c", "c030", "cca8", "cca9",
@@ -9192,7 +9313,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
                 random_digits=10, random_digits_range=5,
             )
         random_hex = secrets.token_hex(32)
-        session_id_hex = secrets.token_hex(32)
+        session_id_hex = hashlib.sha256(seed.encode()).hexdigest() if seed else secrets.token_hex(32)  # рев-25: эхо session_id (RFC 5246): обе стороны — от seed → сервер эхо-отражает клиента
         chosen_cipher = (random.Random(seed).choice([
             "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
         ]) if seed else secrets.choice([
@@ -9203,8 +9324,10 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
                    f"00")
         sh_len = len(sh_body) // 2
         sh_hex = f"02{sh_len:06x}{sh_body}"
-        crypto_hex = "06" + "00000000" + f"{len(sh_hex)//2:08x}{sh_hex}"
-        quic_hex, qr_static_range = _build_quic_packet(crypto_hex, default_range=40, is_server=True)
+        crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(sh_hex) // 2) + sh_hex
+        quic_hex, qr_static_range = _build_quic_packet(
+            crypto_hex, default_range=40, is_server=True,
+            pad_target=1200 if try_AESGCM is not None else 0)
 
         if try_AESGCM is not None:
             rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
@@ -9263,11 +9386,20 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
 
     # ─── STUN имитация (WebRTC ICE / NAT traversal) ─────────────
     def _stun_mi_key() -> str:
-        """Ключ MESSAGE-INTEGRITY: детерминированный от seed (как session_id в QUIC),
+        """Ключ MESSAGE-INTEGRITY: детерминированный от seed (session_id в STUN-серии),
         иначе случайный. Реальный HMAC-SHA1, просто не привязан к живой ICE-сессии."""
         if seed:
             return hashlib.sha256(seed.encode()).hexdigest()
         return secrets.token_hex(32)
+
+    def _stun_ufrag() -> str:
+        """Рев-25: уникальный ICE username fragment на конфиг (детерминированно
+        от seed; раньше константа «abc123:xyz789» — стабильный отпечаток во
+        ВСЕХ конфигах). В реальном ICE у каждой стороны свой ufrag."""
+        if seed:
+            h = hashlib.sha256(("stun-ufrag:" + seed).encode()).hexdigest()
+            return f"{h[:10]}:{h[10:16]}"
+        return secrets.token_hex(5) + ":" + secrets.token_hex(3)
 
     def _stun_build(msg_type_hex: str, attrs_hex: str, mi_key: str = "") -> str:
         """Собирает STUN-сообщение (RFC 5389): header + attributes + [MESSAGE-INTEGRITY] + FINGERPRINT.
@@ -9299,7 +9431,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         """STUN Binding Request (WebRTC ICE connectivity check)."""
         priority = "0024" + "0004" + "6e7a1b7f"          # PRIORITY (1853634559)
         ice_ctrl = "802a" + "0008" + secrets.token_hex(8)  # ICE-CONTROLLING tie-breaker
-        ufrag = "abc123:xyz789"                            # ICE username fragment
+        ufrag = _stun_ufrag()                            # рев-25: уникальный per-конфиг
         pad = (4 - (len(ufrag) % 4)) % 4                   # STUN: атрибуты кратны 4 байтам
         username = "0006" + f"{len(ufrag):04x}" + ufrag.encode().hex() + "00" * pad
         msg = _stun_build("0001", priority + ice_ctrl + username, mi_key=_stun_mi_key())
@@ -9314,8 +9446,15 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     def _gen_stun_server():
         """STUN Binding Success Response (XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY)."""
         # XOR-MAPPED-ADDRESS (0x0020): reserved+family(1) + XOR-port(2) + XOR-addr(4)
-        port = 52884
-        ip = 0xC0A80101  # 192.168.1.1
+        # Рев-25: детерминированно от seed — раньше константы (192.168.1.1:52884)
+        # были отпечатком во всех конфигах.
+        if seed:
+            h = hashlib.sha256(("stun-xor:" + seed).encode()).digest()
+            port = 1024 + ((h[0] << 8 | h[1]) % (65535 - 1024 + 1))
+            ip = (10 << 24) | (h[2] << 16) | (h[3] << 8) | h[4]
+        else:
+            port = 1024 + secrets.randbelow(65535 - 1024 + 1)
+            ip = (10 << 24) | (secrets.randbelow(256) << 16) | (secrets.randbelow(256) << 8) | secrets.randbelow(256)
         xport = port ^ 0x2112
         xaddr = ip ^ 0x2112A442
         xma = "0020" + "0008" + "0001" + f"{xport:04x}" + f"{xaddr:08x}"
@@ -9406,7 +9545,8 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         if not sidecar:
             return None
         try:
-            rc, out = exec_cmd([sidecar, "-mode", "dtls", "-sni", domain or "www.example.com"], timeout=15)
+            rc, out = exec_cmd([sidecar, "-mode", "dtls", "-sni", domain or "www.example.com",
+                                "-seed", seed or ""], timeout=15)  # рев-25: детерминированный серверный сертификат
             if rc != 0:
                 logger.warning("⚠  DTLS-сайдкар вернул код %s: %s", rc, out.strip()[:200])
                 return None
@@ -9708,7 +9848,9 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
         S1, S2, S3, S4 = _generate_s_params(
             avoid_length_collision=version in ("AWG2.0", "AWG3.0"))
 
-    # seed для session_id (QUIC) и выбора cipher (TLS 1.2) — ПУБЛИЧНЫЙ КЛЮЧ СЕРВЕРА
+    # seed для выбора cipher (TLS 1.2) и STUN MI-ключа — ПУБЛИЧНЫЙ КЛЮЧ СЕРВЕРА.
+    # (session_id = sha256(seed) — ТОЛЬКО в STUN-серии; в QUIC-фоллбэке session_id —
+    # независимый secrets-токен на каждой стороне без эха — известное ограничение.)
     # (16.09.2026: раньше было S1+S2+pubkey. session_id = sha256(seed) лежит на проводе
     # открытым, и при известном pubkey (он публичный — в каждом клиентском конфиге)
     # S1/S2 выводились перебором: 3.1 — 8 вариантов, 2.0 — ~19k. S — не ключевой
@@ -9853,6 +9995,31 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
     else:
         result["HeaderProtectionKey"] = None
 
+    # Рев-25 (найдено приёмкой ядром на стенде): awg-парсер 3.1.20260812 падает
+    # SIGABRT (double free) при суммарной длине I-строк > ~4096 hex — и даже
+    # при чистом «00»-заполнении (краш от РАЗМЕРА, не от содержимого).
+    # uTLS-путь даёт I1+I2 ≈ 4500 hex. ФИНАЛЬНЫЙ кап: дропаем ХВОСТОВЫЕ
+    # строки целиком (валидность пакетов сохраняется; одиночная I1 ~2400
+    # hex принимается ядром). Только если одна строка всё ещё > бюджета —
+    # урезаем (чётный hex) как крайнюю меру.
+    _I_BUDGET = 3500
+    _i_names = [k for k in ("I1", "I2", "I3", "I4", "I5")
+                if result.get(k) not in (None, "None", "<I>")]
+    while len(_i_names) > 1:
+        _total = sum(len(str(result.get(k) or "")) for k in _i_names)
+        if _total <= _I_BUDGET:
+            break
+        _ik = _i_names.pop()
+        logger.warning("⚠  I-строка %s дропнута (суммарная длина %d > лимита %d awg-парсера)",
+                       _ik, _total, _I_BUDGET)
+        result[_ik] = None
+    for _ik in _i_names:
+        _s = str(result.get(_ik) or "")
+        if len(_s) > _I_BUDGET:
+            _keep = _I_BUDGET if _I_BUDGET % 2 == 0 else _I_BUDGET - 1
+            logger.warning("⚠  I-строка %s длиной %d обрезана до %d (крайняя мера)", _ik, len(_s), _keep)
+            result[_ik] = _s[:_keep]
+
     return result
 
 # ----------------- Генерация ключей -----------------
@@ -9870,10 +10037,9 @@ def gen_pair_keys() -> tuple[str, str]:
                 # Проверка формата (аудит-20): мусорный вывод сломал бы конфиг.
                 # Явные проверки вместо assert — assert удаляется при python -O
                 # (bandit B101), что отключило бы валидацию в оптимизированном запуске.
-                import base64 as _b64
                 try:
-                    _priv_b = _b64.b64decode(priv + "=" * ((4 - len(priv) % 4) % 4), validate=True)
-                    _pub_b = _b64.b64decode(pub + "=" * ((4 - len(pub) % 4) % 4), validate=True)
+                    _priv_b = base64.b64decode(priv + "=" * ((4 - len(priv) % 4) % 4), validate=True)
+                    _pub_b = base64.b64decode(pub + "=" * ((4 - len(pub) % 4) % 4), validate=True)
                     # Фикс аудита: проверки длин СТРОКИ (43/44) недостаточно —
                     # base64 из 44 символов может декодироваться в 33 байта.
                     if len(_priv_b) != 32 or len(_pub_b) != 32:
@@ -10004,7 +10170,11 @@ def exec_cmd(cmd, input: str | None = None, shell: bool = False, timeout: int | 
     try:
         use_shell = shell
         if isinstance(cmd, str) and not shell:
-            use_shell = True
+            # Рев-21: молчаливый shell=True на строковой команде был ловушкой
+            # инъекции для будущих вызовов; теперь явная ошибка. Все реальные
+            # вызовы — списками (проверено по всем call-site'ам).
+            raise ValueError("exec_cmd: строковая команда без shell=True запрещена — "
+                             "передайте список аргументов")
         proc = subprocess.run(
             cmd,
             input=input,
@@ -10135,7 +10305,7 @@ def check_warp_endpoint(host_port: str, server_pubkey: str = "", client_private_
         "-server-pub", server_pubkey,
         "-timeout-ms", str(int(timeout * 1000)),
         "-retries", "2",
-    ], input=probe_input)
+    ], input=probe_input, timeout=15)  # рев-21: внешний предохранитель от зависшего probe
     if rc == 0 and out_raw:
         try:
             data = json.loads(out_raw.strip().splitlines()[-1])
@@ -10176,7 +10346,10 @@ def get_ext_ipaddr() -> str:
     Получение внешнего IP адреса сервера.
 
     Приоритет: IPv4 → IPv6.
-    Сначала пробуем получить IPv4, только если не получилось — IPv6.
+    Рев-23: все сервисы опрашиваются ПАРАЛЛЕЛЬНО (раньше — последовательно,
+    до ~36 c блокировки при недоступной сети); возвращается первый валидный
+    IP нужной версии. Результат (внешний адрес) не меняется — все сервисы
+    отдают один и тот же egress-IP сервера.
 
     Returns:
         str: Внешний IPv4 или IPv6 адрес сервера
@@ -10184,7 +10357,8 @@ def get_ext_ipaddr() -> str:
     Raises:
         RuntimeError: Если ни один сервис не ответил
     """
-    # Все сервисы (проверяем в два прогона: сначала IPv4, потом IPv6)
+    import concurrent.futures
+
     services = [
         "https://icanhazip.com",
         "https://api.ipify.org",
@@ -10194,37 +10368,46 @@ def get_ext_ipaddr() -> str:
         "https://api64.ipify.org",
     ]
 
-    def _fetch_ip_version(version: int) -> tuple[str | None, str | None]:
-        """Один прогон по сервисам: возвращает (IP нужной версии, последняя ошибка)."""
-        last_error = None
-        for service_url in services:
+    def _fetch_one(service_url: str, version: int) -> str | None:
+        try:
+            r = requests.get(service_url, timeout=3)
+            r.raise_for_status()
+            ip = r.text.strip()
+            addr = ipaddress.ip_address(ip)
+            if addr.version == version:
+                return ip
+        except requests.exceptions.RequestException:
+            pass
+        except ValueError:
+            pass
+        return None
+
+    results_v4: dict[str, str] = {}
+    results_v6: dict[str, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(services)) as ex:
+        futures = {}
+        for version, bucket in ((4, results_v4), (6, results_v6)):
+            for service_url in services:
+                futures[ex.submit(_fetch_one, service_url, version)] = (bucket, service_url)
+        for fut in concurrent.futures.as_completed(futures):
+            bucket, service_url = futures[fut]
             try:
-                # Короткие таймауты: блокировка до ~полутора минут при недоступной
-                # сети неприемлема (аудит-20); 3 сек на сервис, до 3 попыток.
-                r = requests.get(service_url, timeout=3)
-                r.raise_for_status()
-                ip = r.text.strip()
-                addr = ipaddress.ip_address(ip)
-                if addr.version == version:
-                    return ip, last_error
-            except requests.exceptions.RequestException as e:
-                last_error = f"{service_url}: {e}"
-            except ValueError:
-                last_error = f"{service_url}: неверный формат IP"
-        return None, last_error
+                ip = fut.result()
+            except Exception:
+                ip = None
+            if ip:
+                bucket[service_url] = ip
 
-    # Первый прогон: ищем IPv4
-    ip, last_error = _fetch_ip_version(4)
-    if ip:
-        return ip
-
-    # Второй прогон: ищем IPv6 (если первый неудался)
-    ip, last_error = _fetch_ip_version(6)
-    if ip:
-        return ip
-
-    # Ни один сервис не сработал
-    raise RuntimeError(f"Не удалось получить внешний IP. Последняя ошибка: {last_error}")
+    # Рев-23.1: выбор строго в ИСХОДНОМ порядке приоритета среди успешных
+    # сервисов — результат идентичен последовательному коду (первый по списку
+    # успешный), при параллельном опросе; на мульти-egress хостах это важно.
+    for service_url in services:
+        if results_v4.get(service_url):
+            return results_v4[service_url]
+    for service_url in services:
+        if results_v6.get(service_url):
+            return results_v6[service_url]
+    raise RuntimeError("Не удалось получить внешний IP (все сервисы недоступны)")
 
 
 # ----------------- WGConfig (Original Logic) -----------------
@@ -10618,7 +10801,8 @@ def _select_endpoint_from_api_result(result: dict) -> object | None:
     return None
 
 
-def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", version: str = "AWG2.0", for_server: bool = True) -> tuple[str, str]:
+def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", version: str = "AWG2.0", for_server: bool = True,
+                         verified_endpoints: list[str] | None = None) -> tuple[str, str]:
     """
     Генерация одного WARP-конфига (универсальная функция).
 
@@ -10696,6 +10880,12 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
             candidates.append(api_endpoints)
     candidates.extend(CANDIDATE_WARP_ENDPOINTS)
 
+    # Рев-23: endpoint'ы, проверенные в этом прогоне, пробуем первыми —
+    # вместо N полных сканов (до 50 probe × N) при нескольких WARP-конфигах.
+    if verified_endpoints:
+        candidates = [ep for ep in verified_endpoints if ep in candidates] + \
+                     [ep for ep in candidates if ep not in verified_endpoints]
+
     chosen = None
     total_endpoints = len(candidates)
     for idx, ep in enumerate(candidates, 1):
@@ -10705,6 +10895,8 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
                                           client_private_key=priv_key, timeout=0.9)
             if ok:
                 chosen = ep
+                if verified_endpoints is not None and ep not in verified_endpoints:
+                    verified_endpoints.append(ep)
                 if how in ("handshake", "cookie"):
                     logger.info("✅ Endpoint найден: %s (реальное WG-рукопожатие: %s)", chosen, how)
                 else:
@@ -10843,14 +11035,15 @@ def fetch_allowed_dsyt() -> str:
             try:
                 r = requests.get(url, timeout=8)
                 if r.status_code != 200:
-                    logger.warning("⚠  Не удалось получить IPs для %s (%s). Код ответа: %s. Используется Fallback.", site, proto, r.status_code)
-                    return FALLBACK_DSYT_ALLOWEDIPS
-                
+                    logger.warning("⚠  Не удалось получить IPs для %s (%s). Код ответа: %s. Пропуск сайта.", site, proto, r.status_code)
+                    continue
+
                 data = r.text.strip()
                 if not data:
-                    # Если вернулся пустой список для сайта — это подозрительно, считаем за ошибку
-                    logger.warning("⚠  Пустой ответ для %s (%s). Используется Fallback.", site, proto)
-                    return FALLBACK_DSYT_ALLOWEDIPS
+                    # Пустой список для сайта — подозрительно; пропускаем сайт
+                    # (рев-27: раньше один битый сайт ронял ВЕСЬ набор в fallback)
+                    logger.warning("⚠  Пустой ответ для %s (%s). Пропуск сайта.", site, proto)
+                    continue
                 
                 for item in data.split(","):
                     item = item.strip()
@@ -10862,15 +11055,21 @@ def fetch_allowed_dsyt() -> str:
                         logger.warning("⚠  Некорректный CIDR от %s (%s): %s", site, proto, item)
                         continue
             except Exception as e:
-                logger.warning("⚠  Ошибка соединения при получении %s (%s): %s. Используется Fallback.", site, proto, e)
-                return FALLBACK_DSYT_ALLOWEDIPS
-        
-        # Если для сайта вообще ничего не нашлось (даже если 200 OK)
+                logger.warning("⚠  Ошибка соединения при получении %s (%s): %s. Пропуск сайта.", site, proto, e)
+                continue
+
+        # Если для сайта вообще ничего не нашлось — пропускаем сайт
+        # (рев-27: раньше это роняло весь набор в fallback)
         if not site_ips:
-             logger.warning("⚠  Не найдено ни одного IP для %s. Используется Fallback.", site)
-             return FALLBACK_DSYT_ALLOWEDIPS
-             
+             logger.warning("⚠  Не найдено ни одного IP для %s. Пропуск сайта.", site)
+             continue
+
         ip_set.update(site_ips)
+
+    # Рев-27: только если НИ ОДИН сайт не отдал валидных IP — fallback
+    if not ip_set:
+        logger.warning("⚠  Не получено ни одного CIDR — используется Fallback.", )
+        return FALLBACK_DSYT_ALLOWEDIPS
 
     return ", ".join(sorted(ip_set))
 
@@ -11010,9 +11209,14 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
                 head_has_colon = ':' in head_strip
                 raw_has_colon = ':' in raw
                 ipv4_match = re.match(r'^\d+\.\d+\.\d+\.\d+$', head_strip) is not None
-                if head_has_dot or head_has_colon or raw_has_colon or ipv4_match:
+                if head_has_colon or raw_has_colon or ipv4_match:
                     hostpart = head_strip
                     lbl = _sanitize_label(tail.strip())
+                elif head_has_dot:
+                    # Рев-27: домен с дефисом («vpn.acme.com-us-east») — это ИМЯ
+                    # ХОСТА целиком, а не «host-метка»; резать по последнему
+                    # дефису нельзя (раньше endpoint становился нерезолвящимся).
+                    lbl = ""
                 else:
                     lbl = ""
             else:
@@ -11025,8 +11229,7 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
             if ']' in probe6:
                 probe6 = probe6.strip('[]')
             try:
-                import ipaddress as _ipa
-                _ipa.ip_address(probe6)
+                ipaddress.ip_address(probe6)
                 _append(hostpart.strip(), default_port, lbl)
             except Exception:
                 logger.warning("⚠️  Пропущен некорректный endpoint %r (не IPv6, лишние ':'): %s",
@@ -11406,6 +11609,10 @@ def _process_interface_path(raw_input: str) -> tuple[pathlib.Path, str]:
         target_path = pathlib.Path(raw_input)
 
     tun_name = target_path.stem
+    # Фикс 16.09.2026: «..»/«.» проходили _SAFE_NAME (точки входят в класс)
+    # и ломали пути (tun_name идёт в каталоги и shell). Запрещаем явно.
+    if tun_name in ('.', '..'):
+        raise RuntimeError(f'Недопустимое имя интерфейса "{raw_input}": нельзя "." и ".."')
     return target_path, tun_name
 
 
@@ -11557,6 +11764,10 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
                     main_iface: str, tun_name: str, opt, server_addr: str,
                     warp_configs: list[str]) -> None:
     """Создание up.sh, down.sh и файла параметров."""
+    # Безопасность (аудит 16.09.2026): main_iface уходит во все bash-шаблоны
+    # (IFACE="...") и source-ится от root — строгий whitelist, как у tun_name.
+    if not re.fullmatch(r'[A-Za-z0-9_.\-]+', main_iface) or main_iface in ('.', '..'):
+        raise RuntimeError(f'Недопустимое имя интерфейса "{main_iface}"')
 
     if warp_configs:
         warp_list_str = "\n".join([f'  \"{pathlib.Path(cfg).stem}\"' for cfg in warp_configs])
@@ -11875,7 +12086,9 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
 
 
 def _add_client_to_config(srv_path: pathlib.Path, c_name: str, ipaddr: str,
-                          persistent_keepalive: int) -> str:
+                          persistent_keepalive: str) -> str:
+    """Добавляет клиента в серверный конфиг.
+    persistent_keepalive — СТРОКА (диапазон "3-9" для AWG3.x; фикс типа рев-21)."""
     """Добавление клиента в серверный конфиг.
 
     Фикс аудита-A1: НЕ пишет файл сам — возвращает новый полный текст;
@@ -11915,6 +12128,16 @@ def _backup_file(path: pathlib.Path, suffix: str = '.bak') -> pathlib.Path | Non
     shutil.copy2(path, backup_path)
     logger.info("📦 Создана резервная копия: %s", backup_path)
     return backup_path
+
+
+def _ensure_file_unchanged(path: pathlib.Path, st, label: str) -> None:
+    """Защита от потери параллельных правок (аудит 16.09.2026): если файл
+    изменился с момента загрузки в память (mtime/size/inode), прерываем
+    работу вместо молчаливой перезаписи устаревшей копией — иначе
+    параллельный -a/-u/-d теряется без ошибки."""
+    now = path.stat()
+    if (now.st_mtime_ns, now.st_size, now.st_ino) != (st.st_mtime_ns, st.st_size, st.st_ino):
+        raise RuntimeError(f"{label}: файл изменён во время работы — повторите команду")
 
 
 # ─── Шаги поиска/передачи версии QR ─────────────────────────────
@@ -12105,12 +12328,11 @@ def _get_param_value(conf_text: str, param: str, version: str, min_version: str)
 
 
 def _get_server_params(server_conf_text: str, server_protocol: str) -> dict:
-    """Получение параметров сервера (S1-S4, H1-H4, AWG3.x, PublicKey) из конфига.
-
-    AWG3.x-параметры читаются с min_version: ContentPadding/тайминги/DisableCookies
-    с AWG3.0, HeaderProtectionKey/RandomTrailers с AWG3.1. HeaderProtectionKey —
-    server-side: обязан совпадать у сервера и всех клиентов, поэтому вшивается
-    в клиентские конфиги именно отсюда.
+    """Получение параметров сервера (S1-S4, H1-H4, PublicKey, HeaderProtectionKey)
+    из конфига. HeaderProtectionKey — server-side: обязан совпадать у сервера и
+    всех клиентов, поэтому вшивается в клиентские конфиги именно отсюда.
+    (Рев-20: CPA/тайминги/DisableCookies/RandomTrailers отсюда удалены — у них
+    не было потребителей; клиент получает свои значения из client_obf_params.)
     """
     return {
         'PublicKey': _get_param_value(server_conf_text, 'PublicKey', server_protocol, "WG"),
@@ -12122,17 +12344,8 @@ def _get_server_params(server_conf_text: str, server_protocol: str) -> dict:
         'H2': _get_param_value(server_conf_text, 'H2', server_protocol, "AWG1.0"),
         'H3': _get_param_value(server_conf_text, 'H3', server_protocol, "AWG1.0"),
         'H4': _get_param_value(server_conf_text, 'H4', server_protocol, "AWG1.0"),
-        # AWG3.0+
-        'ContentPaddingAddition': _get_param_value(server_conf_text, 'ContentPaddingAddition', server_protocol, "AWG3.0"),
-        'RekeyAfterTime': _get_param_value(server_conf_text, 'RekeyAfterTime', server_protocol, "AWG3.0"),
-        'RekeyTimeout': _get_param_value(server_conf_text, 'RekeyTimeout', server_protocol, "AWG3.0"),
-        'RejectAfterTime': _get_param_value(server_conf_text, 'RejectAfterTime', server_protocol, "AWG3.0"),
-        'KeepaliveTimeout': _get_param_value(server_conf_text, 'KeepaliveTimeout', server_protocol, "AWG3.0"),
-        'MaxHandshakeAttempts': _get_param_value(server_conf_text, 'MaxHandshakeAttempts', server_protocol, "AWG3.0"),
-        'DisableCookies': _get_param_value(server_conf_text, 'DisableCookies', server_protocol, "AWG3.0"),
-        # AWG3.1 (server-side ключ + механизм)
+        # AWG3.1 (server-side ключ)
         'HeaderProtectionKey': _get_param_value(server_conf_text, 'HeaderProtectionKey', server_protocol, "AWG3.1"),
-        'RandomTrailers': _get_param_value(server_conf_text, 'RandomTrailers', server_protocol, "AWG3.1"),
     }
 
 
@@ -12290,6 +12503,7 @@ def handle_makecfg(opt) -> None:
         # Обновление существующего: J, I, PersistentKeepalive
         logger.info('🔄 Конфиг %s уже существует — обновление Jc/Jmin/Jmax, I1-I5, PersistentKeepalive', g_main_config_fn)
         cfg = WGConfig(str(g_main_config_fn))
+        _cfg_stat = g_main_config_fn.stat()
 
         # Определяем версию протокола из существующего конфига
         _file_version = "AWG1.0"
@@ -12316,8 +12530,6 @@ def handle_makecfg(opt) -> None:
                 k = f"__this_server__|{p}"
                 if k in cfg.idsline:
                     cfg.lines[cfg.idsline[k]] = f"{p} = {val}"
-                elif p in srv:  # pragma: no cover — iface не содержит J-ключей без их id-строк в конфиге
-                    srv[p] = val
 
         # Обновляем PersistentKeepalive у всех пиров (до I-lines, пока idsline актуален)
         for pname in list(cfg.peer.keys()):
@@ -12352,14 +12564,19 @@ def handle_makecfg(opt) -> None:
                 if i not in i_added and obf_params.get(f"I{i}") is not None:
                     new_lines.insert(mtu_pos, f"I{i} = {obf_params[f'I{i}']}")
         else:
-            # Fallback: в конец
-            for i in range(1, 6):
-                if i not in i_added and obf_params.get(f"I{i}") is not None:
-                    new_lines.append(f"I{i} = {obf_params[f'I{i}']}")
+            # Fallback (конфиг без MTU; фикс 16.09.2026): НЕ в конец файла —
+            # иначе I-строки попадают в секцию последнего [Peer] и ломают
+            # парсинг/awg. Вставляем ПЕРЕД первой секцией [Peer].
+            _peer_pos = next((_idx for _idx, _l in enumerate(new_lines)
+                              if _l.startswith('[Peer]')), len(new_lines))
+            _ins = [f"I{i} = {obf_params[f'I{i}']}" for i in range(1, 6)
+                    if i not in i_added and obf_params.get(f"I{i}") is not None]
+            new_lines[_peer_pos:_peer_pos] = _ins
         cfg.lines = new_lines
 
         # Конфиг интерфейса — самое ценное (ключи, обф-параметры, порт): из кода
         # не воспроизводится, поэтому бэкапится при перегенерации.
+        _ensure_file_unchanged(g_main_config_fn, _cfg_stat, "Конфиг интерфейса")
         _backup_file(g_main_config_fn, '.bak')
         cfg.save()
         logger.info('✅ Конфиг %s обновлён', g_main_config_fn)
@@ -12428,7 +12645,7 @@ def handle_makecfg(opt) -> None:
     _, _, ipaddr_display = parse_ipaddr_argument(opt.ipaddr)
 
     # Определяем версию протокола из флага --version
-    awg_version = getattr(opt, 'version', 'AWG1.0')
+    awg_version = getattr(opt, 'version', 'AWG3.1')  # мёртвый фоллбэк: parser всегда даёт AWG3.1
 
     # --- СНАЧАЛА ГЕНЕРИРУЕМ WARP (если нужен) ---
     warp_configs = _generate_warp_if_needed(tun_name, opt.warp, opt.mtu, opt.proxy, awg_version)
@@ -12470,17 +12687,27 @@ def handle_makecfg(opt) -> None:
     atomic_write_text(g_main_config_fn, out)
     logger.info("✅ Серверный конфиг создан: %s", g_main_config_fn)
 
-    # Создаём скрипты
-    params_path = up_path.parent / f"{tun_name}.sh"
-    _create_scripts(up_path, down_path, params_path, main_iface, tun_name, opt, ipaddr_display, warp_configs)
-
-    atomic_write_text(g_main_config_src, str(g_main_config_fn))
-
+    # Фикс 16.09.2026: частичный коммит — при сбое скриптов/вспомогательных
+    # файлов удаляем только что созданный конфиг, иначе остаётся
+    # невосстановимое полусостояние (конфиг есть, скриптов нет).
     try:
-        _ensure_endpoint_file_exists(str(get_ext_ipaddr()))
-        ensure_allowedips_config(g_allowedips_config_fn)
-    except Exception as e:
-        logger.warning("⚠  Не удалось создать вспомогательные файлы: %s", e)
+        # Создаём скрипты
+        params_path = up_path.parent / f"{tun_name}.sh"
+        _create_scripts(up_path, down_path, params_path, main_iface, tun_name, opt, ipaddr_display, warp_configs)
+
+        atomic_write_text(g_main_config_src, str(g_main_config_fn))
+
+        try:
+            _ensure_endpoint_file_exists(str(get_ext_ipaddr()))
+            ensure_allowedips_config(g_allowedips_config_fn)
+        except Exception as e:
+            logger.warning("⚠  Не удалось создать вспомогательные файлы: %s", e)
+    except Exception:
+        try:
+            os.remove(str(g_main_config_fn))
+        except OSError:
+            pass
+        raise
 
     sys.exit(0)
 
@@ -12548,16 +12775,6 @@ def handle_add(opt) -> None:
             used_ips_ipv4.add(server_ip_int_ipv4)
         if net_ipv6:
             used_ips_ipv6.add(ipv6_server_ip_int)
-            if net_ipv4 is not None and server_on_network_ipv4 != server_on_network_ipv6:  # pragma: no cover — дублирует валидацию validate_ipv4_ipv6_pair (11255), входы идентичны
-                raise RuntimeError(
-                    f'Позиция сервера в IPv4 и IPv6 подсетях должна совпадать!\n'
-                    f'  IPv4: {ipaddress.IPv4Address(server_ip_int_ipv4)}/{net_ipv4.prefixlen} - '
-                    f'{"на network address" if server_on_network_ipv4 else "НЕ на network address"}\n'
-                    f'  IPv6: {ipaddress.IPv6Address(ipv6_server_ip_int)}/{net_ipv6.prefixlen} - '
-                    f'{"на network address" if server_on_network_ipv6 else "НЕ на network address"}\n'
-                    f'Исправьте: сервер должен быть или на network address в обеих подсетях, '
-                    f'или НЕ на network address в обеих подсетях!'
-                )
 
         ipaddr_ipv4, ipaddr_ipv6 = _allocate_client_ip(
             opt, net_ipv4, net_ipv6,
@@ -12630,6 +12847,10 @@ def handle_delete(opt) -> None:
 
 
 def handle_warp_gen(opt) -> list[str]:
+    """Генерирует WARP конфиги. Возвращает список путей к конфигам."""
+    # Рев-23: список проверенных endpoint'ов на весь прогон (в handle_warp_gen),
+    # чтобы N конфигов делили один результат сканирования.
+    verified_endpoints: list[str] = []
     """
     Автономная генерация WARP конфигов (без серверного интерфейса).
     Сохраняет в папку WARP/ рядом со скриптом.
@@ -12640,7 +12861,7 @@ def handle_warp_gen(opt) -> list[str]:
         Список путей к сгенерированным WARP конфигам
     """
     # Определяем версию протокола
-    awg_version = getattr(opt, 'version', 'AWG2.0')
+    awg_version = getattr(opt, 'version', 'AWG3.1')  # мёртвый фоллбэк: parser всегда даёт AWG3.1
 
     # Создаём папку WARP/ рядом со скриптом
     warp_dir = SCRIPT_DIR.joinpath("WARP")
@@ -12658,7 +12879,8 @@ def handle_warp_gen(opt) -> list[str]:
             mtu=opt.mtu,
             proxy=opt.proxy if hasattr(opt, 'proxy') else "",
             version=awg_version,
-            for_server=False  # Клиентский WARP (без Table = off)
+            for_server=False,  # Клиентский WARP (без Table = off)
+            verified_endpoints=verified_endpoints,
         )
         name = f"warp{i}.conf"
         atomic_write_text(warp_dir.joinpath(name), conf_text)
@@ -12677,6 +12899,7 @@ def handle_confgen(opt) -> set[str]:
     if g_main_config_fn is None:
         get_main_config_path(check=True, override=opt.server_cfg)
     cfg = WGConfig(str(g_main_config_fn))
+    _cfg_stat = g_main_config_fn.stat()
     srv = cfg.iface
     logger.info('📝 Генерация клиентских конфигов...')
     
@@ -12893,6 +13116,7 @@ def handle_confgen(opt) -> set[str]:
 
     if psk_added:
         try:
+            _ensure_file_unchanged(g_main_config_fn, _cfg_stat, "Серверный конфиг")
             cfg.save()
         except Exception as e:
             logger.warning("⚠  Не удалось сохранить server config после добавления PresharedKey: %s", e)
@@ -12926,7 +13150,7 @@ def _match_qr_tag(stem: str, qr_filter) -> tuple[str, str, str]:
 def generate_qr_codes(
     qr_filter: set[str] | None = None,
     warp_configs: list[str] | None = None,
-) -> None:
+) -> bool:
     """
     Генерирует QR для клиентских и WARP конфигов.
     Один next_version для всех — ускорение перебора версий QR.
@@ -12981,7 +13205,7 @@ def generate_qr_codes(
 
     if not all_configs:
         logger.warning('⚠  Нет файлов для генерации QR (фильтр: %s, WARP: %d)', qr_filter, len(warp_configs or []))
-        return
+        return False
 
     # Очистка старых PNG клиентских конфигов (WARP очищает handle_warp_gen)
     for png in g_conf_dir.glob("*.png"):
@@ -12995,11 +13219,15 @@ def generate_qr_codes(
     next_version = 1
     next_ec = -1
     last_group = ("", "")
+    generated = False
+    _qr_meta = {path: (suf, ep) for suf, ep, _c, path in client_configs}
     for fn in all_configs:
         try:
             # Определяем группу (суффикс, ep_label) для сброса при смене
             stem = pathlib.Path(fn).stem
-            cur_suffix, _, cur_ep = _match_qr_tag(stem, qr_filter or {})
+            # Рев-20: suffix/ep уже вычислены при сборе client_configs —
+            # повторный _match_qr_tag не нужен (для WARP — пустые значения).
+            cur_suffix, cur_ep = _qr_meta.get(fn, ("", ""))
             group = (cur_suffix, cur_ep)
             if group != last_group:
                 next_version = 1
@@ -13014,6 +13242,7 @@ def generate_qr_codes(
                 start_version=next_version,
                 start_ec=next_ec,
             )
+            generated = True
             # Уменьшаем на шаг для следующего конфига (backward)
             if _QR_STEPS:
                 try:
@@ -13026,8 +13255,34 @@ def generate_qr_codes(
         except Exception as e:
             logger.error('❌ Ошибка генерации QR для %s: %s', fn, e)
 
+    return generated
 
-def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None) -> None:
+
+def _walk_file_dir() -> list[tuple[str, bool]]:
+    """Рев-22: один обход g_file_dir для всех клиентских архивов.
+
+    Возвращает последовательность записей в порядке исходного os.walk:
+    (arcname, is_dir). Покаталогово: сначала запись каталога ("docs/"),
+    затем файлы внутри. Пусто, если каталога нет.
+    """
+    entries: list[tuple[str, bool]] = []
+    if not (g_file_dir.exists() and g_file_dir.is_dir()):
+        return entries
+    for root, _dirs, files in os.walk(g_file_dir):
+        rel_root = os.path.relpath(root, g_file_dir)
+        if rel_root == ".":
+            rel_root = ""
+        else:
+            rel_root = rel_root.rstrip("/") + "/"
+        if rel_root:
+            entries.append((rel_root, True))
+        for fname in files:
+            entries.append((os.path.join(rel_root, fname), False))
+    return entries
+
+
+def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None,
+                     file_dir_entries: list[tuple[str, bool]] | None = None) -> None:
     if base_dir is None:
         base_dir = g_conf_dir
     zip_filename = base_dir.joinpath(f"{client_name}.zip")
@@ -13046,7 +13301,9 @@ def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None) -> 
     if suffixes and base_dir == g_conf_dir:
         suffixes.sort(key=len, reverse=True)
         suffixes_pattern = "|".join([re.escape(s) for s in suffixes])
-        pattern_str = rf'^{re.escape(client_name)}({suffixes_pattern}).*\.(conf|png)$'
+        # Фикс 16.09.2026: якорный матч без жадного '.*' — иначе клиент «bob»
+        # забирал чужие файлы вида bobAllAll.conf (с PrivateKey) в свой архив.
+        pattern_str = rf'^{re.escape(client_name)}({suffixes_pattern})\.(conf|png)$'
     else:
         # Точное имя файла (имя + расширение), без префиксного матча: иначе
         # «warp1.zip» забирал бы warp10..warp19.conf (фикс аудита-T7).
@@ -13061,28 +13318,23 @@ def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None) -> 
             if pattern_file.match(file.name):
                 _add_file_to_zip(zipf, str(file), file.name)
 
-        if g_file_dir.exists() and g_file_dir.is_dir():
-            for root, _dirs, files in os.walk(g_file_dir):
-                rel_root = os.path.relpath(root, g_file_dir)
-                if rel_root == ".":
-                    rel_root = ""
-                else:
-                    dir_arcname = rel_root.rstrip("/") + "/"
-                    try:
-                        zinfo = zipfile.ZipInfo(dir_arcname)
-                        zipf.writestr(zinfo, "")
-                    except Exception:
-                        pass
-                for fname in files:
-                    full_path = os.path.join(root, fname)
-                    if rel_root:
-                        arcname = os.path.join(rel_root, fname)
-                    else:
-                        arcname = fname
-                    try:
-                        zipf.write(full_path, arcname=arcname)
-                    except Exception as e:
-                        logger.warning("⚠  Не удалось добавить %s в %s: %s", full_path, zip_filename, e)
+        # Рев-22: file_dir_entries передаётся из zip_all (один обход на все
+        # архивы); при прямом вызове — свой обход (совместимость).
+        if file_dir_entries is None:
+            file_dir_entries = _walk_file_dir()
+        for arcname, is_dir in file_dir_entries:
+            if is_dir:
+                try:
+                    zinfo = zipfile.ZipInfo(arcname)
+                    zipf.writestr(zinfo, "")
+                except Exception:
+                    pass
+            else:
+                full_path = g_file_dir.joinpath(arcname)
+                try:
+                    zipf.write(str(full_path), arcname=arcname)
+                except Exception as e:
+                    logger.warning("⚠  Не удалось добавить %s в %s: %s", full_path, zip_filename, e)
 
     # Zip содержит приватные ключи — только владелец
     try:
@@ -13094,12 +13346,14 @@ def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None) -> 
 def zip_all(warp_configs: list[str] | None = None) -> None:
     logger.info('📦 Упаковка конфигов в ZIP...')
     names = list(dict.fromkeys(clients_for_zip))
+    # Рев-22: один обход file-каталога на весь пакет архивов (было: на каждый).
+    entries = _walk_file_dir()
     for name in names:
-        zip_client_files(name)
+        zip_client_files(name, file_dir_entries=entries)
     if warp_configs:
         for cp in warp_configs:
             p = pathlib.Path(cp)
-            zip_client_files(p.stem, base_dir=p.parent)
+            zip_client_files(p.stem, base_dir=p.parent, file_dir_entries=entries)
 
 
 def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip: bool = False,
@@ -13110,8 +13364,35 @@ def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip
     # снести серверный conf, лежащий в g_conf_dir).
     if g_main_config_fn is not None:
         keep_files.add(g_main_config_fn.name)
+    # Фикс 16.09.2026: единая якорная семантика с zip — префиксный startswith
+    # сохранял чужие файлы («bob» спасал «bobby…»). Для conf/png допускаются
+    # только {имя}{суффикс}.conf|png (суффиксы из _allowedips); для zip —
+    # точное равенство имени (см. ниже).
+    _suf = []
+    if allowed_names:
+        if g_allowedips_config_fn.exists():
+            try:
+                _ips, _ = parse_allowedips_config(g_allowedips_config_fn.read_text('utf-8'))
+                _suf = list(_ips.keys())
+            except Exception:
+                _suf = []
+        if not _suf:
+            # Дефолт генерации (тот же, что в generate_qr_codes при отсутствии
+            # файла: {'All'}) — иначе суффиксные файлы (u1All.conf) не считались
+            # бы принадлежащими клиенту u1.
+            _suf = ['All']
+
+    def _belongs(fname: str, name: str) -> bool:
+        # zip — точное равенство имени (для пропуска через фильтр; сам
+        # keep_zip ниже так же требует точного равенства). conf/png — строго
+        # {имя}{суффикс}.(conf|png): _suf всегда непуст (фоллбэк ['All']).
+        if fname == f"{name}.zip":
+            return True
+        _p = rf'^{re.escape(name)}(?:{"|".join(re.escape(s) for s in _suf)})\.(?:conf|png)$'
+        return re.match(_p, fname) is not None
+
     for f in os.listdir(g_conf_dir):
-        if allowed_names and not any(f.startswith(name) for name in allowed_names):
+        if allowed_names and not any(_belongs(f, name) for name in allowed_names):
             continue
         if keep_conf and f.endswith('.conf'):
             keep_files.add(f)
@@ -13145,6 +13426,8 @@ parser.add_argument("-z", "--zip", action="store_true", help="ZIP-архивы")
 parser.add_argument("-o", "--only", help="Только указанные клиенты", default="")
 parser.add_argument("-r", "--reload", action="store_true", help="Перезагрузить конфиг интерфейса без отключения (awg syncconf)")
 parser.add_argument("-i", "--ipaddr", default="", help="IP адрес")
+# Легаси-дефолт 4455 (ранние версии пользовались им); канонический порт
+# AWG по умолчанию — 51820 (см. _read_endpoint_proto), задаётся явно.
 parser.add_argument("-p", "--port", type=int, default=4455, help="Порт")
 parser.add_argument("-l", "--limit", type=int, default=0, help="Limit (Mbit)")
 parser.add_argument("-f", "--iface", default="", help="Сетевой интерфейс (например ens3)")
@@ -13212,13 +13495,19 @@ def resolve_server_config_candidate(name: str | None) -> str | None:
         r = resolve_file(p)
         if r:
             return r
-    r = resolve_file(p)
-    if r:
-        return r
     candidates = []
     if not name.endswith(".conf"):
         candidates.append(name + ".conf")
     candidates.append(name)
+
+    # Относительное имя — тот же порядок, что и у системного каталога:
+    # сперва <name>.conf, затем <name> (фикс 16.09.2026: иначе посторонний
+    # файл «awg0» без расширения побеждал awg0.conf).
+    if not p.is_absolute():
+        for cand in candidates:
+            r = resolve_file(pathlib.Path(cand))
+            if r:
+                return r
 
     standard_dir = pathlib.Path("/etc/amnezia/amneziawg")
     for cand in candidates:
@@ -13229,13 +13518,6 @@ def resolve_server_config_candidate(name: str | None) -> str | None:
     r = resolve_file(SCRIPT_DIR.joinpath(base_name))
     if r:
         return r
-    for cand in candidates:
-        r = resolve_file(pathlib.Path.cwd().joinpath(cand))
-        if r:
-            return r
-        r = resolve_file(pathlib.Path(cand))
-        if r:
-            return r
     return None
 
 
@@ -13362,6 +13644,11 @@ def main() -> None:
         logger.error("❌ Этот скрипт работает только на Linux. Windows не поддерживается.")
         sys.exit(1)
 
+    # Рев-27: серверные операции требуют root — аккуратная ошибка вместо traceback
+    if bool(opt.makecfg or opt.addcl or opt.update or opt.delete or opt.reload or opt.warp) \
+            and getattr(os, "geteuid", lambda: 0)() != 0:
+        raise RuntimeError("Операции --make/-a/-u/-d/-r/--warp требуют прав root (запустите через sudo)")
+
     if not (1280 <= opt.mtu <= 1440):
         raise ValueError("MTU должен быть в диапазоне 1280..1440")
 
@@ -13395,6 +13682,11 @@ def main() -> None:
     want_zip = opt.zip
     need_conf = want_conf or want_qr or want_zip
     need_qr = want_qr or (want_zip and not want_conf)
+
+    # Фикс 16.09.2026: автономный --warp с -s молча не генерировал ничего
+    if opt.warp > 0 and not opt.makecfg and opt.server_cfg \
+            and not (opt.addcl or opt.update or opt.delete or opt.confgen or opt.qrcode or opt.zip):
+        raise RuntimeError('--warp в автономном режиме несовместим с -s: уберите -s или используйте --make')
 
     # Автономная генерация WARP конфигов (без серверного интерфейса)
     if opt.warp > 0 and not opt.makecfg and not opt.server_cfg:
@@ -13456,15 +13748,18 @@ def main() -> None:
     if need_conf:
         qr_filter = handle_confgen(opt)
 
+    # Фикс 16.09.2026: qr_ok=false (пустой фильтр «; qr» и т.п.) — QR не
+    # сгенерирован, поэтому и клиентские .conf НЕ удаляются (см. clean ниже).
+    qr_ok = False
     if need_qr:
-        generate_qr_codes(qr_filter)
+        qr_ok = generate_qr_codes(qr_filter)
 
     if want_zip:
         zip_all()
 
     # Очистка конфиг-каталога производится ТОЛЬКО при активных флагах
     # генерации (аудит-20: запуск без флагов удалял все клиентские файлы).
-    if want_conf or want_qr or want_zip:
+    if want_conf or want_zip or (want_qr and qr_ok):
         only_list = get_only_list()
         allowed_names = None
         if only_list:
