@@ -181,10 +181,10 @@ PORT_FORWARDING_RULES=(
 
 # --- DDoS защита ---
 PORT_FORWARDING_DDOS=(
-  #"Порт[-Диапазон][&Список][=Shared][,v6][/Протокол]:Rate/Период[+Burst][>EstRate/Период[+EstBurst]][<Connlimit[,NewRate/Период]][^EstPackets][_МинДлина-МаксДлина][~Полоса][!Бан/Секунд][@Интерфейс][=>ReplyRate/Период+Burst][=_ReplyМин-Макс][=~ReplyПолоса]"
+  #"Порт[-Диапазон][&Список][=Shared][,v6][/Протокол]:Rate/Период[+Burst][>EstRate/Период[+EstBurst]][<Connlimit[,NewRate/Период[+Burst]]][^EstPackets][_МинДлина-МаксДлина][~Полоса][!Бан/Секунд][@Интерфейс][=>ReplyRate/Период+Burst][=_ReplyМин-Макс][=~ReplyПолоса]"
   #"80/tcp:100/10+50>500/5+100<20,5/30^10_32-1500~100mbit!3/60"
   #"22:10/60<3!5/300"
-  "<SERVER_PORT>/udp:50/10+100>1000/10+2000<10,2/10^50_32-1500~<RATE_LIMIT>=>1000/10+2000=_32-1500=~<RATE_LIMIT>"
+  "<SERVER_PORT>/udp:50/10+100>1000/10+2000<50,600/10+400^50_32-1500~<RATE_LIMIT>=>1000/10+2000=_32-1500=~<RATE_LIMIT>"
 )
 
 # --- Квоты трафика ---
@@ -2257,7 +2257,7 @@ parse_ddos_entry() {
   local _entry="$1"
   DDOS_PORT=""; DDOS_PROTO=""; DDOS_FAMILY=""; DDOS_RATE=""; DDOS_RATE_UNIT=""; DDOS_BURST=""
   DDOS_EST_RATE=""; DDOS_EST_RATE_UNIT=""; DDOS_EST_BURST=""
-  DDOS_CONNLIMIT=""; DDOS_NEW_RATE=""; DDOS_NEW_RATE_UNIT=""
+  DDOS_CONNLIMIT=""; DDOS_NEW_RATE=""; DDOS_NEW_RATE_UNIT=""; DDOS_NEW_BURST=""
   DDOS_EST_PACKETS=""; DDOS_LENGTH_MIN=""; DDOS_LENGTH_MAX=""
   DDOS_BW=""; DDOS_BAN_HITS=""; DDOS_BAN_SEC=""
   DDOS_REPLY_EST_RATE=""; DDOS_REPLY_EST_RATE_UNIT=""; DDOS_REPLY_EST_BURST=""
@@ -2589,6 +2589,13 @@ parse_ddos_entry() {
   if [ -n "$_conn_block" ]; then
     # Формат: connlimit,new_rate/new_period
     local _cb="$_conn_block"
+    # Burst лимита новых пакетов: <Connlimit,NewRate/Период+Burst>.
+    # Без burst хешлимит в режиме above режет любой всплеск больше 5 пакетов,
+    # а обфускация AmneziaWG шлёт ~100 джанк-пакетов перед хендшейком.
+    if [[ "$_cb" == *+* ]]; then
+      DDOS_NEW_BURST="${_cb##*+}"
+      _cb="${_cb%+*}"
+    fi
     if [[ "$_cb" == *,* ]]; then
       DDOS_CONNLIMIT="${_cb%,*}"
       local _new_part="${_cb#*,}"
@@ -2644,6 +2651,7 @@ parse_ddos_entry() {
   # «300;touch /tmp/pwn» в ban-блоке) попадало в eval _ddos_exec → shell-инъекция.
   # Битое поле сбрасываем в «0» — соответствующий лимит просто не применяется.
   for _qn in DDOS_RATE DDOS_EST_RATE DDOS_EST_BURST DDOS_CONNLIMIT DDOS_NEW_RATE \
+             DDOS_NEW_BURST \
              DDOS_EST_PACKETS DDOS_LENGTH_MIN DDOS_LENGTH_MAX DDOS_BW \
              DDOS_BAN_HITS DDOS_BAN_SEC DDOS_REPLY_EST_RATE DDOS_REPLY_EST_BURST \
              DDOS_REPLY_LENGTH_MIN DDOS_REPLY_LENGTH_MAX DDOS_REPLY_BW; do
@@ -2672,7 +2680,7 @@ parse_ddos_by_port() {
   local _target_port="$1" _target_proto="$2" _target_family="$3"
   DDOS_PORT=""; DDOS_PROTO=""; DDOS_FAMILY=""; DDOS_RATE=""; DDOS_RATE_UNIT=""; DDOS_BURST=""
   DDOS_EST_RATE=""; DDOS_EST_RATE_UNIT=""; DDOS_EST_BURST=""
-  DDOS_CONNLIMIT=""; DDOS_NEW_RATE=""; DDOS_NEW_RATE_UNIT=""
+  DDOS_CONNLIMIT=""; DDOS_NEW_RATE=""; DDOS_NEW_RATE_UNIT=""; DDOS_NEW_BURST=""
   DDOS_EST_PACKETS=""; DDOS_LENGTH_MIN=""; DDOS_LENGTH_MAX=""
   DDOS_BW=""; DDOS_BAN_HITS=""; DDOS_BAN_SEC=""
   DDOS_REPLY_EST_RATE=""; DDOS_REPLY_EST_RATE_UNIT=""; DDOS_REPLY_EST_BURST=""
@@ -2766,7 +2774,7 @@ parse_ddos_by_port() {
   # Не нашли — обнуляем
   DDOS_PORT=""; DDOS_PROTO=""; DDOS_FAMILY=""; DDOS_RATE="0"; DDOS_RATE_UNIT="second"; DDOS_BURST="0"
   DDOS_EST_RATE="0"; DDOS_EST_RATE_UNIT="second"; DDOS_EST_BURST="0"
-  DDOS_CONNLIMIT="0"; DDOS_NEW_RATE="0"; DDOS_NEW_RATE_UNIT="second"
+  DDOS_CONNLIMIT="0"; DDOS_NEW_RATE="0"; DDOS_NEW_RATE_UNIT="second"; DDOS_NEW_BURST="0"
   DDOS_EST_PACKETS="0"; DDOS_LENGTH_MIN="0"; DDOS_LENGTH_MAX="0"; DDOS_BW="0"; DDOS_BAN_HITS="0"; DDOS_BAN_SEC="0"
   DDOS_REPLY_EST_RATE="0"; DDOS_REPLY_EST_RATE_UNIT="second"; DDOS_REPLY_EST_BURST="0"
   DDOS_REPLY_LENGTH_MIN="0"; DDOS_REPLY_LENGTH_MAX="0"; DDOS_REPLY_BW="0"
@@ -2947,7 +2955,7 @@ ddos_apply_rules() {
   fi
   # Rate на новые соединения (превысил → DROP, не превысил → падает на RATE)
   if [ -n "$DDOS_NEW_RATE" ] && [ "$DDOS_NEW_RATE" != "0" ]; then
-    _ddos_exec "-m conntrack --ctstate NEW -m hashlimit --hashlimit-name $_hashname_new --hashlimit-mode srcip --hashlimit-above $(ddos_rate_str "$DDOS_NEW_RATE" "$DDOS_NEW_RATE_UNIT") -j DROP"
+    _ddos_exec "-m conntrack --ctstate NEW -m hashlimit --hashlimit-name $_hashname_new --hashlimit-mode srcip --hashlimit-burst ${DDOS_NEW_BURST:-5} --hashlimit-above $(ddos_rate_str "$DDOS_NEW_RATE" "$DDOS_NEW_RATE_UNIT") -j DROP"
   fi
   # NEW — rate по пакетам
   if [ -n "$DDOS_RATE" ] && [ "$DDOS_RATE" != "0" ]; then
@@ -3511,13 +3519,49 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t filter -C INPUT -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -A INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
 fi
 # --- DDoS защита основного порта ---
+# Рев-31: одно рукопожатие AmneziaWG — это ВЗРЫВ пакетов: Jc мусорных
+# (Jmin..Jmax) + имитационные I-строки + init, и все они идут в ctstate NEW.
+# Профильные лимиты (пример: «50/10+100» → 5/сек, burst 100) МЕНЬШЕ взрыва
+# (при Jc=109 это ~115-126 пакетов), поэтому хвост взрыва — а init идёт в
+# хвосте — сбрасывался финальным DROP: туннель поднимался только со 2-3
+# попытки (30-45 с) или не поднимался вовсе. Проверено счётчиками на живых
+# серверах: D_ принимал ровно 100 (второй заход — 200), финальный DROP — ~26
+# пакетов за попытку. Считаем размер взрыва от ФАКТИЧЕСКИХ параметров
+# интерфейса и поднимаем лимиты основного порта до безопасных.
+_jc="$(awg show "$TUN" 2>/dev/null | sed -n 's/^  jc: //p' | tr -dc '0-9')"
+_il="$(awg show "$TUN" 2>/dev/null | grep -cE '^  i[0-9]+:')"
+_hs=$(( ${_jc:-0} + ${_il:-0} + 16 ))
+[ "$_hs" -lt 64 ] && _hs=64
 for _de in "${PORT_FORWARDING_DDOS[@]}"; do
   parse_ddos_entry "$_de" || continue
   [ "$DDOS_PORT" = "$PORT" ] || continue
   # Только UDP правило для основного порта (AWG всегда UDP)
   [ -z "$DDOS_PROTO" ] && continue
   [[ ",${DDOS_PROTO}," != *,UDP,* ]] && continue
-  echo "🛡️ Настройка DDoS защиты для основного порта"
+  echo "🛡️ Настройка DDoS защиты для основного порта (взрыв рукопожатия ~${_hs} пакетов)"
+  # Пол (проверено живьём 30.09): профильные лимиты меньше взрыва рукопожатия —
+  # корзина выдыхается за 1-2 попытки, хвост взрыва (с init) уходит в финальный
+  # DROP, и туннель не поднимается НИКОГДА (endpoint не обновляется, сервер
+  # долбит в мёртвый порт). Запас ×8 к размеру взрыва + rate ×4/сек.
+  # connlimit для порта туннеля поднимаем: каждый перезапуск клиента = новая
+  # запись conntrack (новый порт), 50 записей выбираются быстро.
+  _min_burst=$((_hs * 8)); [ "$_min_burst" -lt 512 ] && _min_burst=512
+  _min_rate=$((_hs * 4)); [ "$_min_rate" -lt 256 ] && _min_rate=256
+  [ "${DDOS_BURST:-0}" -lt "$_min_burst" ] && DDOS_BURST="$_min_burst"
+  [ "${DDOS_NEW_BURST:-0}" -lt "$_min_burst" ] && DDOS_NEW_BURST="$_min_burst"
+  _cur_rate="$(ddos_rate_str "$DDOS_RATE" "$DDOS_RATE_UNIT" | sed 's|/.*||')"
+  if [ -z "$_cur_rate" ] || [ "$_cur_rate" = "0" ] || [ "$_cur_rate" -lt "$_min_rate" ]; then
+    DDOS_RATE="$_min_rate"; DDOS_RATE_UNIT="1"
+  fi
+  if [ -n "$DDOS_NEW_RATE" ] && [ "$DDOS_NEW_RATE" != "0" ]; then
+    _cur_new="$(ddos_rate_str "$DDOS_NEW_RATE" "$DDOS_NEW_RATE_UNIT" | sed 's|/.*||')"
+    if [ -z "$_cur_new" ] || [ "$_cur_new" = "0" ] || [ "$_cur_new" -lt "$_min_rate" ]; then
+      DDOS_NEW_RATE="$_min_rate"; DDOS_NEW_RATE_UNIT="1"
+    fi
+  fi
+  if [ -n "$DDOS_CONNLIMIT" ] && [ "$DDOS_CONNLIMIT" != "0" ] && [ "$DDOS_CONNLIMIT" -lt 500 ]; then
+    DDOS_CONNLIMIT=500
+  fi
   if { [ -z "$DDOS_FAMILY" ] || [[ ",${DDOS_FAMILY}," == *,v4,* ]]; } && [ -n "$LOCAL_SUBNETS_IPV4" ]; then
     ddos_apply_rules "iptables" "$INPUT_CHAIN" "udp" "" "$PORT" ""
   fi
@@ -4741,6 +4785,7 @@ done
 # при -F. Таймаут 600с: up ждёт завершения долгого cron-прохода; если всё же
 # не дождались — предупреждение и продолжение (лучше примениться, чем оставить
 # туннель без квот до следующего up).
+mkdir -p "${SCRIPT_DIR%/}/.data/quota" 2>/dev/null || true
 exec 8>"${SCRIPT_DIR%/}/.data/quota/${TUN_SAFE}.cron.lock"
 flock -w 600 8 2>/dev/null || echo "⚠️ quota: не удалось дождаться cron-lock (600с) — применяюсь без сериализации" >&2
 # Слепок расхода ДО безусловной очистки цепочек (фикс аудита-5x5): up поверх
@@ -5763,8 +5808,12 @@ echo "$now" > "$STATE" 2>/dev/null || true
 QUOTASCRIPT
   chmod +x "$SCRIPT_DIR/.data/quota/quota_update_${TUN_SAFE}.sh"
   # cron: раз в час; убираем старую строку с тем же тэгом при перегенерации
-  ( crontab -l 2>/dev/null | grep -v "# awg-quota-${TUN_SAFE}$"; \
-    echo "0 * * * * bash \"$SCRIPT_DIR/.data/quota/quota_update_${TUN_SAFE}.sh\" ${TUN_SAFE} ${SCRIPT_NAME} >/dev/null 2>&1 # awg-quota-${TUN_SAFE}" ) | crontab -
+  if command -v crontab >/dev/null 2>&1; then
+    ( crontab -l 2>/dev/null | grep -v "# awg-quota-${TUN_SAFE}$"; \
+      echo "0 * * * * bash \"$SCRIPT_DIR/.data/quota/quota_update_${TUN_SAFE}.sh\" ${TUN_SAFE} ${SCRIPT_NAME} >/dev/null 2>&1 # awg-quota-${TUN_SAFE}" ) | crontab -
+  else
+    echo "⚠️  cron не установлен — почасовое обновление квот работать не будет (apt install cron)" >&2
+  fi
   echo "📊 Квоты трафика включены (правил: ${#TRAFFIC_QUOTAS[@]}; клиентов: $(echo "$_QSETS" | wc -w))"
   else
     echo "⚠️  КВОТЫ ПРОПУЩЕНЫ (ipset/xt_set недоступны) — остальной up продолжается" >&2
@@ -5772,7 +5821,9 @@ QUOTASCRIPT
 else
   # Квоты выключены: полная разборка — cron-задача, скрипт обновления и .thr
   # (иначе почасовая задача-сирота обнуляла бы журнал; фикс аудита-5x5).
-  crontab -l 2>/dev/null | grep -v "# awg-quota-${TUN_SAFE}$" | crontab -
+  if command -v crontab >/dev/null 2>&1; then
+    crontab -l 2>/dev/null | grep -v "# awg-quota-${TUN_SAFE}$" | crontab -
+  fi
   rm -f "$SCRIPT_DIR/.data/quota/quota_update_${TUN_SAFE}.sh" "$SCRIPT_DIR/.data/quota/${TUN_SAFE}.thr" 2>/dev/null || true
 fi
 
@@ -7474,7 +7525,9 @@ ip link set "$IFB_MIX" down 2>/dev/null || true
 ip link delete "$IFB_MIX" 2>/dev/null || true
 
 # --- Квоты трафика: снятие cron-задачи, удаление цепочек и state ---
-( crontab -l 2>/dev/null | grep -v "# awg-quota-${TUN_SAFE}$" ) | crontab - 2>/dev/null || true
+if command -v crontab >/dev/null 2>&1; then
+  ( crontab -l 2>/dev/null | grep -v "# awg-quota-${TUN_SAFE}$" ) | crontab - 2>/dev/null || true
+fi
 # Удаление прыжков по имени цепочки (snapshot-подход: один проход
 # iptables-save, каждый -A → отдельный -D; клиентские IP в down неизвестны,
 # поэтому удаляем по имени цепочки, как в up).
@@ -12473,6 +12526,63 @@ def _read_endpoint_proto() -> tuple[str, str]:
     return domain, proto
 
 
+def _default_gateways() -> list[str]:
+    """Адреса шлюзов по умолчанию (v4/v6) — для проверки конфликта подсетей."""
+    gws: list[str] = []
+    for cmd in (["ip", "-4", "route", "show", "default"],
+                ["ip", "-6", "route", "show", "default"]):
+        try:
+            rc, out = exec_cmd(cmd)
+        except Exception:
+            continue
+        if rc != 0:
+            continue
+        for line in str(out).splitlines():
+            m = re.search(r'\bvia\s+(\S+)', line)
+            if m:
+                gws.append(m.group(1))
+    return gws
+
+
+def find_gateway_subnet_conflicts(cidrs: list) -> list:
+    """Ищет подсети туннеля, внутри которых лежит шлюз по умолчанию.
+
+    Возвращает список пар (подсеть, шлюз). Классический случай: у VPS
+    адрес /32 и `default via 10.0.0.1`, а туннель создают как
+    `-i 10.0.0.1/24`. После `awg-quick up` появляется маршрут
+    `10.0.0.0/24 dev awgN`, пакеты до шлюза уходят в туннель, и сервер
+    теряет сеть (SSH рвётся по таймауту).
+    """
+    gws = _default_gateways()
+    if not gws:
+        return []
+    hits: list = []
+    for cidr in cidrs or []:
+        cidr = str(cidr or "").strip()
+        if not cidr:
+            continue
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        for gw in gws:
+            try:
+                addr = ipaddress.ip_address(gw.split('%')[0])
+            except ValueError:
+                continue
+            if addr.version == net.version and addr in net:
+                hits.append((cidr, gw))
+    return hits
+
+
+def suggest_free_subnet() -> str:
+    """Первая подсеть из списка кандидатов, не конфликтующая со шлюзами."""
+    for cand in ("10.10.0.1/24", "10.20.0.1/24", "10.66.0.1/24", "10.99.0.1/24"):
+        if not find_gateway_subnet_conflicts([cand]):
+            return cand
+    return "10.10.0.1/24"
+
+
 def handle_makecfg(opt) -> None:
     """Создание/обновление серверной конфигурации (--make).
 
@@ -12498,6 +12608,33 @@ def handle_makecfg(opt) -> None:
             raise RuntimeError(f"Не удалось создать директорию {target_path.parent}: {e}") from None
 
     g_main_config_fn = target_path.resolve()
+
+    # Защита от конфликта: подсеть туннеля не должна содержать шлюз по
+    # умолчанию, иначе после up маршрут до шлюза уйдёт в туннель и сервер
+    # потеряет сеть (SSH по таймауту). Проверяем и для существующего
+    # конфига, и для запрошенного -i.
+    _check_cidrs: list = []
+    if g_main_config_fn.exists():
+        try:
+            _cfg_txt = g_main_config_fn.read_text(encoding='utf-8', errors='ignore')
+            for _m in re.finditer(r'^\s*Address\s*=\s*(.+)$', _cfg_txt, re.M):
+                _check_cidrs += [c.strip() for c in _m.group(1).split(',') if c.strip()]
+        except OSError:
+            pass
+    if not _check_cidrs and getattr(opt, 'ipaddr', ''):
+        try:
+            _, _, _disp = parse_ipaddr_argument(opt.ipaddr)
+            _check_cidrs = [c.strip() for c in str(_disp).split(',') if c.strip()]
+        except Exception:
+            _check_cidrs = []
+    _conflicts = find_gateway_subnet_conflicts(_check_cidrs)
+    if _conflicts:
+        _pairs = '; '.join(f'{sub} содержит шлюз {gw}' for sub, gw in _conflicts)
+        raise RuntimeError(
+            f'Конфликт подсети туннеля со шлюзом по умолчанию: {_pairs}. '
+            f'После поднятия интерфейса маршрут до шлюза уйдёт в туннель и сервер '
+            f'потеряет сеть. Возьмите другую подсеть, например: -i {suggest_free_subnet()}'
+        )
 
     if g_main_config_fn.exists():
         # Обновление существующего: J, I, PersistentKeepalive

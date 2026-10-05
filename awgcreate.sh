@@ -96,7 +96,7 @@ install_go() {
     fi
 }
 
-# ─── Установка Python зависимостей (полный набор) ──
+# ─── Установка зависимостей (полный набор) ──
 install_python_deps() {
     log_info "$MSG_INSTALL_PYDEPS"
     apt-get update -qq
