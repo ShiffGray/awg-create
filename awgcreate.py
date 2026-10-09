@@ -184,7 +184,13 @@ PORT_FORWARDING_DDOS=(
   #"Порт[-Диапазон][&Список][=Shared][,v6][/Протокол]:Rate/Период[+Burst][>EstRate/Период[+EstBurst]][<Connlimit[,NewRate/Период[+Burst]]][^EstPackets][_МинДлина-МаксДлина][~Полоса][!Бан/Секунд][@Интерфейс][=>ReplyRate/Период+Burst][=_ReplyМин-Макс][=~ReplyПолоса]"
   #"80/tcp:100/10+50>500/5+100<20,5/30^10_32-1500~100mbit!3/60"
   #"22:10/60<3!5/300"
-  "<SERVER_PORT>/udp:50/10+100>1000/10+2000<50,600/10+400^50_32-1500~<RATE_LIMIT>=>1000/10+2000=_32-1500=~<RATE_LIMIT>"
+  # Рев-32: основной порт — «рукопожатие-осознанные» лимиты СРАЗУ в пресете.
+  # Одно рукопожатие AWG = взрыв Jc(80..120) мусорных + до 5 I-строк + init
+  # ≈ ≤126 пакетов, все в ctstate NEW. Прежний пресет (rate 5/сек, burst 100,
+  # connlimit 50) был МЕНЬШЕ взрыва: хвост с init уходил в финальный DROP и
+  # туннель не поднимался никогда (проверено на живых серверах 30.09).
+  # Значения ниже подставляются в _create_scripts (худший случай генератора).
+  "<SERVER_PORT>/udp:<HS_RATE>/1+<HS_BURST>>1000/10+2000<<HS_CONNLIMIT>,<HS_RATE>/1+<HS_BURST>^50_32-1500~<RATE_LIMIT>=>1000/10+2000=_32-1500=~<RATE_LIMIT>"
 )
 
 # --- Квоты трафика ---
@@ -11835,6 +11841,17 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
     params_script = params_script.replace("<SERVER_ADDR>", server_addr)
     params_script = params_script.replace("<RATE_LIMIT>", f"{opt.limit}")
     params_script = params_script.replace("<WARP_LIST>", warp_list_str)
+
+    # Рев-32: пресет DDoS основного порта генерируем сразу валидным для
+    # рукопожатия AWG. Взрыв = Jc + имитационные I-строки + init; генератор
+    # даёт Jc ∈ [80,120] (_generate_j_params) и до 5 I-строк, значит худший
+    # случай ≤ 120+5+1 = 126 пакетов, с запасом берём 141 → burst 8×, rate 4×.
+    # (Раньше в пресете стояли 50/10+100 и <50 — 5/сек, burst 100, connlimit 50:
+    # хвост взрыва с init сбрасывался финальным DROP, туннель не поднимался.)
+    _hs_worst = 120 + 5 + 16          # = 141
+    params_script = params_script.replace("<HS_RATE>", str(_hs_worst * 4))      # 564/сек
+    params_script = params_script.replace("<HS_BURST>", str(_hs_worst * 8))     # 1128
+    params_script = params_script.replace("<HS_CONNLIMIT>", "500")
 
     # up.sh и down.sh больше не используют плейсхолдеры — всё читается из файлов
     up_script = up_script_template_warp
