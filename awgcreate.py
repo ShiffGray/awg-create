@@ -619,15 +619,27 @@ is_proto_field() {
 
 # Проверка флагов (SNAT, интерфейс)
 is_flags_field() {
-  local f="$1"
-  local f_upper
-  f_upper=$(printf '%s' "$f" | tr '[:lower:]' '[:upper:]')
-  [ "$f_upper" = "SNAT" ] && return 0
-  # Рев-24: подстроки вида «SNATx»/«xSNAT» больше не считаются флагами —
-  # иначе PARSED_IFACE="SNATx" → iptables "unknown option" и правило
-  # проброса молча не строилось.
-  [[ "$f" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] && return 0
-  return 1
+  local f="$1" part part_upper
+  # Рев-36: поле может быть СПИСКОМ флагов через запятую — «SNAT,eth0»
+  # (parse_flags() такие списки разбирает). Раньше эта проверка отвергала любое
+  # поле с запятой, и правило вида "10.99.0.2:24607>8092:TCP:SNAT,eth0"
+  # трактовалось как «порт» → молча пропускалось (проверено на стенде
+  # 10.10.2026: up.sh не печатал строку для 24607, DNAT-правила не было).
+  IFS=',' read -ra _flag_parts <<< "$f"
+  [ "${#_flag_parts[@]}" -eq 0 ] && return 1
+  for part in "${_flag_parts[@]}"; do
+    part="${part// /}"
+    [ -z "$part" ] && return 1
+    part_upper=$(printf '%s' "$part" | tr '[:lower:]' '[:upper:]')
+    if [ "$part_upper" = "SNAT" ]; then
+      continue
+    fi
+    # Рев-24: подстроки вида «SNATx»/«xSNAT» по-прежнему не считаются флагами —
+    # иначе PARSED_IFACE="SNATx" → iptables "unknown option" и правило
+    # проброса молча не строилось.
+    [[ "$part" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] || return 1
+  done
+  return 0
 }
 
 # Получение информации о подсети (кол-во адресов + префикс)
@@ -668,8 +680,14 @@ try:
         print(f"# Подсеть {subnet} слишком большая (/{net.prefixlen} < /{effective_limit} для {limit_type})", file=sys.stderr)
         print(f"# Минимум: /{effective_limit} ({num_ips} адресов)", file=sys.stderr)
         sys.exit(1)
-    if num_ips > 65536:
-        print(f"# {subnet}: слишком много адресов ({num_ips}) — максимум 65536 (фикс аудита: /96 вешал up на 2^32 классах); минимум: /112 для IPv6, /16 для IPv4", file=sys.stderr)
+    # Рев-39: порог 65536 был слишком мягким — /112 (ровно 65536 адресов) проходил
+    # и up.sh создавал 65536 tc-классов: на 1 vCPU сервер фактически зависал и
+    # переставал отвечать по SSH (проверено на стенде 10.10.2026). Per-IP режим
+    # имеет смысл для небольших подсетей; крупные должны лимитироваться /32-/128.
+    if num_ips > 4096:
+        print(f"# {subnet}: слишком много адресов ({num_ips}) — per-IP лимиты строятся максимум для 4096 адресов "
+              f"(минимум /20 для IPv4, /116 для IPv6). Сузьте подсеть или задайте лимит на конкретный адрес (/32, /128).",
+              file=sys.stderr)
         sys.exit(1)
     for ip in net:
         print(ip)
@@ -2149,6 +2167,15 @@ if [ "$UPLOG" = "1" ]; then
   set -x
 fi
 
+# Рев-35 (баг, найден живьём 10.10.2026): блок WARP ниже запускает
+# `awg-quick up ... 2>>"$LOG_FILE"`. При выключенном логировании (UPLOG=0 —
+# значение ПО УМОЛЧАНИЮ) LOG_FILE пуст, переадресация `2>>""` падает с
+# «строка N: : Нет такого файла или каталога», и команда awg-quick ВООБЩЕ НЕ
+# ВЫПОЛНЯЕТСЯ — WARP-туннель не поднимается никогда, а сообщение об ошибке
+# врёт про «по имени ищется только /etc/amnezia/amneziawg/». Дефолт ниже
+# делает переадресацию безопасной.
+: "${LOG_FILE:=/dev/null}"
+
 # "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
 TUN_SAFE=$(safe_tun_name "$TUN")
 # Суффиксированные/уникальные имена цепочек/ресурсов
@@ -2848,7 +2875,7 @@ ddos_add_established() {
 # DDOS_* должны быть установлены через parse_ddos_by_port
 # Если DDOS_RATE=0 — правила не добавляются
 ddos_apply_rules() {
-  local _cmd="$1" _chain="$2" _proto="$3" _dip="$4" _dport="$5" _subnet="$6"
+  local _cmd="$1" _chain="$2" _proto="$3" _dip="$4" _dport="$5" _subnet="$6" _ext_port="${7:-}"
 
   # Если ни один параметр защиты не активен — ничего не делаем
   if [ "$DDOS_LENGTH_MIN" = "0" ] && [ "$DDOS_LENGTH_MAX" = "0" ] && [ "$DDOS_EST_RATE" = "0" ] && [ "$DDOS_NEW_RATE" = "0" ] && [ "$DDOS_CONNLIMIT" = "0" ] && [ "$DDOS_RATE" = "0" ] && [ "$DDOS_BW" = "0" ] && [ "$DDOS_BAN_HITS" = "0" ] && [ "$DDOS_REPLY_EST_RATE" = "0" ] && [ "$DDOS_REPLY_BW" = "0" ] && [ "$DDOS_REPLY_LENGTH_MIN" = "0" ] && [ "$DDOS_REPLY_LENGTH_MAX" = "0" ]; then
@@ -2887,8 +2914,22 @@ ddos_apply_rules() {
   local _addr_args=""
   [ -n "$_dip" ] && _addr_args="$_addr_args -d \"$_dip\""
   [ -n "$_subnet" ] && _addr_args="$_addr_args -s \"$_subnet\""
+  # Рев-37: профиль для ПРОБРОШЕННОГО порта должен матчиться по ИСХОДНОМУ порту
+  # назначения (conntrack --ctorigdstport). Иначе несколько профилей, ведущих на
+  # один и тот же ВНУТРЕННИЙ порт, мешают друг другу: терминальный DROP одного
+  # профиля рубит трафик другого (проверено на стенде 10.10.2026: UDP 1/5 и 3/5
+  # при наложении профилей против 10/10 без наложения).
+  local _orig_dport_opt=""
+  [ -n "$_ext_port" ] && _orig_dport_opt="-m conntrack --ctorigdstport $_ext_port"
   # Хелпер: выполняет iptables с переменными _cmd/_chain/_proto/_dport/_iface_opt/_addr_args (eval раскрывает кавычки)
-  _ddos_exec() { eval "$_cmd -t filter -A \"$_chain\" $_iface_opt -p \"$_proto\" --dport \"$_dport\" $_addr_args $1" 2>/dev/null || true; }
+  # Рев-38: ошибку больше не глушим — иначе правило молча терялось
+  # (именно так «исчезали» IPv6-правила, пока цепочка создавалась ниже).
+  _ddos_exec() {
+    local _err
+    if ! _err=$(eval "$_cmd -t filter -A \"$_chain\" $_iface_opt -p \"$_proto\" --dport \"$_dport\" $_addr_args $_orig_dport_opt $1" 2>&1); then
+      [ -n "$_err" ] && echo "⚠️  DDoS: правило не применено ($_cmd $_chain, порт $_dport): $_err" >&2
+    fi
+  }
   # Маска для connlimit: /32 для IPv4, /128 для IPv6
   local _mask=32
   [ "$_cmd" = "ip6tables" ] && _mask=128
@@ -2983,7 +3024,7 @@ pf_accept_or_ddos() {
   local _family="v4"
   [[ "$_cmd" == "ip6tables" ]] && _family="v6"
   if parse_ddos_by_port "$_ext_port" "$_proto" "$_family"; then
-    ddos_apply_rules "$_cmd" "$PF_CHAIN_FILTER" "$_proto" "$_dip" "$_int_port" "$_subnet" && return
+    ddos_apply_rules "$_cmd" "$PF_CHAIN_FILTER" "$_proto" "$_dip" "$_int_port" "$_subnet" "$_ext_port" && return
   fi
   # Без DDOS или без активных параметров — ACCEPT
   if [ -n "$_subnet" ]; then
@@ -3524,6 +3565,16 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -C INPUT -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -A INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
 fi
+# Рев-38: цепочка для IPv6 создаётся ЗДЕСЬ — ДО применения DDoS. Раньше она
+# создавалась ниже (после DDoS-блока), поэтому `ip6tables -A "$INPUT_CHAIN" ...`
+# падал в несуществующую цепочку, ошибка глушилась (`2>/dev/null || true`), и
+# IPv6-правила защиты молча терялись. Проверено на стенде 10.10.2026:
+# в ip6tables оставался только ICMPv6-ACCEPT, а IPv4-правила были на месте.
+if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+  ip6tables -t filter -N "$INPUT_CHAIN" 2>/dev/null || true
+  ip6tables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
+  ip6tables -t filter -C INPUT -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -A INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
+fi
 # --- DDoS защита основного порта ---
 # Рев-31: одно рукопожатие AmneziaWG — это ВЗРЫВ пакетов: Jc мусорных
 # (Jmin..Jmax) + имитационные I-строки + init, и все они идут в ctstate NEW.
@@ -3590,22 +3641,12 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
 fi
 
 # IPv6 правила (С NAT!)
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-  ip6tables -t filter -N "$INPUT_CHAIN" 2>/dev/null || true
-  ip6tables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
-  ip6tables -t filter -C INPUT -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -A INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
-fi
-# --- DDoS защита основного порта (IPv6) — применяется только к UDP-правилам с v6 в DDOS_FAMILY (или без указания семейства) ---
-for _de in "${PORT_FORWARDING_DDOS[@]}"; do
-  parse_ddos_entry "$_de" || continue
-  [ "$DDOS_PORT" = "$PORT" ] || continue
-  [ -z "$DDOS_PROTO" ] && continue
-  [[ ",${DDOS_PROTO}," != *,UDP,* ]] && continue
-  if { [ -z "$DDOS_FAMILY" ] || [[ ",${DDOS_FAMILY}," == *,v6,* ]]; } && [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-    ddos_apply_rules "ip6tables" "$INPUT_CHAIN" "udp" "" "$PORT" ""
-  fi
-  break
-done
+# (цепочка INPUT_CHAIN для ip6tables создана выше — до DDoS-блока, см. Рев-38)
+# Рев-37: здесь был ВТОРОЙ проход по PORT_FORWARDING_DDOS для IPv6 — он дублировал
+# правила (первый проход в IPv4-блоке уже применяет ip6tables-версию с полом
+# рукопожатия) и добавлял вторую пару «правила + терминальный DROP» БЕЗ пола.
+# Дубль был недостижим (шёл после терминального DROP первого набора), но мусорил
+# в цепочке и путал аудит. Оставлен один проход — в IPv4-блоке выше.
 # Разрешаем ICMPv6 (пинг) из VPN подсети на сервер (IPv6)
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -t filter -C "$INPUT_CHAIN" -s "$LOCAL_SUBNETS_IPV6" -p icmpv6 -j ACCEPT 2>/dev/null || ip6tables -t filter -A "$INPUT_CHAIN" -s "$LOCAL_SUBNETS_IPV6" -p icmpv6 -j ACCEPT 2>/dev/null || true
@@ -4640,9 +4681,9 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
               # ВАЖНО: Добавляем префикс ipv4:/ipv6 для уникальности между протоколами
-              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
+              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${EXT_PORT}:${INT_PORT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-$IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
+$IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$EXT_PORT" "$INT_PORT" "$ALLOWED_SUBNET"
@@ -4652,9 +4693,9 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             # доступ всем — без -s / -d
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
-            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${INT_PORT}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${EXT_PORT}:${INT_PORT}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -j SNAT --to-source "$SERVER_IP"
+              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$EXT_PORT" "$INT_PORT" ""
@@ -4665,6 +4706,10 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
           else
             echo "$PF_PROTO порт $EXT_PORT->$INT_PORT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
+            # Рев-37: без SNAT клиент увидит ИСХОДНЫЙ IP источника, а WireGuard
+            # пропускает входящий пакет только если этот IP входит в AllowedIPs
+            # клиента — иначе пакет молча дропается на клиенте. Предупреждаем.
+            echo "   ⚠️  без SNAT клиент увидит исходный IP — WG пропустит его только при совпадении с AllowedIPs клиента (иначе добавьте SNAT)" >&2
           fi
         done
         # После обработки обоих диапазонов — завершаем обработку этого CLIENT_IP
@@ -4679,9 +4724,9 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (используем внутренний порт!)
-              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
+              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PORT_INT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PORT_NUM" "$PF_PORT_INT" "$ALLOWED_SUBNET"
@@ -4689,9 +4734,9 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             done
           else
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
-            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PORT_INT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PORT_NUM" "$PF_PORT_INT" ""
@@ -4702,6 +4747,10 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             echo "$PF_PROTO порт $PORT_NUM->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
           else
             echo "$PF_PROTO порт $PORT_NUM->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
+            # Рев-37: без SNAT клиент увидит ИСХОДНЫЙ IP источника, а WireGuard
+            # пропускает входящий пакет только если этот IP входит в AllowedIPs
+            # клиента — иначе пакет молча дропается на клиенте. Предупреждаем.
+            echo "   ⚠️  без SNAT клиент увидит исходный IP — WG пропустит его только при совпадении с AllowedIPs клиента (иначе добавьте SNAT)" >&2
           fi
         done
         # После обработки внешнего диапазона — завершаем обработку этого CLIENT_IP
@@ -4716,9 +4765,9 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
               $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
-              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
+              snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PORT_NUM}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PORT_NUM" "$ALLOWED_SUBNET"
@@ -4726,9 +4775,9 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             done
           else
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
-            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PORT_NUM}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
+              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PORT_NUM" ""
@@ -4739,6 +4788,10 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             echo "$PF_PROTO порт $PF_PORT_EXT->$PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
           else
             echo "$PF_PROTO порт $PF_PORT_EXT->$PORT_NUM на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
+            # Рев-37: без SNAT клиент увидит ИСХОДНЫЙ IP источника, а WireGuard
+            # пропускает входящий пакет только если этот IP входит в AllowedIPs
+            # клиента — иначе пакет молча дропается на клиенте. Предупреждаем.
+            echo "   ⚠️  без SNAT клиент увидит исходный IP — WG пропустит его только при совпадении с AllowedIPs клиента (иначе добавьте SNAT)" >&2
           fi
         done
         # После обработки внутреннего диапазона — завершаем обработку этого CLIENT_IP
@@ -4749,9 +4802,9 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
           for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
             $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
-            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
+            snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PF_PORT_INT}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
+              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PF_PORT_INT" "$ALLOWED_SUBNET"
@@ -4759,9 +4812,9 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
           done
         else
           $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
-          snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_INT}:${PF_PROTO}"
+          snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PF_PORT_INT}:${PF_PROTO}"
           if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-            $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -j SNAT --to-source "$SERVER_IP"
+            $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
             GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
           fi
           pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PF_PORT_INT" ""
@@ -4772,6 +4825,10 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
           echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (SNAT)"
         else
           echo "$PF_PROTO порт $PF_PORT_EXT->$PF_PORT_INT на $CLIENT_IP открыт для ${ALLOWED_SUBNETS_DISPLAY} (no SNAT)"
+          # Рев-37: без SNAT клиент увидит ИСХОДНЫЙ IP источника, а WireGuard
+          # пропускает входящий пакет только если этот IP входит в AllowedIPs
+          # клиента — иначе пакет молча дропается на клиенте. Предупреждаем.
+          echo "   ⚠️  без SNAT клиент увидит исходный IP — WG пропустит его только при совпадении с AllowedIPs клиента (иначе добавьте SNAT)" >&2
         fi
     # Конец обработки всех вариантов портов
   done
@@ -6773,6 +6830,11 @@ if [ "$DOWNLOG" = "1" ]; then
   BASH_XTRACEFD=3
   set -x
 fi
+
+# Рев-35: та же защита, что и в up-скрипте — блок снятия WARP использует
+# `awg-quick down ... 2>>"$LOG_FILE"`, а при DOWNLOG=0 (по умолчанию) переменная
+# пуста, и переадресация 2>>"" ломает команду (WARP-интерфейс не снимается).
+: "${LOG_FILE:=/dev/null}"
 
 # Helper функции загружены из params через source:
 # atomic_ref_update, find_tun_from_map
@@ -9853,7 +9915,6 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
 def generate_all_params(version: str, for_client: bool = False, for_server: bool = True, for_warp: bool = False, domain: str = "", tun_name: str = "", seed_override: str = "", proto: str = "", server_pubkey: str = "") -> dict:
     """
     УНИВЕРСАЛЬНАЯ ФУНКЦИЯ — генерирует ВСЕ параметры обфускации сразу.
-
     Возвращает полный набор параметров, но неподдерживаемые версии = None.
 
     Таблица реализации:
@@ -9866,6 +9927,8 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
 │ AWG1.0 │ + разные     │ + одинаковые  │ + статичные  │ - коммент  │ - коммент    │
 │ AWG1.5 │ + разные     │ + одинаковые  │ + статичные  │ + клиент   │ - коммент    │
 │ AWG2.0 │ + разные     │ + одинаковые  │ + диапазоны  │ + клиент   │ + одинаковые │
+│ AWG3.0 │ + разные     │ + одинаковые  │ + диапазоны  │ + клиент   │ + одинаковые │
+│ AWG3.1 │ + разные     │ + одинаковые  │ + диапазоны  │ + клиент   │ + одинаковые │
 └────────┴──────────────┴───────────────┴──────────────┴────────────┴──────────────┘
 Эта таблица описывает сервер/клиент, warp сервер/клиент
 ┌────────┬───────────────────┬────────────────────────────┬────────────────────────────┬────────────────────┬────────────────────────────┐
@@ -9876,17 +9939,87 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
 │ AWG1.0 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ - с:#,к/Wс/Wк:нет  │ - с:#,к/Wс/Wк:нет          │
 │ AWG1.5 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ + с/к/Wс/Wк:свои   │ - с:#,к/Wс/Wк:нет          │
 │ AWG2.0 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ + с/к/Wс/Wк:свои   │ + с/к:одинаковые,Wс/Wк:нет │
+│ AWG3.0 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ + с/к/Wс/Wк:свои   │ + с/к:одинаковые,Wс/Wк:нет │
+│ AWG3.1 │ + с/к/Wс/Wк:свои  │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ + с/к/Wс/Wк:свои   │ + с/к:одинаковые,Wс/Wк:нет │
 └────────┴───────────────────┴────────────────────────────┴────────────────────────────┴────────────────────┴────────────────────────────┘
+Эта таблица описывает параметры AWG3.x (сервер/клиент, warp сервер/клиент)
+┌────────┬──────────────────────┬───────────────────┬──────────────────────┬────────────────────────────┬───────────────────────┐
+│ Версия │ CPA                  │ Тайминги (5)      │ DisableCookies       │ HPK                        │ RandomTrailers        │
+├────────┼──────────────────────┼───────────────────┼──────────────────────┼────────────────────────────┼───────────────────────┤
+│ WG ——— │ - с:#,к/Wс/Wк:нет    │ - с:#,к/Wс/Wк:нет │ - с:#,к/Wс/Wк:нет    │ - с/к/Wс/Wк:нет            │ - с/к/Wс/Wк:нет       │
+│ AWG2.0 │ - с:#,к/Wс/Wк:нет    │ - с:#,к/Wс/Wк:нет │ - с:#,к/Wс/Wк:нет    │ - с/к/Wс/Wк:нет            │ - с/к/Wс/Wк:нет       │
+│ AWG3.0 │ + с/к:свои,Wс/Wк:нет │ + с/к/Wс/Wк:свои  │ + с/к:свои,Wс/Wк:нет │ - с/к/Wс/Wк:нет            │ - с/к/Wс/Wк:нет       │
+│ AWG3.1 │ + с/к:свои,Wс/Wк:нет │ + с/к/Wс/Wк:свои  │ + с/к:свои,Wс/Wк:нет │ + с/к:одинаковые,Wс/Wк:нет │ + с/к:свои,Wс/Wк:нет  │
+└────────┴──────────────────────┴───────────────────┴──────────────────────┴────────────────────────────┴───────────────────────┘
+    Для AWG3.1: S1=S2=S3=S4 ∈ [12..19] и равны между собой — при S < 12 ядро
+    отвергает HeaderProtectionKey («Unable to modify interface: Invalid argument»);
+    проверено на ядре amneziawg 3.1.20260812.
 
-    Args:
-        version: "WG", "AWG", "AWG1.0", "AWG1.5", "AWG2.0"
-        for_client: Если True, генерировать I1-I5 для клиента
-        for_server: Если True, генерировать ВСЕ параметры (даже неподдерживаемые) для сервера
+    Описание параметров (столбцов таблиц):
 
-    Returns:
-        Словарь со всеми параметрами. None = параметр не поддерживается (закомментировать).
+      Jc, Jmin, Jmax — «мусорные» пакеты, которые отправляются ПЕРЕД рукопожатием:
+        Jc — сколько пакетов, Jmin/Jmax — минимальный и максимальный размер каждого
+        (в байтах). У каждой стороны свои: получатель мусор просто отбрасывает.
+        Генерируется: Jc 80..120, Jmin 48..64, Jmax = Jmin+8 .. 80.
+
+      S1, S2 — размер «мусорного» префикса, который дописывается к пакетам
+        рукопожатия: S1 — к initiation, S2 — к response. Оба конца обязаны знать
+        одно и то же значение, иначе пакет не разберётся. Генерируется 61..255 и
+        29..127; для AWG3.1 — 12..19.
+      S3, S4 — то же для остальных типов пакетов: S3 — cookie reply, S4 — data.
+        Появились в AWG2.0: S3 13..63, S4 5..9; в AWG3.1 — тоже 12..19.
+
+      H1-H4 — номера типов сообщений вместо стандартных WireGuard 1/2/3/4:
+        H1 — handshake initiation, H2 — response, H3 — cookie reply, H4 — data.
+        В AWG1.0/1.5 — одно фиксированное число (0x10000011..0xFFFFFFF0, попарная
+        разница не меньше 30000); с AWG2.0 — диапазон «начало-конец» (размер
+        300M..600M), значение выбирается на каждый пакет. Обязаны совпадать.
+
+      I1-I5 — «пакеты-приманки» (CPS), отправляемые перед рукопожатием: каждый
+        маскируется под легитимный UDP-протокол (DNS, QUIC, DTLS, NTP, SIP).
+        Формат строки: <b 0xHEX> — статические байты, <t> — текущий timestamp,
+        <r N> — N случайных байт, <rc N> — N ASCII-символов, <rd N> — N цифр.
+        Генерируется 3..5 строк; у каждой стороны свои.
+
+      CPA (ContentPaddingAddition) — добавляет к пакетам случайный паддинг,
+        формат «1-N» (от 1 до N байт). Появился в AWG3.0, генерируется 1..63.
+
+      Тайминги (5) — рандомизация таймеров протокола, формат «a-b» (значение
+        выбирается случайно из диапазона):
+          RekeyAfterTime       — через сколько начинать рекей;
+          RekeyTimeout         — сколько ждать ответа при рекее;
+          RejectAfterTime      — когда считать сессию мёртвой;
+          KeepaliveTimeout     — период keepalive;
+          MaxHandshakeAttempts — сколько попыток рукопожатия делать.
+        AWG3.0+. Это ЛОКАЛЬНЫЕ таймеры — по проводу не передаются, поэтому
+        разрешены и для WARP (единственные из 3.x-параметров).
+
+      DisableCookies — «on»: отключить cookie-механизм WireGuard (сервер не
+        отвечает cookie reply). Появился в AWG3.0.
+
+      HPK (HeaderProtectionKey) — base64-ключ из 32 байт, которым шифруется поле
+        «тип сообщения» (Header Protection). Только AWG3.1 и только серверный
+        конфиг: клиентам ключ вшивается из серверного, значение обязано
+        совпадать. Требует S ≥ 12, иначе ядро отвергает конфиг.
+
+      RandomTrailers — «on»: дописывает к пакетам случайный «хвост». Только AWG3.1.
+
+    Обозначения в таблицах:
+      + / -        — параметр генерируется / не генерируется;
+      с / к        — серверный / клиентский конфиг, Wс / Wк — WARP-сервер / WARP-клиент;
+      с:#          — в серверном конфиге строка пишется ЗАКОММЕНТИРОВАННОЙ
+                     («# KEY = val  # AWGx.y») — как подсказка для ручного включения;
+      коммент      — параметр версией не поддерживается и остаётся закомментированным;
+      свои         — у каждой стороны своё значение (совпадать не обязано);
+      одинаковые   — значения обязаны совпадать у сервера и клиента, иначе
+                     рукопожатие не пройдёт;
+      статичные / диапазоны — H1-H4 заданы одним числом / диапазоном «a-b»;
+      клиент       — пометка в таблице 1 для I1-I5; фактически (см. код) с AWG1.5
+                     они активны И в серверном, И в клиентском конфиге, а
+                     комментарием остаются только у WG/AWG/AWG1.0.
     """
-    # Генерируем полный набор параметров для максимальной версии (AWG2.0)
+    # Генерируем полный набор параметров для максимальной версии (AWG3.1);
+    # версии ниже получают только своё (см. таблицы выше)
     Jc, Jmin, Jmax = _generate_j_params()
 
     # S1-S4: для AWG3.1 — ОДНО значение на все четыре, 12..19 (см. docstring
@@ -11672,6 +11805,27 @@ def _process_interface_path(raw_input: str) -> tuple[pathlib.Path, str]:
     # и ломали пути (tun_name идёт в каталоги и shell). Запрещаем явно.
     if tun_name in ('.', '..'):
         raise RuntimeError(f'Недопустимое имя интерфейса "{raw_input}": нельзя "." и ".."')
+    # Рев-37: имена, которые физически не дают создать интерфейс.
+    # `ip link add <name> type amneziawg` разбирает аргументы по ПРЕФИКСУ
+    # ключевых слов iproute2, поэтому однобуквенное имя «t» понимается как
+    # сокращение «txqueuelen» и awg-quick падает с
+    # `Error: argument "type" is wrong: Invalid "txqueuelen" value`
+    # (проверено на стенде 10.10.2026: конфиг t.conf не поднимался, awgt0 —
+    # поднимался). Такие имена отклоняем сразу, иначе пользователь получает
+    # заведомо нерабочий конфиг и непонятную ошибку на `awg-quick up`.
+    _IP_LINK_KEYWORDS = (
+        'dev', 'type', 'txqueuelen', 'mtu', 'address', 'broadcast', 'name',
+        'index', 'numtxqueues', 'numrxqueues', 'group', 'alias', 'link',
+        'up', 'down', 'arp', 'set', 'add', 'del', 'delete', 'show', 'change',
+        'replace', 'on', 'off',
+    )
+    _low = tun_name.lower()
+    if len(tun_name) < 2 or any(kw.startswith(_low) for kw in _IP_LINK_KEYWORDS):
+        raise RuntimeError(
+            f'Недопустимое имя интерфейса "{tun_name}" (из "{raw_input}"): iproute2 '
+            f'сопоставляет аргументы по префиксу служебных слов, поэтому `ip link add` '
+            f'с таким именем падает (например «t» → «txqueuelen»), и awg-quick не '
+            f'сможет поднять интерфейс. Переименуйте конфиг, например в "awg0.conf".')
     return target_path, tun_name
 
 
@@ -11840,6 +11994,21 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
     params_script = params_script.replace("<SERVER_TUN>", tun_name)
     params_script = params_script.replace("<SERVER_ADDR>", server_addr)
     params_script = params_script.replace("<RATE_LIMIT>", f"{opt.limit}")
+    # Рев-39: если задан лимит скорости, а подсеть туннеля слишком большая —
+    # up.sh строил бы класс на КАЖДЫЙ адрес (для /112 это 65536 классов: сервер
+    # зависает). Отказываем сразу с понятным текстом вместо зависания на старте.
+    if opt.limit:
+        try:
+            _net = ipaddress.ip_network(server_addr, strict=False)
+            if _net.num_addresses > 4096:
+                raise RuntimeError(
+                    f'Лимит скорости ({opt.limit} Мбит) для подсети {server_addr} '
+                    f'({_net.num_addresses} адресов) невозможен: инструмент строит '
+                    f'класс на каждый адрес, это подвесит сервер. Возьмите подсеть '
+                    f'до 4096 адресов (/20 для IPv4, /116 для IPv6) или задайте '
+                    f'лимит на конкретный адрес (/32, /128).')
+        except ValueError:
+            pass  # server_addr может быть списком/нестандартным — пропускаем
     params_script = params_script.replace("<WARP_LIST>", warp_list_str)
 
     # Рев-32: пресет DDoS основного порта генерируем сразу валидным для
