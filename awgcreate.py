@@ -184,12 +184,6 @@ PORT_FORWARDING_DDOS=(
   #"Порт[-Диапазон][&Список][=Shared][,v6][/Протокол]:Rate/Период[+Burst][>EstRate/Период[+EstBurst]][<Connlimit[,NewRate/Период[+Burst]]][^EstPackets][_МинДлина-МаксДлина][~Полоса][!Бан/Секунд][@Интерфейс][=>ReplyRate/Период+Burst][=_ReplyМин-Макс][=~ReplyПолоса]"
   #"80/tcp:100/10+50>500/5+100<20,5/30^10_32-1500~100mbit!3/60"
   #"22:10/60<3!5/300"
-  # Рев-32: основной порт — «рукопожатие-осознанные» лимиты СРАЗУ в пресете.
-  # Одно рукопожатие AWG = взрыв Jc(80..120) мусорных + до 5 I-строк + init
-  # ≈ ≤126 пакетов, все в ctstate NEW. Прежний пресет (rate 5/сек, burst 100,
-  # connlimit 50) был МЕНЬШЕ взрыва: хвост с init уходил в финальный DROP и
-  # туннель не поднимался никогда (проверено на живых серверах 30.09).
-  # Значения ниже подставляются в _create_scripts (худший случай генератора).
   "<SERVER_PORT>/udp:<HS_RATE>/1+<HS_BURST>>1000/10+2000<<HS_CONNLIMIT>,<HS_RATE>/1+<HS_BURST>^50_32-1500~<RATE_LIMIT>=>1000/10+2000=_32-1500=~<RATE_LIMIT>"
 )
 
@@ -12000,12 +11994,12 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
     if opt.limit:
         try:
             _net = ipaddress.ip_network(server_addr, strict=False)
-            if _net.num_addresses > 4096:
+            if _net.num_addresses > 8192:
                 raise RuntimeError(
                     f'Лимит скорости ({opt.limit} Мбит) для подсети {server_addr} '
                     f'({_net.num_addresses} адресов) невозможен: инструмент строит '
                     f'класс на каждый адрес, это подвесит сервер. Возьмите подсеть '
-                    f'до 4096 адресов (/20 для IPv4, /116 для IPv6) или задайте '
+                    f'до 8192 адресов (/20 для IPv4, /116 для IPv6) или задайте '
                     f'лимит на конкретный адрес (/32, /128).')
         except ValueError:
             pass  # server_addr может быть списком/нестандартным — пропускаем
