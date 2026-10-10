@@ -8929,8 +8929,8 @@ def _generate_timing_params(rng: random.Random | None = None) -> dict[str, str]:
     (проверено e2e, в т.ч. при диких расхождениях значений) → разнос ритмов
     рекеев убирает общий «сигнал генератора» при наблюдении нескольких
     туннелей. Формула (инвариант в каждом конфиге: Reject_min = Rekey_max+60):
-      RekeyAfterTime  = "a-b": a=240..360, b=a+240..360  → итого 240..720
-      RejectAfterTime = "c-d": c=b+60,     d=c+60        → итого 540..840
+      RekeyAfterTime  = "a-b": a=60..90, b=a+60..90  → итого 60..180
+      RejectAfterTime = "c-d": c=b+20,     d=c+20    → итого 180..260
     Дополнительно (16.09.2026): RekeyTimeout, KeepaliveTimeout и
     MaxHandshakeAttempts тоже per-config: каждое "a-b" со СВОИМ случайным a=6..9,
     b=a+a (итог 6..18) — декорреляция локальных таймеров между конфигами.
@@ -8938,10 +8938,10 @@ def _generate_timing_params(rng: random.Random | None = None) -> dict[str, str]:
     в конфигах младших версий: global random НЕ трогается — стрим-инвариант).
     """
     rng = rng if rng is not None else random
-    a = rng.randint(240, 360)
-    b = a + rng.randint(240, 360)
+    a = rng.randint(60, 90)
+    b = a + rng.randint(60, 90)
     c = b + 60
-    d = c + 60
+    d = c + 20
     t_rt = rng.randint(6, 9)
     t_ka = rng.randint(6, 9)
     t_ma = rng.randint(6, 9)
@@ -13749,8 +13749,6 @@ parser.add_argument("-z", "--zip", action="store_true", help="ZIP-архивы")
 parser.add_argument("-o", "--only", help="Только указанные клиенты", default="")
 parser.add_argument("-r", "--reload", action="store_true", help="Перезагрузить конфиг интерфейса без отключения (awg syncconf)")
 parser.add_argument("-i", "--ipaddr", default="", help="IP адрес")
-# Легаси-дефолт 4455 (ранние версии пользовались им); канонический порт
-# AWG по умолчанию — 51820 (см. _read_endpoint_proto), задаётся явно.
 parser.add_argument("-p", "--port", type=int, default=4455, help="Порт")
 parser.add_argument("-l", "--limit", type=int, default=0, help="Limit (Mbit)")
 parser.add_argument("-f", "--iface", default="", help="Сетевой интерфейс (например ens3)")
