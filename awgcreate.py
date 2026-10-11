@@ -8915,22 +8915,6 @@ def _generate_content_padding(rng: random.Random | None = None) -> str:
 
 
 def _generate_timing_params(rng: random.Random | None = None) -> dict[str, str]:
-    """Генерация 5 таймингов-диапазонов (AWG3.0+).
-
-    16.09.2026: RekeyAfterTime/RejectAfterTime рандомизируются на КАЖДЫЙ
-    конфиг (сервер — один набор, каждый клиент — свой): тайминги — локальные
-    таймеры, по проводу не передаются, совпадение сервер↔клиент НЕ требуется
-    (проверено e2e, в т.ч. при диких расхождениях значений) → разнос ритмов
-    рекеев убирает общий «сигнал генератора» при наблюдении нескольких
-    туннелей. Формула (инвариант в каждом конфиге: Reject_min = Rekey_max+60):
-      RekeyAfterTime  = "a-b": a=60..90, b=a+60..90  → итого 60..180
-      RejectAfterTime = "c-d": c=b+20,     d=c+20    → итого 180..260
-    Дополнительно (16.09.2026): RekeyTimeout, KeepaliveTimeout и
-    MaxHandshakeAttempts тоже per-config: каждое "a-b" со СВОИМ случайным a=6..9,
-    b=a+a (итог 6..18) — декорреляция локальных таймеров между конфигами.
-    rng: при задании — случайный источник (для комментариев-подсказок 3.x
-    в конфигах младших версий: global random НЕ трогается — стрим-инвариант).
-    """
     rng = rng if rng is not None else random
     a = rng.randint(60, 90)
     b = a + rng.randint(60, 90)
@@ -9144,30 +9128,26 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
                 raise ValueError(f"QUIC: не удалось набрать PADDING до {pad_target} байт")
             return try_AESGCM(dcid_hex, scid_hex, crypto_hex, is_server=is_server), 0
         # Фоллбэк без cryptography (пакет не зашифрован — только для вида); паддинг нулями
-        if pad_target > 0:
-            for _pad in range(pad_target):
-                payload_len = len(crypto_hex) // 2 + 1 + _pad
-                quic_hex = (f"c000000001"
-                            f"08{dcid_hex}"
-                            f"08{scid_hex}"
-                            f"00"
-                            f"{_quic_varint(payload_len)}"
-                            f"00"
-                            f"{crypto_hex}{'00' * _pad}")
-                if len(quic_hex) // 2 == pad_target:
-                    return quic_hex, 0
-                if len(quic_hex) // 2 > pad_target:
-                    break
-            raise ValueError(f"QUIC: не удалось набрать PADDING до {pad_target} байт (фоллбэк)")
-        payload_len = len(crypto_hex) // 2 + 1
-        quic_hex = (f"c000000001"
+        def _fallback_packet(pad: int) -> str:
+            """QUIC long header + CRYPTO-фрейм + `pad` нулевых байт (PADDING-фреймы)."""
+            payload_len = len(crypto_hex) // 2 + 1 + pad
+            return (f"c000000001"
                     f"08{dcid_hex}"
                     f"08{scid_hex}"
                     f"00"
                     f"{_quic_varint(payload_len)}"
                     f"00"
-                    f"{crypto_hex}")
-        return quic_hex, default_range
+                    f"{crypto_hex}{'00' * pad}")
+
+        if pad_target > 0:
+            for _pad in range(pad_target):
+                quic_hex = _fallback_packet(_pad)
+                if len(quic_hex) // 2 == pad_target:
+                    return quic_hex, 0
+                if len(quic_hex) // 2 > pad_target:
+                    break
+            raise ValueError(f"QUIC: не удалось набрать PADDING до {pad_target} байт (фоллбэк)")
+        return _fallback_packet(0), default_range
 
     def _quic_varint(value: int) -> str:
         """Кодирует целое в QUIC variable-length integer (hex)."""
@@ -9278,21 +9258,16 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
             # PADDING-фреймы до 1200 байт (RFC 9000 §14.1) — иначе дроп
             quic_hex, qr_static_range = _build_quic_packet(crypto_hex, scid_hex_preset=scid_hex,
                                                            pad_target=1200)
+            # Хвост не добавляем — см. комментарий в TLS-1.2 ветке ниже (MTU 1500).
             return generate_cps_packet(
                 static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
                 use_timestamp=True,
-                random_bytes=200, random_bytes_range=100,
-                random_ascii=100, random_ascii_range=100,
-                random_digits=10, random_digits_range=5,
             )
         aio_hex = _quic_initial_via_aioquic(is_server=False)
         if aio_hex:
             return generate_cps_packet(
                 static_bytes=f"0x{aio_hex}", static_bytes_range=0,
                 use_timestamp=True,
-                random_bytes=200, random_bytes_range=100,
-                random_ascii=100, random_ascii_range=100,
-                random_digits=10, random_digits_range=5,
             )
         sni_bytes = domain.encode('utf-8')
         sni_hex = sni_bytes.hex()
@@ -9300,7 +9275,10 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         session_id_hex = hashlib.sha256(seed.encode()).hexdigest() if seed else secrets.token_hex(32)  # рев-25: эхо session_id (RFC 5246): обе стороны — от seed → сервер эхо-отражает клиента
 
         # TLS 1.2 cipher suites (первый — детерминированный от seed, совпадает с сервером)
-        suites_pool = ["c02b", "c02f", "c02c", "c030", "cca8", "cca9",
+        # TLS-1.3-шифры ПЕРВЫМИ — как у Chrome. Без 0x13xx QUIC-сервер отвергает
+        # ClientHello (ниже выставляется supported_versions = TLS 1.3).
+        suites_pool = ["1301", "1302", "1303",
+                       "c02b", "c02f", "c02c", "c030", "cca8", "cca9",
                        "c013", "c014", "0033", "0039", "002f", "009c"]
         if seed:
             # Тот же seed и тот же пул что на сервере → одинаковый выбранный cipher
@@ -9313,27 +9291,63 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         # SNI extension data (RFC 6066): list_len + name_type(00) + name_len + name.
         # ext_hex ниже добавляет ext_type(0000) + ext_data_len.
         sni_ext_hex = f"{len(sni_bytes)+3:04x}00{len(sni_bytes):04x}{sni_hex}"
-        # supported_groups (x25519, secp256r1, secp384r1)
-        groups_hex = ("000a00140012001d0017001800190100"
-                      "1c000b000a0009")
-        # signature_algorithms (ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, ...)
-        sigalgs_hex = ("000d001a001806010602060305010502"
-                       "0503040104020403080408040508")
-        # ALPN (h2, http/1.1)
-        alpn_hex = "0010000e000c02683208687474702f312e31"
-        # supported_versions: только TLS 1.2 (0x0303)
-        sv_hex = "002b0003020303"
-        # ec_point_formats: uncompressed
-        ecpt_hex = "000b00020100"
+        # supported_groups (x25519, secp256r1, secp384r1, secp521r1) — длины СЧИТАЮТСЯ,
+        # а не вписаны руками: в прежней версии было объявлено 20 Б при 19 реальных,
+        # из-за чего Cloudflare отвечал CONNECTION_CLOSE с TLS alert 50 (decode_error).
+        grp_list = "".join(["001d", "0017", "0018", "0019"])
+        groups_hex = ("000a" +
+                      f"{len(grp_list)//2 + 2:04x}" +      # ext data len: list_len(2) + группы
+                      f"{len(grp_list)//2:04x}" + grp_list)
+        # signature_algorithms — реальные коды из реестра IANA в порядке Chrome.
+        # Прежний список содержал несуществующие значения (0x0602/0x0502/0x0402/0x0508)
+        # и дубль 0x0804: Cloudflare отвечал CONNECTION_CLOSE с illegal_parameter.
+        sig_list = ["0403", "0503", "0603", "0804", "0805", "0806", "0807", "0808",
+                    "0401", "0501", "0601"]
+        sigalgs_hex = ("000d" +
+                       f"{len(sig_list) * 2 + 2:04x}" +
+                       f"{len(sig_list) * 2:04x}" + "".join(sig_list))
+        # ALPN (h3) — для QUIC обязателен RFC 9114; h2/http1.1 в QUIC-ClientHello
+        # сервер отвергает (no_application_protocol). Проверено: с h2 Cloudflare
+        # отвечает CONNECTION_CLOSE, с h3 — ServerHello.
+        alpn_hex = "001000050003026833"
+        # supported_versions: TLS 1.3 (0x0304). QUIC требует именно 1.3 (RFC 9001 §4.2);
+        # с 0x0303 сервер тоже отвечает CONNECTION_CLOSE.
+        sv_hex = "002b0003020304"
+        # ec_point_formats НЕ отправляем: содержит TLS-1.2-only значение и в 1.3
+        # отвергается сервером (illegal_parameter) — Chrome его в 1.3 не шлёт.
         # QUIC Transport Parameters
         scid_hex = secrets.token_hex(8)
+        # QUIC Transport Parameters по RFC 9000 §18.2. ВАЖНО: initial_source_connection_id
+        # у клиента — это код 0x0f. Код 0x00 (original_destination_connection_id) —
+        # серверный, клиенту его слать ЗАПРЕЩЕНО (прежняя версия слала 0x00 → сервер
+        # отвечал CONNECTION_CLOSE). Длины считаются, а не вписаны руками.
+        def _tp(pid: int, val_hex: str) -> str:
+            # Длины — ИМЕННО QUIC-varint (RFC 9000 §16): для 2-байтной формы
+            # старшие биты обязаны быть 01 (0x4000|len). Прежняя запись «сырыми»
+            # 0008 читалась парсером как id=0/длина=0 + мусор.
+            return _quic_varint(pid) + _quic_varint(len(val_hex) // 2) + val_hex
+
+        def _tp_int(pid: int, value: int) -> str:
+            # Целочисленные параметры ТОЖЕ кодируются varint'ом, и длина обязана
+            # совпадать с числом байт varint'а (RFC 9000 §18.2). Прежняя запись
+            # фиксированной шириной (max_udp_payload_size = «04b0») читалась как
+            # varint «4» длиной 1 байт при заявленной длине 2 → строгий парсер
+            # отвечал TRANSPORT_PARAMETER_ERROR «length does not match»
+            # (проверено локальным aioquic-сервером).
+            v = _quic_varint(value)
+            return _quic_varint(pid) + _quic_varint(len(v) // 2) + v
+
         tp_body = (
-            "00" + f"{len(scid_hex)//2:04x}" + scid_hex +        # initial_source_connection_id
-            "01" + "0002" + "7530" +                              # max_idle_timeout (30000ms)
-            "03" + "0002" + "04b0" +                              # max_udp_payload_size (1200)
-            "04" + "0004" + "00010000" +                          # initial_max_data (65536)
-            "06" + "0002" + "0100" +                              # initial_max_streams_bidi (256)
-            "07" + "0002" + "0100"                                # initial_max_streams_uni (256)
+            _tp_int(0x01, 30000) +     # max_idle_timeout = 30000 мс
+            _tp_int(0x03, 1200) +      # max_udp_payload_size = 1200
+            _tp_int(0x04, 65536) +     # initial_max_data
+            _tp_int(0x05, 65536) +     # initial_max_stream_data_bidi_local
+            _tp_int(0x06, 65536) +     # initial_max_stream_data_bidi_remote
+            _tp_int(0x07, 65536) +     # initial_max_stream_data_uni
+            _tp_int(0x08, 100) +       # initial_max_streams_bidi
+            _tp_int(0x09, 100) +       # initial_max_streams_uni
+            _tp_int(0x0e, 2) +         # active_connection_id_limit
+            _tp(0x0f, scid_hex)        # initial_source_connection_id = наш SCID
         )
         qtp_hex = "0039" + f"{len(tp_body)//2:04x}" + tp_body
         # key_share (X25519 dummy public key)
@@ -9344,10 +9358,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
                    f"{sigalgs_hex}"                                # signature_algorithms
                    f"{sv_hex}"                                     # supported_versions
                    f"{alpn_hex}"                                   # ALPN
-                   f"{ecpt_hex}"                                   # ec_point_formats
                    f"{qtp_hex}"                                    # QUIC transport params
-                   f"ff01000100"                                   # renegotiation_info
-                   f"00120000"                                     # signed_certificate_timestamp (empty)
                    f"{ks_hex}")                                    # key_share
         ext_len = len(ext_hex) // 2
         # ClientHello body
@@ -9362,40 +9373,44 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         quic_hex, qr_static_range = _build_quic_packet(
             crypto_hex, scid_hex_preset=scid_hex,
             pad_target=1200 if try_AESGCM is not None else 0)
-        if try_AESGCM is not None:
-            # Хвостовые <r>/<rc>/<rd> расширяются в датаграмме ПОСЛЕ валидного
-            # Initial-пакета. Проверено на стенде: Cloudflare отвечает и на
-            # датаграмму с таким хвостом (16.09.2026).
-            rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
-        else:
-            rb, rbr, ra, rar, rd, rdr = 400, 200, 200, 200, 20, 10
+        # 16.10.2026: хвост <r>/<rc>/<rd> после QUIC Initial НЕ добавляем.
+        # 1200 Б Initial + хвост 400-500 Б давали датаграмму 1650-1716 Б >
+        # MTU 1500 → фрагментация, а настоящий QUIC Initial ровно 1200 Б
+        # (RFC 9000 §14.1) и на 1500-байтном пути не фрагментируется никогда.
+        # Вдобавок случайный хвост — это не валидный второй QUIC-пакет, то есть
+        # демаскировка. Объём серии и разброс размеров дают I2-I5, у них хвосты
+        # остаются (см. _gen_quic_client_handshake / _gen_quic_appdata).
         return generate_cps_packet(
             static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
             use_timestamp=True,
-            random_bytes=rb, random_bytes_range=rbr,
-            random_ascii=ra, random_ascii_range=rar,
-            random_digits=rd, random_digits_range=rdr,
         )
 
-    def _gen_quic_client_handshake():
-        """QUIC Handshake (завершение рукопожатия клиента)."""
-        payload = secrets.token_hex(64)
+    def _quic_handshake_packet(payload_hex: str, ascii_base: int) -> str:
+        """QUIC Handshake-пакет (long header, PN=0) + хвост CPS как у I2-I5.
+
+        Общий сборщик для клиентского и серверного флайта: отличается только
+        содержимое/длина payload и база случайных ASCII в хвосте.
+        """
         dcid_hex = secrets.token_hex(8)
         scid_hex = secrets.token_hex(8)
-        body_len = 1 + len(payload)//2  # PN(1) + payload
+        body_len = 1 + len(payload_hex) // 2      # PN(1) + payload
         handshake_hex = (f"e000000001"
                          f"08{dcid_hex}"
                          f"08{scid_hex}"
                          f"{_quic_varint(body_len)}"
-                         f"00"                                           # PN=0
-                         f"{payload}")
+                         f"00"                                     # PN = 0
+                         f"{payload_hex}")
         return generate_cps_packet(
             static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
             use_timestamp=True,
             random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
+            random_ascii=ascii_base, random_ascii_range=100,
             random_digits=10, random_digits_range=5,
         )
+
+    def _gen_quic_client_handshake():
+        """QUIC Handshake (завершение рукопожатия клиента)."""
+        return _quic_handshake_packet(secrets.token_hex(64), 100)
 
     def _gen_quic_server():
         """QUIC ServerHello: uTLS (согласованный с ClientHello) → aioquic TLS 1.3 → TLS 1.2."""
@@ -9407,36 +9422,35 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
                 crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(sh_hex) // 2) + sh_hex
                 quic_hex, qr_static_range = _build_quic_packet(crypto_hex, default_range=40,
                                                                is_server=True, pad_target=1200)
-                if try_AESGCM is not None:
-                    rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
-                else:
-                    rb, rbr, ra, rar, rd, rdr = 300, 200, 300, 200, 20, 10
+                # Хвост не добавляем — см. _gen_quic_client (MTU 1500).
                 return generate_cps_packet(
                     static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
                     use_timestamp=True,
-                    random_bytes=rb, random_bytes_range=rbr,
-                    random_ascii=ra, random_ascii_range=rar,
-                    random_digits=rd, random_digits_range=rdr,
                 )
         aio_hex = _quic_initial_via_aioquic(is_server=True)
         if aio_hex:
             return generate_cps_packet(
                 static_bytes=f"0x{aio_hex}", static_bytes_range=0,
                 use_timestamp=True,
-                random_bytes=200, random_bytes_range=100,
-                random_ascii=100, random_ascii_range=100,
-                random_digits=10, random_digits_range=5,
+                random_bytes=0, random_bytes_range=0,
+                random_ascii=0, random_ascii_range=0,
+                random_digits=0, random_digits_range=0,
             )
         random_hex = secrets.token_hex(32)
         session_id_hex = hashlib.sha256(seed.encode()).hexdigest() if seed else secrets.token_hex(32)  # рев-25: эхо session_id (RFC 5246): обе стороны — от seed → сервер эхо-отражает клиента
         chosen_cipher = (random.Random(seed).choice([
-            "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
+            "1301", "1302", "1303", "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
         ]) if seed else secrets.choice([
-            "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
+            "1301", "1302", "1303", "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
         ]))
+        # TLS 1.3 ServerHello обязан нести supported_versions=0x0304 и key_share
+        # (RFC 8446 §4.1.3/4.2.8) — без них ServerHello невалиден.
+        sh_ext = ("002b00020304"                              # supported_versions: TLS 1.3
+                  "0033" + "0024" + "001d" + "0020" + secrets.token_hex(32))  # key_share x25519
         sh_body = (f"0303{random_hex}20{session_id_hex}"
                    f"{chosen_cipher}"
-                   f"00")
+                   f"00"
+                   f"{len(sh_ext)//2:04x}{sh_ext}")
         sh_len = len(sh_body) // 2
         sh_hex = f"02{sh_len:06x}{sh_body}"
         crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(sh_hex) // 2) + sh_hex
@@ -9444,16 +9458,10 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
             crypto_hex, default_range=40, is_server=True,
             pad_target=1200 if try_AESGCM is not None else 0)
 
-        if try_AESGCM is not None:
-            rb, rbr, ra, rar, rd, rdr = 200, 100, 100, 100, 10, 5
-        else:
-            rb, rbr, ra, rar, rd, rdr = 300, 200, 300, 200, 20, 10
+        # Хвост не добавляем — см. _gen_quic_client (MTU 1500).
         return generate_cps_packet(
             static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
             use_timestamp=True,
-            random_bytes=rb, random_bytes_range=rbr,
-            random_ascii=ra, random_ascii_range=rar,
-            random_digits=rd, random_digits_range=rdr,
         )
 
     def _gen_quic_server_handshake():
@@ -9463,23 +9471,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         (нужны приватные ключи) — payload для него непрозрачен. Поэтому достаточно
         реалистичной ДЛИНЫ: серверный flight с сертификатом ~1000+ байт.
         """
-        payload = secrets.token_hex(1000)  # фрагмент flight с сертификатом
-        dcid_hex = secrets.token_hex(8)
-        scid_hex = secrets.token_hex(8)
-        body_len = 1 + len(payload)//2  # PN(1) + payload
-        handshake_hex = (f"e000000001"
-                         f"08{dcid_hex}"
-                         f"08{scid_hex}"
-                         f"{_quic_varint(body_len)}"
-                         f"00"
-                         f"{payload}")
-        return generate_cps_packet(
-            static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
-            use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=150, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
-        )
+        return _quic_handshake_packet(secrets.token_hex(1000), 150)  # фрагмент flight с сертификатом
 
     def _gen_quic_appdata():
         """QUIC 1-RTT (application data) — короткий заголовок.
@@ -9550,13 +9542,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         pad = (4 - (len(ufrag) % 4)) % 4                   # STUN: атрибуты кратны 4 байтам
         username = "0006" + f"{len(ufrag):04x}" + ufrag.encode().hex() + "00" * pad
         msg = _stun_build("0001", priority + ice_ctrl + username, mi_key=_stun_mi_key())
-        return generate_cps_packet(
-            static_bytes=f"0x{msg}", static_bytes_range=0,
-            use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
-        )
+        return _cps_with_std_tail(msg)
 
     def _gen_stun_server():
         """STUN Binding Success Response (XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY)."""
@@ -9575,13 +9561,7 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         xma = "0020" + "0008" + "0001" + f"{xport:04x}" + f"{xaddr:08x}"
         # MESSAGE-INTEGRITY (0x0008): настоящий HMAC-SHA1(20) от ключа из seed.
         msg = _stun_build("0101", xma, mi_key=_stun_mi_key())
-        return generate_cps_packet(
-            static_bytes=f"0x{msg}", static_bytes_range=0,
-            use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
-        )
+        return _cps_with_std_tail(msg)
 
     # ─── DTLS 1.2 имитация (WebRTC) ─────────────────────────────
     def _dtls_suites():
@@ -9632,15 +9612,19 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
         body_len = len(body_hex) // 2
         return f"{msg_type:02x}{body_len:06x}{msg_seq:04x}000000{body_len:06x}{body_hex}"
 
-    def _dtls_packet(record_hex: str) -> str:
-        """Обёртка CPS-пакета для DTLS record."""
+    def _cps_with_std_tail(msg_hex: str) -> str:
+        """CPS-пакет: статичное сообщение протокола + стандартный хвост
+        `<t><r 200..300><rc 100..200><rd 10..15>` (одинаков у STUN и DTLS)."""
         return generate_cps_packet(
-            static_bytes=f"0x{record_hex}", static_bytes_range=0,
+            static_bytes=f"0x{msg_hex}", static_bytes_range=0,
             use_timestamp=True,
             random_bytes=200, random_bytes_range=100,
             random_ascii=100, random_ascii_range=100,
             random_digits=10, random_digits_range=5,
         )
+
+    # Историческое имя для DTLS-вызовов (14 мест): тот же хвост, доменное название.
+    _dtls_packet = _cps_with_std_tail
 
     _dtls_pion_cache = None
 
@@ -10316,6 +10300,21 @@ def atomic_write_text(path: pathlib.Path, text: str, encoding: str = "utf-8") ->
                 os.remove(tmpname)
         except Exception:
             pass
+
+
+def _chmod_owner_only(path: pathlib.Path, what: str = "файл") -> None:
+    """Права 600 на файл/архив с приватными ключами.
+
+    При неудаче НЕ молчим: раньше здесь стоял `except OSError: pass`, и сбой
+    chmod оставлял PrivateKey/PSK читаемыми для всех — теперь пишем предупреждение
+    (поток управления не меняется, файл уже создан).
+    """
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError as e:
+        logger.warning("⚠  Не удалось выставить права 600 на %s: %s "
+                       "(%s содержит приватные ключи — проверьте права вручную)",
+                       pathlib.Path(path).name, e, what)
 
 
 def _atomic_rmw(path: pathlib.Path, make, attempts: int = 3) -> str:
@@ -12582,6 +12581,176 @@ def _get_server_params(server_conf_text: str, server_protocol: str) -> dict:
     }
 
 
+def _parse_awg_int_or_range(value) -> tuple[int, int] | None:
+    """'12' → (12, 12); '12-19' → (12, 19); мусор/None → None."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not re.fullmatch(r'\d+(?:-\d+)?', s):
+        return None
+    if '-' in s:
+        lo, hi = s.split('-', 1)
+        return int(lo), int(hi)
+    return int(s), int(s)
+
+
+def _awg_flag_is_on(value) -> bool:
+    return str(value or '').strip().lower() in ('on', 'true', '1', 'yes')
+
+
+def validate_awg_params(params: dict, source: str = "") -> list[str]:
+    """Проверка AWG-параметров ДО применения ядром. Возвращает список проблем
+    строками: 'ОШИБКА ...' (ядро откажет или результат будет неверным) либо
+    'ПРЕДУПРЕЖДЕНИЕ ...' (работает, но не так, как выглядит).
+
+    Внутри — только инварианты, подтверждённые по исходникам модуля
+    3.1.20260812 и живыми замерами на стенде:
+      * S1-S4 хранятся как u16 (0..65535) и КАЖДОЕ обязано быть ≥ 12, если задан
+        HeaderProtectionKey — иначе ядро отвергает конфиг с -EINVAL
+        (netlink.c:810-850 и пост-проверка 953-974); nonce ChaCha20 берётся из
+        первых 12 байт S-префикса (header_protection.c:12);
+      * H1-H4 приходят по netlink как NLA_U64, но в ядре лежат u32_range_t →
+        значение > 0xFFFFFFFF молча усечётся и тип пакета перестанет совпадать;
+      * Jmin ≤ Jmax: ядро НЕ проверяет, а get_random_u32_inclusive(jmin, jmax)
+        при lo > hi даёт мусор (send.c:62-79);
+      * RejectAfterTime > 180 не влияет на отправку: data-путь берёт зашитые 180;
+      * различающиеся S1..S4 при включённом RandomTrailers — измерено ~30% потерь
+        на широких H (длинный data-пакет проверяется по смещениям S1/S2/S3).
+    """
+    problems: list[str] = []
+    where = f" ({source})" if source else ""
+    params = params or {}
+
+    hpk = str(params.get('HeaderProtectionKey') or '').strip()
+    if hpk:
+        try:
+            key_len = len(base64.b64decode(hpk, validate=True))
+        except Exception:
+            key_len = 0
+        if key_len != 32:
+            problems.append(
+                f"ОШИБКА{where}: HeaderProtectionKey должен быть 32 байта в base64 "
+                f"(декодируется {key_len})")
+
+    s_values = {}
+    for name in ('S1', 'S2', 'S3', 'S4'):
+        raw = params.get(name)
+        if raw is None:
+            continue
+        rng = _parse_awg_int_or_range(raw)
+        if rng is None or rng[0] != rng[1]:
+            problems.append(f"ОШИБКА{where}: {name} = {raw!r} — нужно одно число 0..65535")
+            continue
+        val = rng[0]
+        s_values[name] = val
+        if not 0 <= val <= 65535:
+            problems.append(f"ОШИБКА{where}: {name} = {val} вне 0..65535 (ядро хранит u16)")
+        elif hpk and val < 12:
+            problems.append(
+                f"ОШИБКА{where}: {name} = {val} < 12 при заданном HeaderProtectionKey — "
+                f"ядро отвергнет конфиг (Invalid argument)")
+    if hpk and len(set(s_values.values())) > 1 and _awg_flag_is_on(params.get('RandomTrailers')):
+        problems.append(
+            f"ПРЕДУПРЕЖДЕНИЕ{where}: S1..S4 разные {s_values} при RandomTrailers = on — "
+            f"измерено ~30% потерь (нужны одинаковые значения)")
+
+    h_ranges = []
+    for name in ('H1', 'H2', 'H3', 'H4'):
+        raw = params.get(name)
+        if raw is None:
+            continue
+        rng = _parse_awg_int_or_range(raw)
+        if rng is None:
+            problems.append(f"ОШИБКА{where}: {name} = {raw!r} — нужно число или диапазон lo-hi")
+            continue
+        lo, hi = rng
+        h_ranges.append((name, lo, hi))
+        if lo > hi:
+            problems.append(f"ОШИБКА{where}: {name} = {raw!r} — начало больше конца")
+        elif hi > 0xFFFFFFFF:
+            problems.append(
+                f"ОШИБКА{where}: {name} = {raw!r} выходит за u32 — ядро молча усечёт "
+                f"значение и тип пакета перестанет совпадать")
+    for i in range(len(h_ranges)):
+        for j in range(i + 1, len(h_ranges)):
+            n1, lo1, hi1 = h_ranges[i]
+            n2, lo2, hi2 = h_ranges[j]
+            if lo1 <= hi2 and lo2 <= hi1:
+                problems.append(
+                    f"ПРЕДУПРЕЖДЕНИЕ{where}: диапазоны {n1} и {n2} пересекаются — "
+                    f"тип пакета определяется неоднозначно")
+
+    j_min = j_max = None
+    for name in ('Jc', 'Jmin', 'Jmax'):
+        raw = params.get(name)
+        if raw is None:
+            continue
+        rng = _parse_awg_int_or_range(raw)
+        if rng is None or rng[0] != rng[1]:
+            problems.append(f"ОШИБКА{where}: {name} = {raw!r} — нужно одно число 0..65535")
+            continue
+        if not 0 <= rng[0] <= 65535:
+            problems.append(f"ОШИБКА{where}: {name} = {rng[0]} вне 0..65535")
+        if name == 'Jmin':
+            j_min = rng[0]
+        elif name == 'Jmax':
+            j_max = rng[0]
+    if j_min is not None and j_max is not None and j_min > j_max:
+        problems.append(
+            f"ОШИБКА{where}: Jmin = {j_min} > Jmax = {j_max} — ядро не проверяет это, "
+            f"а случайный размер мусорного пакета станет мусором")
+
+    for name in ('RekeyAfterTime', 'RekeyTimeout', 'RejectAfterTime',
+                 'KeepaliveTimeout', 'MaxHandshakeAttempts', 'ContentPaddingAddition'):
+        raw = params.get(name)
+        if raw is None:
+            continue
+        rng = _parse_awg_int_or_range(raw)
+        if rng is None:
+            problems.append(f"ОШИБКА{where}: {name} = {raw!r} — нужно число или диапазон lo-hi")
+            continue
+        lo, hi = rng
+        if lo > hi:
+            problems.append(f"ОШИБКА{where}: {name} = {raw!r} — начало больше конца")
+        elif hi > 65535:
+            problems.append(f"ОШИБКА{where}: {name} = {raw!r} вне 0..65535 (ядро хранит u16)")
+
+    rekey = _parse_awg_int_or_range(params.get('RekeyAfterTime'))
+    reject = _parse_awg_int_or_range(params.get('RejectAfterTime'))
+    if rekey and reject and reject[0] <= rekey[1]:
+        problems.append(
+            f"ПРЕДУПРЕЖДЕНИЕ{where}: RejectAfterTime ({params.get('RejectAfterTime')}) не больше "
+            f"RekeyAfterTime ({params.get('RekeyAfterTime')}) — сессия может протухнуть до рекея")
+    # Про RejectAfterTime > 180 НЕ предупреждаем: наш генератор сам даёт 180..260
+    # (нужный запас на приёмной стороне), а на отправку значение не влияет — data-путь
+    # ядра берёт зашитые 180 с. Факт зафиксирован в data/HANDOFF_FULL.md §43.6.
+    # (Правка снималась и была откачена сохранением файла из редактора — возвращена.)
+
+    mtu = _parse_awg_int_or_range(params.get('MTU'))
+    if mtu and not (1280 <= mtu[0] <= 1440):
+        problems.append(
+            f"ПРЕДУПРЕЖДЕНИЕ{where}: MTU = {params.get('MTU')} вне 1280..1440 "
+            f"(при S4 до 19 безопасный максимум 1420-S4 для IPv6 и 1440-S4 для IPv4)")
+
+    return problems
+
+
+def _apply_awg_param_checks(params: dict, source: str, strict: bool = True) -> list[str]:
+    """Логирует проблемы из validate_awg_params; при strict и наличии ОШИБОК — исключение."""
+    problems = validate_awg_params(params, source)
+    errors = [p for p in problems if p.startswith('ОШИБКА')]
+    for p in problems:
+        if p.startswith('ОШИБКА'):
+            logger.error('❌ %s', p)
+        else:
+            logger.warning('⚠ %s', p)
+    if strict and errors:
+        raise RuntimeError(
+            f"Параметры AWG в источнике '{source}' несовместимы с ядром: "
+            + '; '.join(errors))
+    return problems
+
+
 def _fix_client_allowed_ips(client_allowed_ips: str, srv_addr: str) -> str:
     """
     Исправление маски клиента на маску подсети сервера.
@@ -12820,6 +12989,9 @@ def handle_makecfg(opt) -> None:
         # Обновление существующего: J, I, PersistentKeepalive
         logger.info('🔄 Конфиг %s уже существует — обновление Jc/Jmin/Jmax, I1-I5, PersistentKeepalive', g_main_config_fn)
         cfg = WGConfig(str(g_main_config_fn))
+        # Существующий конфиг мог быть отредактирован руками — проверяем AWG-параметры
+        # до правок, чтобы не «унаследовать» несовместимые с ядром значения.
+        _apply_awg_param_checks(cfg.iface, f"существующий конфиг {g_main_config_fn.name}")
         _cfg_stat = g_main_config_fn.stat()
 
         # Определяем версию протокола из существующего конфига
@@ -13237,8 +13409,9 @@ def handle_confgen(opt) -> set[str]:
     ensure_allowedips_config(g_allowedips_config_fn)
     try:
         server_addr = srv.get("Address", "")
-        # allowed_ips_dict: { "All": "0.0.0...", "DsYt": "1.1.1..." }
-        # qr_enabled_names: { "All", "Tg" }
+        # parse_allowedips_config отдаёт две структуры: словарь подсетей по имени
+        # (например "All" → "0.0.0.0/0", "DsYt" → "1.1.1.1/32") и множество имён,
+        # для которых включён QR.
         allowed_ips_dict, qr_enabled_names = parse_allowedips_config(
             g_allowedips_config_fn.read_text(encoding='utf-8'),
             server_addr
@@ -13313,6 +13486,10 @@ def handle_confgen(opt) -> set[str]:
 
     # Параметры сервера (S1, S2, S3, S4, H1-H4) одинаковы для всех клиентов — читаем один раз
     server_params = _get_server_params(g_main_config_fn.read_text(encoding='utf-8'), server_protocol)
+    # Проверяем их ДО генерации клиентов: если серверный конфиг правили руками и он
+    # несовместим с ядром (например S < 12 при HeaderProtectionKey), клиенты получат
+    # те же нерабочие значения, и туннель молча не поднимется.
+    _apply_awg_param_checks(server_params, f"серверный конфиг {g_main_config_fn.name}")
 
     for peer_name, peer in peers:
         if 'Name' not in peer or 'PrivateKey' not in peer:
@@ -13420,10 +13597,7 @@ def handle_confgen(opt) -> set[str]:
                     # частичный файл с PrivateKey при сбое).
                     atomic_write_text(conf_path, final_conf)
                     # Конфиг содержит PrivateKey/PSK клиента — только владелец
-                    try:
-                        os.chmod(str(conf_path), 0o600)
-                    except OSError:
-                        pass
+                    _chmod_owner_only(conf_path, "конфиг клиента")
                 except Exception as e:
                     logger.warning("⚠  Не удалось записать conf-файл %s: %s", conf_name, e)
                     continue
@@ -13654,10 +13828,7 @@ def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None,
                     logger.warning("⚠  Не удалось добавить %s в %s: %s", full_path, zip_filename, e)
 
     # Zip содержит приватные ключи — только владелец
-    try:
-        os.chmod(str(zip_filename), 0o600)
-    except OSError:
-        pass
+    _chmod_owner_only(zip_filename, "ZIP-архив")
 
 
 def zip_all(warp_configs: list[str] | None = None) -> None:
