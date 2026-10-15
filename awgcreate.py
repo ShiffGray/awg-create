@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime
 import glob
 import hashlib
@@ -29,6 +30,7 @@ import time
 import types
 import zipfile
 import zlib
+from functools import partial
 
 # ----------------- Сторонние библиотеки -----------------
 try:
@@ -272,7 +274,9 @@ def get_rules(ip_ver):
                     m = int(v.split('/')[0], 0) if v.startswith('0x') else int(v)
                     lines.append((line, m))
         return lines
-    except:
+    except Exception as _e:      # Рев-47: не глотаем молча — пустой
+        # BROADCAST_ADDR выключал весь broadcast-релей без следа в логе
+        print("CALC_ERR", _e, flush=True)
         return []
 
 def print_matching(rules, start, end, label_v4, label_v6):
@@ -638,7 +642,7 @@ is_flags_field() {
 
 # Получение информации о подсети (кол-во адресов + префикс)
 get_subnet_info() {
-    SUBNET_ARG="$1" python3 << PYEOF 2>/dev/null
+    SUBNET_ARG="$1" python3 <<'PYEOF' 2>/dev/null
 import ipaddress, os
 try:
     net = ipaddress.ip_network(os.environ.get('SUBNET_ARG', ''), strict=False)
@@ -655,7 +659,7 @@ list_subnet_ips() {
     local subnet="$1"
     local max_prefixlen_ipv4=8
     local max_prefixlen_ipv6=96
-    SUBNET_ARG="$subnet" MAX_V4="$max_prefixlen_ipv4" MAX_V6="$max_prefixlen_ipv6" python3 << PYEOF
+    SUBNET_ARG="$subnet" MAX_V4="$max_prefixlen_ipv4" MAX_V6="$max_prefixlen_ipv6" python3 <<'PYEOF'
 import ipaddress, os, sys
 try:
     subnet = os.environ.get('SUBNET_ARG', '')
@@ -693,7 +697,7 @@ PYEOF
 
 # Вычисление соотношений подсетей
 calc_subnet_ratios() {
-    SUBNETS_ARG="$1" python3 << PYEOF
+    SUBNETS_ARG="$1" python3 <<'PYEOF'
 import ipaddress, os, sys
 subnets = os.environ.get('SUBNETS_ARG', '').split(',')
 nets = []
@@ -726,7 +730,7 @@ PYEOF
 
 # Вычисление базового IP блока
 get_block_ip() {
-    SUBNET_ARG="$1" RATIO_ARG="$2" IDX_ARG="$3" python3 << PYEOF
+    SUBNET_ARG="$1" RATIO_ARG="$2" IDX_ARG="$3" python3 <<'PYEOF'
 import ipaddress, os
 subnet = os.environ.get('SUBNET_ARG', '')
 net = ipaddress.ip_network(subnet, strict=False)
@@ -1603,7 +1607,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   TUN_SAFE=$(safe_tun_name "$TUN")
 
   # Вычисляем MARK_BASE (так же как в up.sh)
-  MARK_BASE=$(calc_mark_base "$TUN")
+  # Рев-46: сначала выделенное значение (как в up/down) — иначе
+  # проверочный скрипт печатал метку, которой нет в правилах
+  MARK_BASE=$(cat "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" 2>/dev/null)
+  [ -z "$MARK_BASE" ] && MARK_BASE=$(calc_mark_base "$TUN")
 
   # Суффиксированные имена цепочек
   PF_CHAIN_NAT="PORT_FORWARD_NAT_${TUN_SAFE}"
@@ -2731,7 +2738,12 @@ parse_ddos_by_port() {
         if [[ "$_item" == *"-"* ]]; then
           # Диапазон: 8300-8400
           local _dstart="${_item%-*}" _dend="${_item#*-}"
-          [[ "$_target_port" =~ ^[0-9]+$ ]] && [ "$_target_port" -ge "$_dstart" ] && [ "$_target_port" -le "$_dend" ] && { _port_matched=true; break; }
+          # Рев-44: цель тоже может быть диапазоном ("8000-8010>8000-8010") —
+          # сравниваем ПЕРЕСЕЧЕНИЕ, иначе профиль молча не применялся и порт
+          # оставался под голым ACCEPT без hashlimit/connlimit.
+          local _tstart="${_target_port%%-*}" _tend="${_target_port##*-}"
+          [[ "$_tstart" =~ ^[0-9]+$ && "$_tend" =~ ^[0-9]+$ ]] && \
+            [ "$_tstart" -le "$_dend" ] && [ "$_tend" -ge "$_dstart" ] && { _port_matched=true; break; }
         else
           # Точное совпадение
           [ "$_item" = "$_target_port" ] && { _port_matched=true; break; }
@@ -2740,9 +2752,11 @@ parse_ddos_by_port() {
     elif [[ "$DDOS_PORT" == *"-"* ]]; then
       # DDOS-правило с диапазоном: target должен попадать в него
       local _dstart="${DDOS_PORT%-*}" _dend="${DDOS_PORT#*-}"
-      [[ "$_target_port" =~ ^[0-9]+$ ]] || continue
-      [ "$_target_port" -lt "$_dstart" ] && continue
-      [ "$_target_port" -gt "$_dend" ] && continue
+      # Рев-44: цель может быть диапазоном — проверяем пересечение
+      local _tstart="${_target_port%%-*}" _tend="${_target_port##*-}"
+      [[ "$_tstart" =~ ^[0-9]+$ && "$_tend" =~ ^[0-9]+$ ]] || continue
+      [ "$_tend" -lt "$_dstart" ] && continue
+      [ "$_tstart" -gt "$_dend" ] && continue
       _port_matched=true
     else
       [ "$DDOS_PORT" = "$_target_port" ] && _port_matched=true
@@ -3065,6 +3079,7 @@ if [ -n "$SCRIPT_DIR" ]; then
   if [ ! -f "$SYSCTL_ORIG" ]; then
     for _sf in net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter \
                net.ipv6.conf.all.rp_filter net.ipv6.conf.default.rp_filter \
+               net.ipv4.ip_forward net.ipv6.conf.all.forwarding \
                net.netfilter.nf_conntrack_acct; do
       printf '%s=%s\n' "$_sf" "$(sysctl -n "$_sf" 2>/dev/null || echo 1)" >> "$SYSCTL_ORIG"
     done
@@ -3141,7 +3156,7 @@ fi
 find_table_id() {
   local tname="$1"
   local tid
-  tid=$(awk -v name="$tname" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+  tid=$(name="$tname" awk '$2==ENVIRON["name"]{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
   if [ -n "$tid" ]; then
     echo "$tid"
     return
@@ -3186,7 +3201,14 @@ for entry in "${WARP_LIST[@]}"; do
   IFS=',' read -ra RAW_INTERFACES <<< "$interfaces_part"
   for iface in "${RAW_INTERFACES[@]}"; do
     iface="$(echo "$iface" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    if [ -n "$iface" ] && [ "$iface" != "none" ]; then
+    # Рев-44: тот же фильтр, что в down.sh — имя уходит в путь
+    # "$SCRIPT_DIR/${warp}.conf", поэтому точки/слэши/двоеточия запрещены
+    # (иначе WARP_LIST=("../../tmp/evil") заставил бы root поднять чужой конфиг).
+    # Рев-45: точка ДОПУСТИМА (имена WARP-конфигов — <tun>warp<i>, а tun_name
+    # может содержать точку); запрещаем то, что даёт обход пути: слэш,
+    # двоеточие, ведущая точка и «..».
+    if [ -n "$iface" ] && [ "$iface" != "none" ] && [[ "$iface" != *":"* ]] \
+       && [[ "$iface" != *"/"* ]] && [[ "$iface" != .* ]] && [[ "$iface" != *".."* ]]; then
       ALL_WARP_INTERFACES["$iface"]=1
     fi
   done
@@ -3259,12 +3281,16 @@ done
 # Выполняется ДО добавления WARP/IFACE-правил: раньше grep-очистка удаляла
 # только что созданные правила того же прохода up (баг 1.22). Имя туннеля
 # заякорено пробелом, чтобы не задеть чужие туннели (awg1 vs awg10; баг 1.2).
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА, не завязываясь на LOCAL_SUBNETS —
+# правила заякорены именем туннеля, повторный up не плодит дубли
+if [ -n "$TUN" ]; then
   while iptables -C FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null; do
     iptables -D FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
   done
 fi
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА, не завязываясь на LOCAL_SUBNETS —
+# правила заякорены именем туннеля, повторный up не плодит дубли
+if [ -n "$TUN" ]; then
   while ip6tables -C FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null; do
     ip6tables -D FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
   done
@@ -3274,11 +3300,11 @@ fi
 _TUN_RE="$(printf '%s' "$TUN" | sed 's/[][\.*^$+?()|{}]/\\&/g')"
 iptables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
-  iptables -D $_rule 2>/dev/null || true
+  ( set -f; iptables -D $_rule 2>/dev/null || true )
 done
 ip6tables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
-  ip6tables -D $_rule 2>/dev/null || true
+  ( set -f; ip6tables -D $_rule 2>/dev/null || true )
 done
 iptables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
@@ -3302,7 +3328,8 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
       if [ "$_tid" = "0" ]; then
         echo "Ошибка: не удалось найти свободный TABLE_ID для $warp" >&2
       else
-        grep -q "^$_tid[[:space:]]$warp$" /etc/iproute2/rt_tables || echo "$_tid $warp" >> /etc/iproute2/rt_tables
+        _warp_re="$(printf '%s' "$warp" | sed 's/[][\.*^$+?()|{}]/\\&/g')"
+  grep -q "^$_tid[[:space:]]${_warp_re}$" /etc/iproute2/rt_tables || echo "$_tid $warp" >> /etc/iproute2/rt_tables
         echo "$_tid"
       fi
     ) 9>>/etc/iproute2/rt_tables )
@@ -3557,7 +3584,15 @@ fi
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t filter -N "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
-  iptables -t filter -C INPUT -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -A INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-54: подвеска ТОЛЬКО на UDP-порт туннеля. Глобальная (`-A INPUT -j ...`) означала,
+  # что цепочка входит для ВСЕГО входящего трафика: правило без порт-условия внутри неё
+  # отфильтровало бы трафик сервера (вплоть до потери SSH). DDoS-правила порт-специфичны,
+  # поэтому привязка к порту сохраняет защиту полностью и убирает скрытую мину.
+  iptables -t filter -C INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -A INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-54: вторая подвеска — по интерфейсу туннеля, чтобы ICMP-ACCEPT для подсети VPN
+  # остался достижим (иначе он работает только при политике INPUT=ACCEPT). Трафик eth0,
+  # не относящийся к порту туннеля, в цепочку НЕ попадает — мина устранена.
+  iptables -t filter -C INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -A INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
 fi
 # Рев-38: цепочка для IPv6 создаётся ЗДЕСЬ — ДО применения DDoS. Раньше она
 # создавалась ниже (после DDoS-блока), поэтому `ip6tables -A "$INPUT_CHAIN" ...`
@@ -3567,7 +3602,10 @@ fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -t filter -N "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
-  ip6tables -t filter -C INPUT -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -A INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-54: то же для IPv6 — подвеска по UDP-порту туннеля (см. комментарий выше).
+  ip6tables -t filter -C INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -A INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-54: вторая подвеска по интерфейсу туннеля (см. комментарий для IPv4 выше).
+  ip6tables -t filter -C INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -A INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
 fi
 # --- DDoS защита основного порта ---
 # Рев-31: одно рукопожатие AmneziaWG — это ВЗРЫВ пакетов: Jc мусорных
@@ -3630,8 +3668,21 @@ fi
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
   iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-  atomic_ref_update "$MASQ_REF_FILE" "inc" >/dev/null 2>&1 || true
+  # Рев-44: правило общее для всех туннелей на этом интерфейсе, поэтому счётчик
+  # считает ТУННЕЛИ (маркер на туннель), а не факты добавления правила:
+  #   * повторный up того же туннеля не раздувает ref (раньше up+up+down оставлял
+  #     правило навсегда);
+  #   * второй туннель на том же интерфейсе счётчик увеличивает (иначе первый же
+  #     down снимал общее правило NAT у живого соседа — проверено на стенде).
+  # Имя внешнего интерфейса сохраняем в .data — down возьмёт его оттуда, если
+  # файл параметров уже удалён.
+  iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+  if [ ! -f "$STATE_BASE_DIR/masq_mark_${TUN_SAFE}" ]; then
+    : > "$STATE_BASE_DIR/masq_mark_${TUN_SAFE}" 2>/dev/null || true
+    atomic_ref_update "$MASQ_REF_FILE" "inc" >/dev/null 2>&1 || true
+  fi
+  printf '%s' "$IFACE" > "$STATE_BASE_DIR/masq_iface_${TUN_SAFE}" 2>/dev/null || true
 fi
 
 # IPv6 правила (С NAT!)
@@ -3648,8 +3699,14 @@ fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
   ip6tables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  ip6tables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-  atomic_ref_update "$MASQ6_REF_FILE" "inc" >/dev/null 2>&1 || true
+  # Рев-44: то же для IPv6 — маркер на туннель (см. IPv4-блок выше).
+  ip6tables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
+    ip6tables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+  if [ ! -f "$STATE_BASE_DIR/masq6_mark_${TUN_SAFE}" ]; then
+    : > "$STATE_BASE_DIR/masq6_mark_${TUN_SAFE}" 2>/dev/null || true
+    atomic_ref_update "$MASQ6_REF_FILE" "inc" >/dev/null 2>&1 || true
+  fi
+  printf '%s' "$IFACE" > "$STATE_BASE_DIR/masq_iface_${TUN_SAFE}" 2>/dev/null || true
 fi
 
 # --- Hairpin NAT ---
@@ -3657,9 +3714,15 @@ fi
 # Создаём цепочку в ОБЕИХ таблицах (iptables и ip6tables)
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t nat -N "$HAIRPIN_CHAIN" 2>/dev/null || true
+  # Рев-44: как у PF/INPUT-цепочек — флашим при создании, иначе
+  # повторный up накапливает дубли RETURN (down сносит цепочку целиком).
+  iptables -t nat -F "$HAIRPIN_CHAIN" 2>/dev/null || true
 fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -t nat -N "$HAIRPIN_CHAIN" 2>/dev/null || true
+  # Рев-44: как у PF/INPUT-цепочек — флашим при создании, иначе
+  # повторный up накапливает дубли RETURN (down сносит цепочку целиком).
+  ip6tables -t nat -F "$HAIRPIN_CHAIN" 2>/dev/null || true
 fi
 
 # IPv4 Hairpin NAT
@@ -3985,7 +4048,7 @@ cp "$PARAMS_FILE" "$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh" 2>/dev/null || true
   echo ""
   echo "INTERFACE_MAP=("
   for item in "${INTERFACE_MAP_UNIQUE[@]}"; do
-    echo "  \"$item\""
+    printf '  %q\n' "$item"
   done
   echo ")"
 } >> "$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh" 2>/dev/null || true
@@ -4170,14 +4233,22 @@ fi
 # для процессов без pid-файла (якорный конец строки cmdline).
 _bc_pid="$(cat "$STATE_BASE_DIR/bc_relay_${TUN_SAFE}.pid" 2>/dev/null)"
 if [ -n "$_bc_pid" ]; then
-  kill "$_bc_pid" 2>/dev/null || true
+  # Рев-47: убиваем только если это ДЕЙСТВИТЕЛЬНО наш bc_relay — pid мог
+  # быть переиспользован другим процессом
+  if [ -r "/proc/$_bc_pid/cmdline" ] && tr '\0' ' ' < "/proc/$_bc_pid/cmdline" | grep -q 'bc_relay'; then
+    kill "$_bc_pid" 2>/dev/null || true
+  fi
   rm -f "$STATE_BASE_DIR/bc_relay_${TUN_SAFE}.pid" 2>/dev/null || true
 fi
 pkill -f "bc_relay_${TUN_SAFE}\.py$" 2>/dev/null || true
 if [ -n "$BC_RELAY_GROUPS" ]; then
   BC_RELAY_MARK=$((MARK_BASE + 9000))
-  iptables -t nat -I "$HAIRPIN_CHAIN" 1 -m mark --mark $BC_RELAY_MARK -j RETURN 2>/dev/null || true
-  ip6tables -t nat -I "$HAIRPIN_CHAIN" 1 -m mark --mark $BC_RELAY_MARK -j RETURN 2>/dev/null || true
+  # Рев-44: гвард -C, иначе каждый up добавлял ещё один RETURN
+  iptables -t nat -C "$HAIRPIN_CHAIN" -m mark --mark $BC_RELAY_MARK -j RETURN 2>/dev/null || \
+    iptables -t nat -I "$HAIRPIN_CHAIN" 1 -m mark --mark $BC_RELAY_MARK -j RETURN 2>/dev/null || true
+  # Рев-44: гвард -C, иначе каждый up добавлял ещё один RETURN
+  ip6tables -t nat -C "$HAIRPIN_CHAIN" -m mark --mark $BC_RELAY_MARK -j RETURN 2>/dev/null || \
+    ip6tables -t nat -I "$HAIRPIN_CHAIN" 1 -m mark --mark $BC_RELAY_MARK -j RETURN 2>/dev/null || true
   mkdir -p "$SCRIPT_DIR/.data"
   cat > "$SCRIPT_DIR/.data/bc_relay_${TUN_SAFE}.py" <<'PYEOF'
 #!/usr/bin/env python3
@@ -4212,15 +4283,38 @@ BROADCAST4 = os.environ.get("BC_RELAY_BC4", "255.255.255.255")
 BROADCAST6 = os.environ.get("BC_RELAY_BC6", "ff02::1")
 HAS4 = any(g[0] for g in GROUPS)
 HAS6 = any(g[2] for g in GROUPS)
-print("RELAY_V2_STARTED", IFACE, "v4" if HAS4 else "", "v6" if HAS6 else "", flush=True)
+# Рев-45: маркер печатается в main() ПОСЛЕ успешного bind (см. ниже), иначе
+# упавший на bind процесс выглядел запущенным для bash-проверки живости.
+RELAY_START_BANNER = ("RELAY_V2_STARTED", IFACE, "v4" if HAS4 else "", "v6" if HAS6 else "")
 
 BLOCKED4 = {ipaddress.ip_address("255.255.255.255"), ipaddress.ip_address(BROADCAST4) if BROADCAST4 else None}
 BLOCKED6 = {ipaddress.ip_address("ff02::1"), ipaddress.ip_address(BROADCAST6) if ":" in BROADCAST6 else None}
 BLOCKED4.discard(None)
 BLOCKED6.discard(None)
+# Рев-45: multicast тоже реплицируем — раньше «Broadcast/Multicast» работал
+# только для 255.255.255.255 / broadcast подсети и ff02::1, а mDNS (224.0.0.251)
+# и SSDP (239.255.255.250) не проходили вовсе.
+MCAST4 = ipaddress.ip_network("224.0.0.0/4")
+MCAST6 = ipaddress.ip_network("ff00::/8")
 
 
-def send4(src_s, dport, payload, members):
+_LOG_N = {"n": 0}
+
+
+def _log(*parts):
+    """Лог по счётчику: печатаем первое событие и далее каждое 200-е.
+
+    Рев-45: раньше на КАЖДЫЙ пакет писалась строка с flush=True — на шумном
+    сегменте это десятки-сотни МБ в сутки и лишний syscall в горячем пути.
+    """
+    _LOG_N["n"] += 1
+    if _LOG_N["n"] % 200 == 1:
+        print(*parts, flush=True)
+
+
+def send4(src_s, sport, dport, payload, members):
+    # Рев-45: сохраняем ПОРТ ИСТОЧНИКА — иначе копия уходила с эфемерного порта, и
+    # request/response-discovery (ответ приходит на порт инициатора) не работал.
     for m in members:
         if m == src_s:
             continue  # не эхом инициатору его же broadcast (фикс аудита)
@@ -4228,16 +4322,20 @@ def send4(src_s, dport, payload, members):
         try:
             s.setsockopt(socket.SOL_IP, socket.IP_TRANSPARENT, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, RELAY_MARK)
-            s.bind((src_s, 0))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((src_s, sport))
+            except OSError:
+                s.bind((src_s, 0))          # порт занят — отдаём ядру выбор
             s.sendto(payload, (m, dport))
-            print("TX4", src_s, "->", m, dport, flush=True)
+            _log("TX4", src_s, sport, "->", m, dport)
         except OSError as _e:
-            print("TX4", src_s, "->", m, dport, "ERR", _e, flush=True)
+            _log("TX4ERR", src_s, sport, "->", m, dport, "ERR", _e)
         finally:
             s.close()
 
 
-def send6(src_s, dport, payload, members):
+def send6(src_s, sport, dport, payload, members):
     for m in members:
         if m == src_s:
             continue  # не эхом инициатору (фикс аудита)
@@ -4245,11 +4343,15 @@ def send6(src_s, dport, payload, members):
         try:
             s.setsockopt(socket.SOL_IPV6, socket.IPV6_TRANSPARENT, 1)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_MARK, RELAY_MARK)
-            s.bind((src_s, 0))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((src_s, sport))
+            except OSError:
+                s.bind((src_s, 0))
             s.sendto(payload, (m, dport))
-            print("TX6", src_s, "->", m, dport, flush=True)
+            _log("TX6", src_s, sport, "->", m, dport)
         except OSError as _e:
-            print("TX6", src_s, "->", m, dport, "ERR", _e, flush=True)
+            _log("TX6ERR", src_s, sport, "->", m, dport, "ERR", _e)
         finally:
             s.close()
 
@@ -4258,16 +4360,41 @@ def main():
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     signal.signal(signal.SIGINT, lambda *a: sys.exit(0))
     pkt = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+    # Рев-47: не разбираем СВОИ ЖЕ исходящие пакеты (иначе в Python попадают
+    # и отправленные копии) — экономия CPU в горячем пути демона.
+    try:
+        # PACKET_IGNORE_OUTGOING = 23; SOL_PACKET (263 в Linux) есть не во всех
+        # сборках Python — getattr + перехват AttributeError (рев-48: без этого
+        # релей падал при старте, и broadcast/multicast молча не работали).
+        pkt.setsockopt(getattr(socket, "SOL_PACKET", 263), 23, 1)
+    except (OSError, AttributeError):
+        pass
     try:
         pkt.bind((IFACE, 0))
     except OSError as _e:
         print("BIND_ERR", _e, flush=True)
         sys.exit(1)  # фикс аудита-C3: раньше «молчаливый успех» с exit 0
+    # Рев-45: только теперь сообщаем о запуске
+    print(*RELAY_START_BANNER, flush=True)
+    # Рев-47: таймаут ставим ОДИН раз — раньше settimeout вызывался на каждый
+    # пакет (лишний syscall в горячем пути).
+    pkt.settimeout(0.4)
     while True:
         try:
-            pkt.settimeout(0.4)
             frame, _a = pkt.recvfrom(65535)
-        except (socket.timeout, OSError):
+            _err_n = 0
+        except socket.timeout:
+            continue
+        except OSError as _e:
+            # Рев-45: ошибка сокета (ENETDOWN при `ip link set <tun> down`,
+            # ENODEV при удалении интерфейса) — НЕ таймаут. Раньше она молча
+            # съедалась: relay числился живым по pid-файлу, но не реплицировал
+            # (и мог крутиться в hot-spin). Логируем и выходим после 3 подряд.
+            _err_n = globals().get("_err_n", 0) + 1
+            if _err_n >= 3:
+                print("SOCK_ERR", _e, flush=True)
+                sys.exit(1)
+            time.sleep(0.5)
             continue
         if len(frame) < 20:
             continue
@@ -4282,20 +4409,54 @@ def main():
                     dst_ip = ipaddress.ip_address(dst_s)
                 except ValueError:
                     continue
-                if dst_ip not in BLOCKED4:
+                if dst_ip not in BLOCKED4 and dst_ip not in MCAST4:
                     continue
+                # Рев-45: фрагменты пропускаем ЯВНО (UDP-сокетом фрагмент
+                # корректно не передать), а длину берём из IP-заголовка: раньше
+                # проверка по ulen (длине ВСЕЙ датаграммы) отбрасывала первый
+                # фрагмент всегда, а остальные парсились как мусор.
+                _frag = struct.unpack("!H", frame[6:8])[0]
+                if (_frag & 0x1FFF) or (_frag & 0x2000):
+                    continue
+                _iplen = struct.unpack("!H", frame[2:4])[0]
                 ulen = struct.unpack("!H", frame[ihl + 4:ihl + 6])[0]
-                if ulen < 8 or ihl + ulen > len(frame):
+                if ulen < 8 or ihl + 8 > len(frame):
                     continue
+                # Рев-45: порт источника — копия обязана уйти С НЕГО ЖЕ,
+                # иначе ответы discovery-протоколов уходят в никуда.
+                sport = struct.unpack("!H", frame[ihl:ihl + 2])[0]
                 dport = struct.unpack("!H", frame[ihl + 2:ihl + 4])[0]
-                payload = frame[ihl + 8:ihl + ulen]
+                payload = frame[ihl + 8:min(len(frame), ihl + min(ulen, max(_iplen - ihl, 8)))]
                 for m4, s4, _m6, _s6 in GROUPS:
                     if any(ipaddress.ip_address(src_s) in n for n in s4):
-                        print("RX4", src_s, dst_s, dport, flush=True)
-                        send4(src_s, dport, payload, m4)
-                        break
+                        _log("RX4", src_s, sport, dst_s, dport)
+                        send4(src_s, sport, dport, payload, m4)
+                        # Рев-47: НЕ прерываемся — при перекрывающихся LAN-группах
+                        # участники последующих групп тоже должны получить копию
+                        pass
             elif frame[0] >> 4 == 6:
-                if frame[6] != 17:
+                # Рев-45: обходим цепочку заголовков расширения (Hop-by-Hop 0,
+                # Routing 43, Fragment 44, AH 51, DestOpts 60) до UDP — иначе вся
+                # фрагментированная IPv6-UDP и MLD (с Hop-by-Hop) отбрасывались.
+                _nh = frame[6]
+                _off = 40
+                _fragmented = False
+                while _nh in (0, 43, 44, 51, 60):
+                    if _off + 8 > len(frame):
+                        _fragmented = True
+                        break
+                    if _nh == 44:
+                        _fr = struct.unpack("!H", frame[_off + 2:_off + 4])[0]
+                        if (_fr & 0xFFF8) or (_fr & 0x1):
+                            _fragmented = True   # не первый фрагмент — пропускаем
+                            break
+                    _hlen = (frame[_off + 1] + 1) * 8
+                    if _hlen < 8 or _off + _hlen > len(frame):
+                        _fragmented = True
+                        break
+                    _nh = frame[_off]
+                    _off += _hlen
+                if _fragmented or _nh != 17 or _off + 8 > len(frame):
                     continue
                 src_s = socket.inet_ntop(socket.AF_INET6, frame[8:24])
                 dst_s = socket.inet_ntop(socket.AF_INET6, frame[24:40])
@@ -4303,18 +4464,21 @@ def main():
                     dst_ip = ipaddress.ip_address(dst_s)
                 except ValueError:
                     continue
-                if dst_ip not in BLOCKED6:
+                if dst_ip not in BLOCKED6 and dst_ip not in MCAST6:
                     continue
-                ulen = struct.unpack("!H", frame[4:6])[0]
-                if ulen < 8 or 40 + ulen > len(frame):
+                ulen = struct.unpack("!H", frame[_off + 4:_off + 6])[0]
+                if ulen < 8 or _off + 8 > len(frame):
                     continue
-                dport = struct.unpack("!H", frame[42:44])[0]
-                payload = frame[48:40 + ulen]
+                sport = struct.unpack("!H", frame[_off:_off + 2])[0]
+                dport = struct.unpack("!H", frame[_off + 2:_off + 4])[0]
+                payload = frame[_off + 8:min(len(frame), _off + ulen)]
                 for _m4, _s4, m6, s6 in GROUPS:
                     if any(ipaddress.ip_address(src_s) in n for n in s6):
-                        print("RX6", src_s, dst_s, dport, flush=True)
+                        _log("RX6", src_s, sport, dst_s, dport)
                         send6(src_s, dport, payload, m6)
-                        break
+                        # Рев-47: НЕ прерываемся — при перекрывающихся LAN-группах
+                        # участники последующих групп тоже должны получить копию
+                        pass
         except Exception:
             continue
 
@@ -4672,12 +4836,16 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           INT_PORT=$((PF_PORT_INT_START + i))
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
+              # Рев-46: гвард -C — повторный up не плодит дубли правил
+              $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT" 2>/dev/null || \
+                $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
               # ВАЖНО: Добавляем префикс ipv4:/ipv6 для уникальности между протоколами
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${EXT_PORT}:${INT_PORT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-$IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
+# Рев-46: гвард -C — повторный up не плодит дубли правил
+$IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+  $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$EXT_PORT" "$INT_PORT" "$ALLOWED_SUBNET"
@@ -4685,11 +4853,15 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             done
           else
             # доступ всем — без -s / -d
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
+            # Рев-46: гвард -C — повторный up не плодит дубли правил
+            $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT" 2>/dev/null || \
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${EXT_PORT}:${INT_PORT}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
+              # Рев-46: гвард -C — повторный up не плодит дубли правил
+              $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$EXT_PORT" "$INT_PORT" ""
@@ -4716,21 +4888,29 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
         for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+              # Рев-46: гвард -C — повторный up не плодит дубли правил
+              $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT" 2>/dev/null || \
+                $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (используем внутренний порт!)
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PORT_INT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
+                # Рев-46: гвард -C — повторный up не плодит дубли правил
+                $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+                  $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PORT_NUM" "$PF_PORT_INT" "$ALLOWED_SUBNET"
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+            # Рев-46: гвард -C — повторный up не плодит дубли правил
+            $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT" 2>/dev/null || \
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PORT_INT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
+                # Рев-46: гвард -C — повторный up не плодит дубли правил
+                $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+                  $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PORT_NUM" "$PF_PORT_INT" ""
@@ -4757,21 +4937,29 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
         for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+              # Рев-46: гвард -C — повторный up не плодит дубли правил
+              $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM" 2>/dev/null || \
+                $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PORT_NUM}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
+                # Рев-46: гвард -C — повторный up не плодит дубли правил
+                $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+                  $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PORT_NUM" "$ALLOWED_SUBNET"
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+            # Рев-46: гвард -C — повторный up не плодит дубли правил
+            $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM" 2>/dev/null || \
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PORT_NUM}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
+              # Рев-46: гвард -C — повторный up не плодит дубли правил
+              $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PORT_NUM" ""
@@ -4794,21 +4982,29 @@ $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
     # 4. Оба не диапазоны (single-port)
     if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
           for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+            # Рев-46: гвард -C — повторный up не плодит дубли правил
+            $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT" 2>/dev/null || \
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:PF_PORT_INT:PROTO
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PF_PORT_INT}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
+              # Рев-46: гвард -C — повторный up не плодит дубли правил
+              $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PF_PORT_INT" "$ALLOWED_SUBNET"
             $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
           done
         else
-          $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+          # Рев-46: гвард -C — повторный up не плодит дубли правил
+          $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT" 2>/dev/null || \
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
           snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PF_PORT_INT}:${PF_PROTO}"
           if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-            $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
+            # Рев-46: гвард -C — повторный up не плодит дубли правил
+            $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
+              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
             GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
           fi
           pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PF_PORT_INT" ""
@@ -4883,7 +5079,7 @@ fi
 for _qc in $(iptables-save 2>/dev/null | grep -oE "QUOTA_${TUN_SAFE}_[A-Za-z0-9_]+_(SRC|DST)" | sort -u); do
   iptables-save 2>/dev/null | grep -- "-j $_qc" | while read -r _line; do
     _rule="${_line#-A }"
-    iptables -D $_rule 2>/dev/null || true
+    ( set -f; iptables -D $_rule 2>/dev/null || true )
   done
   iptables -F "$_qc" 2>/dev/null || true
   iptables -X "$_qc" 2>/dev/null || true
@@ -4891,7 +5087,7 @@ done
 for _qc in $(ip6tables-save 2>/dev/null | grep -oE "QUOTA_${TUN_SAFE}_[A-Za-z0-9_]+_(SRC|DST)" | sort -u); do
   ip6tables-save 2>/dev/null | grep -- "-j $_qc" | while read -r _line; do
     _rule="${_line#-A }"
-    ip6tables -D $_rule 2>/dev/null || true
+    ( set -f; ip6tables -D $_rule 2>/dev/null || true )
   done
   ip6tables -F "$_qc" 2>/dev/null || true
   ip6tables -X "$_qc" 2>/dev/null || true
@@ -5072,11 +5268,11 @@ if [ "${#TRAFFIC_QUOTAS[@]}" -gt 0 ]; then
     local _qc="$1"
     iptables-save 2>/dev/null | grep -- "-j $_qc" | while read -r _line; do
       _rule="${_line#-A }"
-      iptables -D $_rule 2>/dev/null || true
+      ( set -f; iptables -D $_rule 2>/dev/null || true )
     done
     ip6tables-save 2>/dev/null | grep -- "-j $_qc" | while read -r _line; do
       _rule="${_line#-A }"
-      ip6tables -D $_rule 2>/dev/null || true
+      ( set -f; ip6tables -D $_rule 2>/dev/null || true )
     done
   }
 
@@ -5150,7 +5346,15 @@ if [ "${#TRAFFIC_QUOTAS[@]}" -gt 0 ]; then
         *)   [ -n "$_Q4" ] && _Q4="$_Q4,"; _Q4="$_Q4$_qa" ;;
       esac
     done
-    _qsafe="$(printf '%s' "${_qname:-client}" | tr -c 'A-Za-z0-9_.-' '_')"
+    # Рев-45: у [Peer] без комментария #_Name имя пустое — все «безымянные»
+    # клиенты получали ОДИН набор/цепочки (второй делал ipset flush первого):
+    # один не учитывался и не блокировался (обход квоты), другой получал чужой
+    # расход. Строим стабильное имя из адресных блоков клиента.
+    if [ -z "$_qname" ]; then
+      _qname="peer_$(printf '%s' "${_q4blk:-none}${_q6blk:-none}" | cksum | cut -d' ' -f1)"
+      echo "⚠  [Peer] без #_Name: квота учитывается как $_qname" >&2
+    fi
+    _qsafe="$(printf '%s' "$_qname" | tr -c 'A-Za-z0-9_.-' '_')"
     _qnamelen=${#TUN_SAFE}
     _qmax=$(( 22 - _qnamelen ))  # Q_ + TUN + _ + X + _V4 <= 31 (лимит имени ipset)
     [ "$_qmax" -lt 6 ] && _qmax=6
@@ -5190,15 +5394,23 @@ if [ "${#TRAFFIC_QUOTAS[@]}" -gt 0 ]; then
     _qset4=""; _qset6=""
     if [ "$_qany" = "1" ] && [ "$_qv4" = "1" ] && [ -n "$_Q4" ]; then
       _qset4="Q_${TUN_SAFE}_${_qsafe}_V4"
-      ipset create "$_qset4" hash:net family inet 2>/dev/null || ipset flush "$_qset4" 2>/dev/null || true
-      for _qa in $(echo "$_Q4" | tr ',' ' '); do ipset add "$_qset4" "$_qa" 2>/dev/null || true; done
+      # Рев-45: проверяем результат — иначе сбой ipset/xt_set оставался
+# невидимым («квоты включены», а учёт не работает).
+if ! ipset create "$_qset4" hash:net family inet 2>/dev/null; then
+  ipset flush "$_qset4" 2>/dev/null || echo "⚠  ipset: не удалось создать/очистить $_qset4" >&2
+fi
+      IFS=',' read -ra _qa_arr <<< "$_Q4"; for _qa in "${_qa_arr[@]}"; do _qa="${_qa// /}"; [ -n "$_qa" ] && ipset add "$_qset4" "$_qa" 2>/dev/null || true; done
       _QSETS="$_QSETS $_qset4"
       CL_BLOCK4["$_qset4"]="$_Q4"
     fi
     if [ "$_qany" = "1" ] && [ "$_qv6" = "1" ] && [ -n "$_Q6" ]; then
       _qset6="Q_${TUN_SAFE}_${_qsafe}_V6"
-      ipset create "$_qset6" hash:net family inet6 2>/dev/null || ipset flush "$_qset6" 2>/dev/null || true
-      for _qa in $(echo "$_Q6" | tr ',' ' '); do ipset add "$_qset6" "$_qa" 2>/dev/null || true; done
+      # Рев-45: проверяем результат — иначе сбой ipset/xt_set оставался
+# невидимым («квоты включены», а учёт не работает).
+if ! ipset create "$_qset6" hash:net family inet6 2>/dev/null; then
+  ipset flush "$_qset6" 2>/dev/null || echo "⚠  ipset: не удалось создать/очистить $_qset6" >&2
+fi
+      IFS=',' read -ra _qa_arr <<< "$_Q6"; for _qa in "${_qa_arr[@]}"; do _qa="${_qa// /}"; [ -n "$_qa" ] && ipset add "$_qset6" "$_qa" 2>/dev/null || true; done
       _QSETS="$_QSETS $_qset6"
       CL_BLOCK6["$_qset6"]="$_Q6"
     fi
@@ -5374,6 +5586,11 @@ if [ "${#TRAFFIC_QUOTAS[@]}" -gt 0 ]; then
 
   # Скрипт сброса периодов (вызывается cron'ом раз в час; аргумент — TUN_SAFE)
   cat > "$SCRIPT_DIR/.data/quota/quota_update_${TUN_SAFE}.sh" <<'QUOTASCRIPT'
+# Рев-45: cron запускает задачу с PATH=/usr/bin:/bin, а ipset/iptables/ip6tables
+# лежат в /usr/sbin, tc — в /sbin. Без этой строки ВСЕ команды квот молча не
+# находились (ошибки глушились), и клиент, исчерпавший квоту, оставался
+# заблокированным навсегда.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 #!/bin/bash
 # Сброс истёкших периодов квот трафика. Аргумент: TUN_SAFE.
 TUN_SAFE="$1"
@@ -5446,7 +5663,15 @@ while IFS='|' read -r _qname _qips; do
       *)   [ -n "$_Q4" ] && _Q4="$_Q4,"; _Q4="$_Q4$_qa" ;;
     esac
   done
-  _qsafe="$(printf '%s' "${_qname:-client}" | tr -c 'A-Za-z0-9_.-' '_')"
+  # Рев-45: у [Peer] без комментария #_Name имя пустое — все «безымянные»
+  # клиенты получали ОДИН набор/цепочки (второй делал ipset flush первого):
+  # один не учитывался и не блокировался (обход квоты), другой получал чужой
+  # расход. Строим стабильное имя из адресных блоков клиента.
+  if [ -z "$_qname" ]; then
+    _qname="peer_$(printf '%s' "${_q4blk:-none}${_q6blk:-none}" | cksum | cut -d' ' -f1)"
+    echo "⚠  [Peer] без #_Name: квота учитывается как $_qname" >&2
+  fi
+  _qsafe="$(printf '%s' "$_qname" | tr -c 'A-Za-z0-9_.-' '_')"
   _qnamelen=${#TUN_SAFE}
   _qmax=$(( 22 - _qnamelen ))  # Q_ + TUN + _ + X + _V4 <= 31 (лимит имени ipset)
   [ "$_qmax" -lt 6 ] && _qmax=6
@@ -5482,15 +5707,23 @@ while IFS='|' read -r _qname _qips; do
     _qset4=""; _qset6=""
     if [ "$_qv4" = "1" ] && [ -n "$_Q4" ]; then
       _qset4="Q_${TUN_SAFE}_${_qsafe}_V4"
-      ipset create "$_qset4" hash:net family inet 2>/dev/null || ipset flush "$_qset4" 2>/dev/null || true
-      for _qa in $(echo "$_Q4" | tr ',' ' '); do ipset add "$_qset4" "$_qa" 2>/dev/null || true; done
+      # Рев-45: проверяем результат — иначе сбой ipset/xt_set оставался
+# невидимым («квоты включены», а учёт не работает).
+if ! ipset create "$_qset4" hash:net family inet 2>/dev/null; then
+  ipset flush "$_qset4" 2>/dev/null || echo "⚠  ipset: не удалось создать/очистить $_qset4" >&2
+fi
+      IFS=',' read -ra _qa_arr <<< "$_Q4"; for _qa in "${_qa_arr[@]}"; do _qa="${_qa// /}"; [ -n "$_qa" ] && ipset add "$_qset4" "$_qa" 2>/dev/null || true; done
       _QSETS="$_QSETS $_qset4"
       CL_BLOCK4["$_qset4"]="$_Q4"
     fi
     if [ "$_qv6" = "1" ] && [ -n "$_Q6" ]; then
       _qset6="Q_${TUN_SAFE}_${_qsafe}_V6"
-      ipset create "$_qset6" hash:net family inet6 2>/dev/null || ipset flush "$_qset6" 2>/dev/null || true
-      for _qa in $(echo "$_Q6" | tr ',' ' '); do ipset add "$_qset6" "$_qa" 2>/dev/null || true; done
+      # Рев-45: проверяем результат — иначе сбой ipset/xt_set оставался
+# невидимым («квоты включены», а учёт не работает).
+if ! ipset create "$_qset6" hash:net family inet6 2>/dev/null; then
+  ipset flush "$_qset6" 2>/dev/null || echo "⚠  ipset: не удалось создать/очистить $_qset6" >&2
+fi
+      IFS=',' read -ra _qa_arr <<< "$_Q6"; for _qa in "${_qa_arr[@]}"; do _qa="${_qa// /}"; [ -n "$_qa" ] && ipset add "$_qset6" "$_qa" 2>/dev/null || true; done
       _QSETS="$_QSETS $_qset6"
       CL_BLOCK6["$_qset6"]="$_Q6"
     fi
@@ -6770,9 +7003,10 @@ STATE_BASE_DIR="$SCRIPT_DIR/.data"
 TUNNELS_STATE_DIR="$STATE_BASE_DIR/temp"
 TUNNEL_PARAMS_FILE="$TUNNELS_STATE_DIR/${SCRIPT_NAME}.sh"
 
-# Рев-24: те же ref-счётчики MASQUERADE, что и в up.sh (общий каталог .data)
-MASQ_REF_FILE="$STATE_BASE_DIR/masq_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
-MASQ6_REF_FILE="$STATE_BASE_DIR/masq6_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
+# Рев-24/44: ref-счётчики MASQUERADE вычисляются НЕ здесь, а перед использованием
+# (ниже, после чтения параметров): на этой строке IFACE ещё пуст, из-за чего имя
+# ref-файла не совпадало с up.sh — счётчик «не находился», и down снимал общее
+# правило MASQUERADE даже когда соседние туннели на том же интерфейсе живы.
 
 # Восстановление глобальных sysctl, изменённых up.sh (rp_filter и др.)
 # (сохранены в .data/<tun>_sysctl.save при up).
@@ -6782,7 +7016,7 @@ MASQ6_REF_FILE="$STATE_BASE_DIR/masq6_$(printf '%s' "$IFACE" | cksum | cut -d' '
 # по файлам параметров в .data/temp/*.sh (каждый up создаёт свой, down удаляет).
 # Общий оригинал rp_filter (каталог .data): восстанавливаем только когда
 # это последний активный туннель этого каталога.
-OTHER_TUNNELS=$(ls "$TUNNELS_STATE_DIR"/*.sh 2>/dev/null | grep -v "/${SCRIPT_NAME}\.sh$" | wc -l)
+OTHER_TUNNELS=$(ls "$TUNNELS_STATE_DIR"/*.sh 2>/dev/null | grep -vF "/${SCRIPT_NAME}.sh" | wc -l)
 SYSCTL_ORIG="$SCRIPT_DIR/.data/rp_filter.orig"
 if [ "$OTHER_TUNNELS" -eq 0 ] && [ -f "$SYSCTL_ORIG" ]; then
   while IFS='=' read -r _sk _sv; do
@@ -6889,7 +7123,10 @@ echo "————————————————————————�
 if [ -f "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" ]; then
   MARK_BASE=$(cat "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" 2>/dev/null)
 elif command -v calc_mark_base &>/dev/null 2>/dev/null; then
-  MARK_BASE=$(calc_mark_base "$TUN")
+  # Рев-46: сначала выделенное значение (как в up/down) — иначе
+  # проверочный скрипт печатал метку, которой нет в правилах
+  MARK_BASE=$(cat "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" 2>/dev/null)
+  [ -z "$MARK_BASE" ] && MARK_BASE=$(calc_mark_base "$TUN")
 else
   TUN_HASH=$(echo -n "$TUN" | cksum 2>/dev/null | cut -d' ' -f1)
   if [ -z "$TUN_HASH" ] || [ "$TUN_HASH" = "0" ]; then
@@ -6929,7 +7166,11 @@ for entry in "${WARP_LIST[@]}"; do
   for iface in "${RAW_INTERFACES[@]}"; do
     iface="$(echo "$iface" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     # Проверяем что это имя интерфейса (не подсеть и не IP)
-    if [ -n "$iface" ] && [ "$iface" != "none" ] && [[ "$iface" != *"."* ]] && [[ "$iface" != *":"* ]] && [[ "$iface" != *"/"* ]]; then
+    # Рев-45: точка ДОПУСТИМА (имена WARP-конфигов — <tun>warp<i>, а tun_name
+    # может содержать точку); запрещаем то, что даёт обход пути: слэш,
+    # двоеточие, ведущая точка и «..».
+    if [ -n "$iface" ] && [ "$iface" != "none" ] && [[ "$iface" != *":"* ]] \
+       && [[ "$iface" != *"/"* ]] && [[ "$iface" != .* ]] && [[ "$iface" != *".."* ]]; then
       ALL_WARP_INTERFACES["$iface"]=1
     fi
   done
@@ -6983,11 +7224,12 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
 
       if [ "$WARP_STOPPED_OK" = "1" ]; then
         # Очищаем таблицу маршрутизации (только если последний пользователь)
-        TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+        TABLE_ID=$(name="$warp" awk '$2==ENVIRON["name"]{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
         if [ -n "$TABLE_ID" ]; then
           WARP_TABLE_IDS["$warp"]="$TABLE_ID"
           ip route flush table "$TABLE_ID" 2>/dev/null || true
-          sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
+          _warp_re="$(printf '%s' "$warp" | sed 's/[][\.*^$+?()|{}]/\\&/g;s|/|\\/|g')"
+sed -i "/^${TABLE_ID}[[:space:]]\+${_warp_re}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
           echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
         fi
 
@@ -7011,11 +7253,12 @@ for warp in "${!ALL_WARP_INTERFACES[@]}"; do
 
       if [ "$WARP_STOPPED_OK" = "1" ]; then
         # Очищаем таблицу маршрутизации
-        TABLE_ID=$(awk -v name="$warp" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+        TABLE_ID=$(name="$warp" awk '$2==ENVIRON["name"]{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
         if [ -n "$TABLE_ID" ]; then
           WARP_TABLE_IDS["$warp"]="$TABLE_ID"
           ip route flush table "$TABLE_ID" 2>/dev/null || true
-          sed -i "/^${TABLE_ID}[[:space:]]\+${warp}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
+          _warp_re="$(printf '%s' "$warp" | sed 's/[][\.*^$+?()|{}]/\\&/g;s|/|\\/|g')"
+sed -i "/^${TABLE_ID}[[:space:]]\+${_warp_re}$/d" /etc/iproute2/rt_tables 2>/dev/null || true
           echo "🗑️  Таблица маршрутизации $warp (ID $TABLE_ID) очищена"
         fi
       fi
@@ -7092,7 +7335,7 @@ if [ ${#STOPPED_WARP_INTERFACES[@]} -gt 0 ]; then
         warp_iface="${WARP_GROUP[$i]}"
         # Получаем TABLE_ID из сохранённого значения (rt_tables уже очищен при остановке WARP)
         TABLE_ID="${WARP_TABLE_IDS[$warp_iface]:-}"
-        [ -z "$TABLE_ID" ] && TABLE_ID=$(awk -v name="$warp_iface" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+        [ -z "$TABLE_ID" ] && TABLE_ID=$(name="$warp_iface" awk '$2==ENVIRON["name"]{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
         if [ -n "$TABLE_ID" ]; then
           # Удаляем IPv4 правило
           ip rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
@@ -7123,7 +7366,7 @@ if [ ${#STOPPED_WARP_INTERFACES[@]} -gt 0 ]; then
         warp_iface="${DEFAULT_WARP_GROUP[$i]}"
         # Получаем TABLE_ID из сохранённого значения (rt_tables уже очищен при остановке WARP)
         TABLE_ID="${WARP_TABLE_IDS[$warp_iface]:-}"
-        [ -z "$TABLE_ID" ] && TABLE_ID=$(awk -v name="$warp_iface" '$2==name{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
+        [ -z "$TABLE_ID" ] && TABLE_ID=$(name="$warp_iface" awk '$2==ENVIRON["name"]{print $1; exit}' /etc/iproute2/rt_tables 2>/dev/null)
         if [ -n "$TABLE_ID" ]; then
           # Удаляем IPv4 правило
           ip rule del fwmark $MARK table "$TABLE_ID" 2>/dev/null || true
@@ -7289,13 +7532,17 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ] && [ "$SERVER_ON_NETWORK_IPV6" -eq 0 ]; then
 fi
 
 # --- Удаляем Hairpin NAT (IPv4 + IPv6) ---
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   iptables -t nat -D POSTROUTING -j "$HAIRPIN_CHAIN" 2>/dev/null || true
   iptables -t nat -F "$HAIRPIN_CHAIN" 2>/dev/null || true
   iptables -t nat -X "$HAIRPIN_CHAIN" 2>/dev/null || true
 fi
 
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   ip6tables -t nat -D POSTROUTING -j "$HAIRPIN_CHAIN" 2>/dev/null || true
   ip6tables -t nat -F "$HAIRPIN_CHAIN" 2>/dev/null || true
   ip6tables -t nat -X "$HAIRPIN_CHAIN" 2>/dev/null || true
@@ -7308,7 +7555,9 @@ echo "🧹 Очистка проброса портов (цепочки: $PF_CHA
 # СНАЧАЛА удаляем ссылки из глобальных цепочек (IPv4 + IPv6)
 echo "   Удаление ссылок из PREROUTING, FORWARD, POSTROUTING..."
 
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   # PREROUTING → PF_CHAIN_NAT
   iptables -t nat -D PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
   # FORWARD → PF_CHAIN_FILTER
@@ -7317,7 +7566,9 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t nat -D POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 fi
 
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   # PREROUTING → PF_CHAIN_NAT
   ip6tables -t nat -D PREROUTING -j "$PF_CHAIN_NAT" 2>/dev/null || true
   # FORWARD → PF_CHAIN_FILTER
@@ -7329,7 +7580,9 @@ fi
 # ПОТОМ очищаем цепочки (IPv4 + IPv6)
 echo "🧹 Очистка цепочек..."
 
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   # PF_CHAIN_NAT
   iptables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
   # PF_CHAIN_SNAT
@@ -7338,7 +7591,9 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t filter -F "$PF_CHAIN_FILTER" 2>/dev/null || true
 fi
 
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   # PF_CHAIN_NAT
   ip6tables -t nat -F "$PF_CHAIN_NAT" 2>/dev/null || true
   # PF_CHAIN_SNAT
@@ -7350,7 +7605,9 @@ fi
 # В КОНЦЕ удаляем цепочки (IPv4 + IPv6)
 echo "   Удаление цепочек..."
 
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   # PF_CHAIN_NAT
   iptables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
   # PF_CHAIN_SNAT
@@ -7359,7 +7616,9 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t filter -X "$PF_CHAIN_FILTER" 2>/dev/null || true
 fi
 
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   # PF_CHAIN_NAT
   ip6tables -t nat -X "$PF_CHAIN_NAT" 2>/dev/null || true
   # PF_CHAIN_SNAT
@@ -7372,14 +7631,25 @@ fi
 # Очищаем суффиксированную цепочку INPUT (IPv4 + IPv6)
 
 # IPv4 INPUT
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
+  # Рев-54: снимаем подвеску по порту И старую глобальную (если правила применены
+  # прежней версией — иначе мина осталась бы на сервере после перегенерации).
+  iptables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  iptables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -D INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -X "$INPUT_CHAIN" 2>/dev/null || true
 fi
 
 # IPv6 INPUT
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
+  # Рев-54: то же для IPv6.
+  ip6tables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  ip6tables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -D INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -X "$INPUT_CHAIN" 2>/dev/null || true
@@ -7498,37 +7768,61 @@ if [ ${#LAN_ALLOW[@]} -gt 0 ]; then
 fi
 
 # Удаляем DROP правило межклиентского трафика (оно было добавлено в up.sh)
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   iptables -D FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 fi
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   ip6tables -D FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 fi
 
 # Рев-24: экранированный TUN для grep-очистки (имя с точкой не зацепит чужие правила)
 _TUN_RE="$(printf '%s' "$TUN" | sed 's/[][\.*^$+?()|{}]/\\&/g')"
 
+# Рев-44: ref-файлы считаем ЗДЕСЬ — после чтения параметров, когда IFACE известен.
+# Если файла параметров нет, берём имя интерфейса из подсказки, оставленной up.sh
+# (.data/masq_iface_<tun>): без неё down не знал бы, к какому интерфейсу относится
+# общее правило MASQUERADE, и либо снял бы его у соседей, либо оставил мусор.
+if [ -z "$IFACE" ] && [ -f "$STATE_BASE_DIR/masq_iface_${TUN_SAFE}" ]; then
+  IFACE="$(cat "$STATE_BASE_DIR/masq_iface_${TUN_SAFE}" 2>/dev/null || true)"
+fi
+MASQ_REF_FILE="$STATE_BASE_DIR/masq_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
+MASQ6_REF_FILE="$STATE_BASE_DIR/masq6_$(printf '%s' "$IFACE" | cksum | cut -d' ' -f1).ref"
+
 # Рев-24: общий MASQUERADE-правило снимаем ТОЛЬКО когда это последний туннель
 # на внешнем интерфейсе (ref-счётчик из up.sh; раньше правило висело вечно)
-_masq_left="$(atomic_ref_update "$MASQ_REF_FILE" "dec" 2>/dev/null || echo 1)"
-if [ "${_masq_left:-1}" -le 0 ]; then
-  iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-  rm -f "$MASQ_REF_FILE" 2>/dev/null || true
-fi
-_masq6_left="$(atomic_ref_update "$MASQ6_REF_FILE" "dec" 2>/dev/null || echo 1)"
-if [ "${_masq6_left:-1}" -le 0 ]; then
-  ip6tables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-  rm -f "$MASQ6_REF_FILE" 2>/dev/null || true
+if [ -n "$IFACE" ]; then
+  # Рев-44: уменьшаем счётчик только если ЭТОТ туннель его увеличивал (маркер).
+  if [ -f "$STATE_BASE_DIR/masq_mark_${TUN_SAFE}" ]; then
+    rm -f "$STATE_BASE_DIR/masq_mark_${TUN_SAFE}" 2>/dev/null || true
+    _masq_left="$(atomic_ref_update "$MASQ_REF_FILE" "dec" 2>/dev/null || echo 1)"
+    if [ "${_masq_left:-1}" -le 0 ]; then
+      iptables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+      rm -f "$MASQ_REF_FILE" 2>/dev/null || true
+    fi
+  fi
+  if [ -f "$STATE_BASE_DIR/masq6_mark_${TUN_SAFE}" ]; then
+    rm -f "$STATE_BASE_DIR/masq6_mark_${TUN_SAFE}" 2>/dev/null || true
+    _masq6_left="$(atomic_ref_update "$MASQ6_REF_FILE" "dec" 2>/dev/null || echo 1)"
+    if [ "${_masq6_left:-1}" -le 0 ]; then
+      ip6tables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+      rm -f "$MASQ6_REF_FILE" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$STATE_BASE_DIR/masq_iface_${TUN_SAFE}" 2>/dev/null || true
 fi
 
 # Очищаем все FORWARD правила для этого туннеля (LAN_ALLOW, broadcast, MARK)
 iptables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
-  iptables -D $_rule 2>/dev/null || true
+  ( set -f; iptables -D $_rule 2>/dev/null || true )
 done
 ip6tables-save -t filter 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
   _rule="${_line#-A }"
-  ip6tables -D $_rule 2>/dev/null || true
+  ( set -f; ip6tables -D $_rule 2>/dev/null || true )
 done
 # Очищаем mangle FORWARD правила для этого туннеля (broadcast MARK)
 iptables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | while read -r _line; do
@@ -7541,21 +7835,29 @@ ip6tables-save -t mangle 2>/dev/null | grep "^-A FORWARD .*-i ${_TUN_RE} " | whi
 done
 
 # Очищаем старые универсальные правила (если вдруг они есть)
-if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   iptables -D FORWARD -i "$TUN" -o "$TUN" -j ACCEPT 2>/dev/null || true
 fi
-if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+if [ -n "$TUN" ]; then
   ip6tables -D FORWARD -i "$TUN" -o "$TUN" -j ACCEPT 2>/dev/null || true
 fi
 
 # Очищаем правила FORWARD для трафика напрямую через внешний интерфейс
 # IFACE может быть пустым если файл параметров не найден
 if [ -n "$IFACE" ]; then
-  if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+  if [ -n "$TUN" ]; then
     iptables -D FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   fi
-  if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+# Рев-44: чистим ВСЕГДА (имена цепочек вычисляются из TUN_SAFE) —
+# без params-файла туннель мёртв, а DNAT-правила оставались живыми
+  if [ -n "$TUN" ]; then
     ip6tables -D FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
     ip6tables -D FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   fi
@@ -7597,11 +7899,11 @@ quota_jump_del() {
   local _qc="$1"
   iptables-save 2>/dev/null | grep -- "-j $_qc" | while read -r _line; do
     _rule="${_line#-A }"
-    iptables -D $_rule 2>/dev/null || true
+    ( set -f; iptables -D $_rule 2>/dev/null || true )
   done
   ip6tables-save 2>/dev/null | grep -- "-j $_qc" | while read -r _line; do
     _rule="${_line#-A }"
-    ip6tables -D $_rule 2>/dev/null || true
+    ( set -f; ip6tables -D $_rule 2>/dev/null || true )
   done
 }
 # --- Квоты: ФИНАЛЬНЫЙ слепок расхода перед удалением цепочек ---
@@ -7740,7 +8042,6 @@ _IMITAT_SIDECAR_MAIN_GO = r'''// awg-imitat — единый сайдкар им
 package main
 
 import (
-	"bytes"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8113,12 +8414,37 @@ func genCert() (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
 
+// seedReader — бесконечный детерминированный поток из seed (SHA-256 по счётчику).
+// Нужен потому, что ecdsa.GenerateKey в Go 1.24+ читает ПЕРЕМЕННОЕ число байт, и
+// конечный bytes.NewReader мог закончиться → «unexpected EOF» → сайдкар падал, и
+// инструмент уходил в рукописный фоллбэк (рев-51).
+type seedReader struct {
+	seed []byte
+	buf  []byte
+	n    uint64
+}
+
+func (r *seedReader) Read(p []byte) (int, error) {
+	for len(r.buf) < len(p) {
+		var ctr [8]byte
+		binary.BigEndian.PutUint64(ctr[:], r.n)
+		h := sha256.Sum256(append(append([]byte{}, r.seed...), ctr[:]...))
+		r.buf = append(r.buf, h[:]...)
+		r.n++
+	}
+	n := copy(p, r.buf)
+	r.buf = r.buf[n:]
+	return n, nil
+}
+
 func genCertFromSeed(seedStr string) (tls.Certificate, error) {
-	// Рев-25: детерминированный серверный сертификат от seed — реальные
-	// DTLS-серверы переиспользуют свой сертификат между сессиями, поэтому
-	// все конфиги одного интерфейса получают один server-identity.
+	// Рев-25/47: сертификат строится из seed'а (serial/CN/срок), но БАЙТОВОЙ
+	// детерминированности нет: Go 1.24+ игнорирует переданный reader в
+	// ecdsa.GenerateKey, а x509.CreateCertificate подписывает через crypto/rand.
+	// Стабильность «один интерфейс — один server-identity» даёт кэш набора в
+	// процессе (см. _DTLS_PION_CACHE в awgcreate.py), а не этот seed.
 	h := sha256.Sum256([]byte(seedStr))
-	key, err := ecdsa.GenerateKey(elliptic.P256(), bytes.NewReader(h[:]))
+	key, err := ecdsa.GenerateKey(elliptic.P256(), &seedReader{seed: h[:]})
 	if err != nil {
 		return tls.Certificate{}, err
 	}
@@ -8139,7 +8465,44 @@ func genCertFromSeed(seedStr string) (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
 
-func waitCaptured(c *captureConn) bool {
+// hsTypesPresent: в буфере есть ServerHello(0x02), Certificate(0x0b),
+// ServerKeyExchange(0x0c) и ServerHelloDone(0x0e) — разбор DTLS-записей и
+// handshake-сообщений внутри них.
+func hsTypesPresent(buf []byte) bool {
+	need := map[byte]bool{0x02: false, 0x0b: false, 0x0c: false, 0x0e: false}
+	for off := 0; off+13 <= len(buf); {
+		if buf[off] != 0x16 {
+			break
+		}
+		recLen := int(buf[off+11])<<8 | int(buf[off+12])
+		if off+13+recLen > len(buf) {
+			break
+		}
+		for p := off + 13; p+12 <= off+13+recLen; {
+			ht := buf[p]
+			hl := int(buf[p+1])<<16 | int(buf[p+2])<<8 | int(buf[p+3])
+			if _, ok := need[ht]; ok {
+				need[ht] = true
+			}
+			if hl == 0 || p+12+hl > off+13+recLen {
+				break
+			}
+			p += 12 + hl
+		}
+		off += 13 + recLen
+	}
+	for _, v := range need {
+		if !v {
+			return false
+		}
+	}
+	return true
+}
+
+// waitAnyCapture: ждём ЛЮБОЙ захват. Нужен для клиентского ClientHello — клиент
+// пишет только сообщение типа 0x01, и требовать весь серверный flight нельзя
+// (рев-51: именно это ломало Pion-путь — сайдкар всегда падал с «no capture»).
+func waitAnyCapture(c *captureConn) bool {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && !c.hasCapture() {
 		time.Sleep(10 * time.Millisecond)
@@ -8149,6 +8512,22 @@ func waitCaptured(c *captureConn) bool {
 		return false
 	}
 	return true
+}
+
+func waitCaptured(c *captureConn) bool {
+	// Рев-45: ждём ВЕСЬ flight. Раньше функция возвращалась по первому Write, и
+	// при склейке flight несколькими записями Python получал частичный набор —
+	// настоящие поля вперемешку со случайными (подпись SKX не подписывала
+	// подставленный сертификат).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hsTypesPresent(c.snapshot()) {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fmt.Fprintln(os.Stderr, "dtls: no capture (endpoint не ответил)")
+	return false
 }
 
 // hsHeader собирает DTLS handshake header (12 байт) + body.
@@ -8204,7 +8583,7 @@ func runDTLS(sni, seed string) {
 		})
 		close(clientConn.done)
 	}()
-	if !waitCaptured(clientConn) {
+	if !waitAnyCapture(clientConn) {   // клиент пишет только ClientHello
 		os.Exit(1)
 	}
 	ch := clientConn.snapshot()
@@ -8258,7 +8637,10 @@ func runDTLS(sni, seed string) {
 		for off+12 <= len(payload) {
 			typ := payload[off]
 			mlen := int(payload[off+1])<<16 | int(payload[off+2])<<8 | int(payload[off+3])
-			msgSeq := int(payload[4])<<8 | int(payload[5])
+			// Рев-45: смещение внутри записи (off), а не от начала payload — иначе у
+		// второго+ сообщения в записи номер неверен, а он же служит record seq
+		// (RFC 6347 §4.1).
+		msgSeq := int(payload[off+4])<<8 | int(payload[off+5])
 			if off+12+mlen > len(payload) {
 				break // обрезанный handshake-body: bounds-check
 			}
@@ -8327,7 +8709,7 @@ go 1.24
 require golang.org/x/crypto v0.31.0
 '''
 
-_WARP_PROBE_GO = r'''// awg-probe — проверка WireGuard/AmneziaWG endpoint'а «настоящим рукопожатием».
+_WARP_PROBE_GO = r'''// awg-probe — проверка СТАНДАРТНОГО WireGuard endpoint'а «настоящим рукопожатием».
 //
 // Строит корректный WG handshake initiation (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s,
 // алгоритм взят из wireguard-go: device/noise-protocol.go, noise-helpers.go,
@@ -8345,6 +8727,7 @@ _WARP_PROBE_GO = r'''// awg-probe — проверка WireGuard/AmneziaWG endpo
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"encoding/base64"
@@ -8355,6 +8738,8 @@ import (
 	"hash"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/blake2s"
@@ -8451,7 +8836,7 @@ func tai64nNow() [12]byte {
 
 // buildInitiation строит полный 148-байтовый handshake initiation.
 // Возвращает (пакет, ""), либо ("", тип_ошибки) — без паник на вырожденных ключах.
-func buildInitiation(serverPub, clientPriv []byte) ([]byte, string) {
+func buildInitiation(serverPub, clientPriv []byte, msgType uint32) ([]byte, [4]byte, string) {
 	if initialChainKey == [blake2s.Size]byte{} {
 		initialChainKey = b2s256([]byte(noiseConstruction))
 		initialHash = b2s256(initialChainKey[:], []byte(wgIdentifier))
@@ -8461,21 +8846,22 @@ func buildInitiation(serverPub, clientPriv []byte) ([]byte, string) {
 	chainKey := initialChainKey
 
 	// клиентский статический ключ (наш, зарегистрированный)
+	var emptySender [4]byte
 	clientPub, err := curve25519.X25519(clientPriv, curve25519.Basepoint)
 	if err != nil {
-		return nil, "dh-error"
+		return nil, emptySender, "dh-error"
 	}
 	sp := serverPub
 
 	// эфемерный ключ
 	ephRaw := make([]byte, 32)
 	if _, err := rand.Read(ephRaw); err != nil {
-		return nil, "rng-error"
+		return nil, emptySender, "rng-error"
 	}
 	clamp(ephRaw)
 	ephPub, err := curve25519.X25519(ephRaw, curve25519.Basepoint)
 	if err != nil {
-		return nil, "dh-error"
+		return nil, emptySender, "dh-error"
 	}
 
 	mixHash(&hash, sp)        // серверный static в транскрипт
@@ -8485,7 +8871,7 @@ func buildInitiation(serverPub, clientPriv []byte) ([]byte, string) {
 	// шифруем клиентский статический ключ
 	ss1, err := curve25519.X25519(ephRaw, sp)
 	if err != nil {
-		return nil, "dh-error"
+		return nil, emptySender, "dh-error"
 	}
 	ck, key := kdf2(chainKey[:], ss1)
 	chainKey = ck
@@ -8496,7 +8882,7 @@ func buildInitiation(serverPub, clientPriv []byte) ([]byte, string) {
 	// шифруем timestamp
 	ss2, err := curve25519.X25519(clientPriv, sp)
 	if err != nil {
-		return nil, "dh-error"
+		return nil, emptySender, "dh-error"
 	}
 	ck, key = kdf2(chainKey[:], ss2)
 	chainKey = ck
@@ -8508,11 +8894,14 @@ func buildInitiation(serverPub, clientPriv []byte) ([]byte, string) {
 	// sender index
 	var sender [4]byte
 	if _, err := rand.Read(sender[:]); err != nil {
-		return nil, "rng-error"
+		return nil, emptySender, "rng-error"
 	}
 
 	msg := make([]byte, 0, msgInitiationSize)
-	msg = append(msg, 1, 0, 0, 0) // type
+	// Рев-47: тип сообщения задаётся конфигом (H1 в AmneziaWG); раньше всегда 1,
+	// поэтому AWG-эндпоинт молча дропал пробу и она объявляла его мёртвым.
+	mt := msgType
+	msg = append(msg, byte(mt), byte(mt>>8), byte(mt>>16), byte(mt>>24)) // type
 	msg = append(msg, sender[:]...)
 	msg = append(msg, ephPub...)
 	msg = append(msg, msgStatic...)
@@ -8522,10 +8911,12 @@ func buildInitiation(serverPub, clientPriv []byte) ([]byte, string) {
 	mac1 := b2s128(mac1Key[:], msg)
 	msg = append(msg, mac1[:]...)
 	msg = append(msg, make([]byte, 16)...) // MAC2 = 0 (нет cookie)
-	return msg, ""
+	// Рев-47: возвращаем sender index — вызывающий сверяет его с receiver index
+	// ответа (иначе вердикт «жив» давал любой подделанный пакет с типом 2).
+	return msg, sender, ""
 }
 
-func probe(endpoint, serverPub, clientPriv string, timeoutMs int, retries int) (bool, string) {
+func probe(endpoint, serverPub, clientPriv string, timeoutMs int, retries int, msgType uint32) (bool, string) {
 	sp, err := base64.StdEncoding.DecodeString(serverPub)
 	if err != nil || len(sp) != 32 {
 		return false, "bad-server-pub"
@@ -8534,7 +8925,7 @@ func probe(endpoint, serverPub, clientPriv string, timeoutMs int, retries int) (
 	if err != nil || len(cp) != 32 {
 		return false, "bad-client-priv"
 	}
-	msg, buildErr := buildInitiation(sp, cp)
+	msg, sender, buildErr := buildInitiation(sp, cp, msgType)
 	if buildErr != "" {
 		return false, buildErr
 	}
@@ -8552,6 +8943,18 @@ func probe(endpoint, serverPub, clientPriv string, timeoutMs int, retries int) (
 	}
 	buf := make([]byte, 512)
 	for i := 0; i < retries; i++ {
+		// Рев-45: каждый повтор — НОВОЕ рукопожатие (свой эфемерный ключ, sender
+		// index и timestamp). Побайтовый повтор апстримный WireGuard отбрасывает
+		// replay-защитой (timestamp не новее последнего), и живой эндпоинт
+		// объявлялся мёртвым.
+		if i > 0 {
+			_msg, _sender, _err := buildInitiation(sp, cp, msgType)
+			if _err != "" {
+				return false, _err
+			}
+			msg = _msg
+			sender = _sender
+		}
 		conn, err := net.DialUDP("udp", nil, udpAddr)
 		if err != nil {
 			return false, "dial"
@@ -8579,6 +8982,22 @@ func probe(endpoint, serverPub, clientPriv string, timeoutMs int, retries int) (
 		typ := binary.LittleEndian.Uint32(buf[:4])
 		switch typ {
 		case typeResponse:
+			// Рев-45: сверяем receiver index (байты 8..12) с нашим sender —
+			// иначе вердикт «жив» давал любой подделанный/отражённый пакет с
+			// типом 2, и перебор эндпоинтов прекращался на нерабочем.
+			if n >= msgResponseSize && !bytes.Equal(buf[8:12], sender[:]) {
+				return false, "wrong-receiver"
+			}
+			// Рев-47: проверяем MAC1 ответа — сервер считает его нашим статическим
+			// публичным ключом, поэтому подделка без знания ключа не проходит.
+			if n >= msgResponseSize {
+				clientPub, _ := curve25519.X25519(cp, curve25519.Basepoint)
+				_mac1Key := b2s256([]byte(wgLabelMAC1), clientPub)
+				_expect := b2s128(_mac1Key[:], buf[:n-32])
+				if !bytes.Equal(_expect[:], buf[n-32:n-16]) {
+					return false, "wrong-mac1"
+				}
+			}
 			if n >= msgResponseSize {
 				return true, "handshake"
 			}
@@ -8601,7 +9020,17 @@ func main() {
 	clientPriv := flag.String("client-priv", "", "base64 клиентский приватный ключ (зарегистрированный)")
 	timeoutMs := flag.Int("timeout-ms", 1500, "таймаут ожидания ответа, мс")
 	retries := flag.Int("retries", 2, "число попыток")
+	// Рев-47: тип handshake-сообщения (H1 в AmneziaWG); 1 — стандартный WireGuard.
+	h1 := flag.String("h1", "1", "тип handshake-сообщения (H1), hex или dec")
 	flag.Parse()
+	// h1 может быть hex ("0x1b2cbb") или dec — принимаем оба вида
+	var msgType uint32 = 1
+	_h1 := strings.TrimSpace(strings.TrimPrefix(*h1, "0x"))
+	if _h1 != "" {
+		if v, err := strconv.ParseUint(_h1, 16, 32); err == nil && v > 0 {
+			msgType = uint32(v)
+		}
+	}
 	// Поддержка stdin-JSON {"endpoint":..,"server_pub":..,"client_priv":..}:
 	// позволяет не светить приватный ключ в argv (ps); CLI-режим не ломается
 	// (Decode только при неполных флагах; пустой stdin → EOF → пропуск).
@@ -8610,6 +9039,7 @@ func main() {
 			Endpoint   string `json:"endpoint"`
 			ServerPub  string `json:"server_pub"`
 			ClientPriv string `json:"client_priv"`
+			H1         string `json:"h1"`
 		}
 		if err := json.NewDecoder(os.Stdin).Decode(&in); err == nil {
 			if *endpoint == "" {
@@ -8618,6 +9048,9 @@ func main() {
 			if *serverPub == "" {
 				*serverPub = in.ServerPub
 			}
+			if *h1 == "1" && in.H1 != "" {
+				*h1 = in.H1
+			}
 			if *clientPriv == "" {
 				*clientPriv = in.ClientPriv
 			}
@@ -8625,10 +9058,10 @@ func main() {
 	}
 
 	if *endpoint == "" || *serverPub == "" || *clientPriv == "" {
-		fmt.Fprintln(os.Stderr, "usage: awg-probe -endpoint host:port -server-pub <b64> -client-priv <b64> [-timeout-ms N] [-retries N]")
+		fmt.Fprintln(os.Stderr, "usage: awg-probe -endpoint host:port -server-pub <b64> -client-priv <b64> [-timeout-ms N] [-retries N] [-h1 TYPE]\n  проверяет СТАНДАРТНЫЙ WireGuard (WARP/Cloudflare). Для AWG-серверов результат\n  недостоверен: нужна обфускация (S1/S2-паддинг, при HPK — защита заголовков),\n  которой у пробы нет — живой AWG-эндпоинт вернёт ok:false/type:none.")
 		os.Exit(2)
 	}
-	ok, typ := probe(*endpoint, *serverPub, *clientPriv, *timeoutMs, *retries)
+	ok, typ := probe(*endpoint, *serverPub, *clientPriv, *timeoutMs, *retries, msgType)
 	out, _ := json.Marshal(map[string]any{"ok": ok, "type": typ})
 	fmt.Println(string(out))
 }
@@ -8680,10 +9113,7 @@ def generate_cps_packet(
 
     # Если указан диапазон, генерируем случайное значение
     def _append_random_part(tag, base, rng):
-        if rng > 0:
-            actual = random.randint(base, base + rng)
-        else:
-            actual = base
+        actual = random.randint(base, base + rng) if rng > 0 else base
         if actual > 0:
             parts.append(f"<{tag} {actual}>")
 
@@ -8942,7 +9372,944 @@ def _generate_header_protection_key() -> str:
     return base64.b64encode(secrets.token_bytes(32)).decode("ascii")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CPS/I-параметры: генераторы QUIC (вынесены из _generate_i_params, рев-43)
+#
+#  Были вложенными функциями 945-строчного замыкания; вынесены на модульный
+#  уровень, чтобы их можно было читать и тестировать по отдельности. Поведение
+#  не менялось: перенос байт-в-байт, проверено структурным снимком I-параметров,
+#  сравнивателем (72/72) и живым CPS-пакетом на стенде (I1 = 1204, init = 148).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# RFC 9001 §5.2: salt для вывода initial_secret из DCID
+_QUIC_INITIAL_SALT = bytes.fromhex('38762cf7f55934b34d179ae6a4c80cadccbb7f0a')
+
+
+def _quic_varint(value: int) -> str:
+    """Кодирует целое в QUIC variable-length integer (hex)."""
+    if value < 64:
+        return f"{value:02x}"
+    elif value < 16384:
+        return f"{(0x4000 | value):04x}"
+    elif value < 1073741824:
+        return f"{(0x80000000 | value):08x}"
+    else:
+        return f"{(0xc000000000000000 | value):016x}"
+
+
+def _hkdf_extract(salt, ikm):
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def _hkdf_expand(prk, info, length):
+    hkdf = HKDFExpand(algorithm=hashes.SHA256(), length=length, info=info, backend=default_backend())
+    return hkdf.derive(prk)
+
+
+def _hkdf_expand_label(secret, label, context, length):
+    """HKDF-Expand-Label (RFC 8446 §7.1): info = struct {uint16 len; opaque label; opaque context}."""
+    full_label = b"tls13 " + label
+    hkdf_label = (struct.pack(">H", length) + bytes([len(full_label)]) +
+                  full_label + bytes([len(context)]) + context)
+    return _hkdf_expand(secret, hkdf_label, length)
+
+
+def _quic_encrypt_initial(dcid_hex: str, scid_hex: str, plaintext_hex: str,
+                          is_server: bool = False) -> str:
+    """Шифрование QUIC Initial (AES-128-GCM + Header Protection).
+
+    Требует установленного `cryptography`; при его отсутствии не вызывается
+    (см. `_generate_i_params`: try_AESGCM = None).
+    """
+    dcid = bytes.fromhex(dcid_hex)
+    scid = bytes.fromhex(scid_hex)
+    # RFC 9001 §5.2: initial_secret -> client/server_initial_secret -> key/iv/hp
+    prk = _hkdf_extract(_QUIC_INITIAL_SALT, dcid)
+    secret = _hkdf_expand_label(prk, b'server in' if is_server else b'client in', b'', 32)
+    key = _hkdf_expand_label(secret, b'quic key', b'', 16)
+    iv  = _hkdf_expand_label(secret, b'quic iv', b'', 12)
+    hp  = _hkdf_expand_label(secret, b'quic hp', b'', 16)
+
+    plaintext = bytes.fromhex(plaintext_hex)
+    pn = 0
+    pn_len = 1
+    pn_bytes = pn.to_bytes(pn_len, 'big')
+    # Заголовок (без PN): type + version + DCID_len + DCID + SCID_len + SCID + Token_len + Length
+    header = (b'\xc0\x00\x00\x00\x01'
+              b'\x08' + dcid +
+              b'\x08' + scid +
+              b'\x00')
+    payload_len = len(plaintext) + pn_len + 16  # +PN byte, +16 GCM tag
+    header += bytes.fromhex(_quic_varint(payload_len))
+    # RFC 9001 §5.4.2: AAD = заголовок + unmasked PN
+    aad = header + pn_bytes
+    # RFC 9001 §5.3: nonce = IV XOR PN, PN пишется в ПОСЛЕДНИЕ байты IV
+    nonce = bytearray(iv)
+    nonce[12 - pn_len] ^= pn
+    nonce = bytes(nonce)
+    # AES-128-GCM encrypt
+    aesgcm = AESGCM(key)
+    ct = aesgcm.encrypt(nonce, plaintext, aad)
+    encrypted = ct[:-16]
+    tag = ct[-16:]
+    # RFC 9001 §5.4.2: sample берётся с pn_offset + 4 (PN считается 4-байтовым).
+    # encrypted начинается с pn_offset+pn_len, поэтому sample = encrypted[4-pn_len : 20-pn_len]
+    # RFC 9001 §5.4.2: sample = packet[pn_offset+4 : pn_offset+20], поэтому при
+    # pn_len=1 нужно >= 19 байт ciphertext (раньше guard пропускал 16..18 —
+    # падало невнятной ошибкой бэкенда).
+    if len(encrypted) < 4 - pn_len + 16:
+        raise ValueError("QUIC: ciphertext короче 19 байт для Header Protection")
+    sample = encrypted[4 - pn_len : 20 - pn_len]
+    ecb_cipher = Cipher(algorithms.AES(hp), modes.ECB(), backend=default_backend())
+    ecb_enc = ecb_cipher.encryptor()
+    mask = ecb_enc.update(sample) + ecb_enc.finalize()
+
+    first_byte = 0xc0 ^ (mask[0] & 0x0f)
+    pn_protected = bytes([pn_bytes[0] ^ (mask[1] if len(mask) > 1 else 0)])
+
+    result_hex = (
+        first_byte.to_bytes(1, 'big').hex() +
+        header[1:].hex() +
+        pn_protected.hex() +
+        encrypted.hex() +
+        tag.hex()
+    )
+    return result_hex
+
+
+def _build_quic_packet(crypto_hex: str, try_aesgcm=None, default_range: int = 60,
+                       scid_hex_preset: str = "", is_server: bool = False,
+                       pad_target: int = 0) -> tuple[str, int]:
+    """Оборачивает hex CRYPTO frame в QUIC Long Header (с шифрованием если доступно).
+
+    try_aesgcm — функция шифрования Initial (`_quic_encrypt_initial`) или None,
+    если `cryptography` не установлен: тогда пакет не шифруется (только для вида).
+    pad_target > 0 — добрать PADDING-фреймы (0x00 в ЗАЩИЩЁННОМ payload, RFC 9000 §19.1)
+    до точного размера пакета (RFC 9000 §14.1: Initial от клиента и от сервера обязан
+    быть >= 1200 байт). Фикс 16.09.2026: без паддинга реальные QUIC-серверы
+    (Cloudflare, Google — проверено на стенде) молча отбрасывают Initial,
+    с паддингом — отвечают.
+    """
+    dcid_hex = secrets.token_hex(8)
+    scid_hex = scid_hex_preset or secrets.token_hex(8)
+    if try_aesgcm is not None:
+        if pad_target > 0:
+            _best = None
+            for _pad in range(pad_target):
+                pkt = try_aesgcm(dcid_hex, scid_hex, crypto_hex + "00" * _pad,
+                                 is_server=is_server)
+                pkt_len = len(pkt) // 2
+                if pkt_len == pad_target:
+                    return pkt, 0
+                if pkt_len > pad_target:
+                    break
+                _best = pkt
+            # Рев-44: раньше здесь был raise ValueError — он доходил до main() и
+            # весь прогон падал (exit 1), хотя конфиг можно сгенерировать и без
+            # добора до 1200. Отдаём максимальный влезший пакет + предупреждение.
+            if _best is None:
+                _best = try_aesgcm(dcid_hex, scid_hex, crypto_hex, is_server=is_server)
+            logger.warning('⚠  QUIC: PADDING до %d байт не сходится, отдаю %d Б',
+                           pad_target, len(_best) // 2)
+            return _best, 0
+        return try_aesgcm(dcid_hex, scid_hex, crypto_hex, is_server=is_server), 0
+    # Фоллбэк без cryptography (пакет не зашифрован — только для вида); паддинг нулями
+    def _fallback_packet(pad: int) -> str:
+        """QUIC long header + CRYPTO-фрейм + `pad` нулевых байт (PADDING-фреймы)."""
+        payload_len = len(crypto_hex) // 2 + 1 + pad
+        return (f"c000000001"
+                f"08{dcid_hex}"
+                f"08{scid_hex}"
+                f"00"
+                f"{_quic_varint(payload_len)}"
+                f"00"
+                f"{crypto_hex}{'00' * pad}")
+
+    if pad_target > 0:
+        _best = None
+        for _pad in range(pad_target):
+            quic_hex = _fallback_packet(_pad)
+            if len(quic_hex) // 2 == pad_target:
+                return quic_hex, 0
+            if len(quic_hex) // 2 > pad_target:
+                break
+            _best = quic_hex
+        # Рев-44: не падаем — см. ветку с шифрованием выше
+        if _best is None:
+            _best = _fallback_packet(0)
+        logger.warning('⚠  QUIC: PADDING до %d байт не сходится (фоллбэк), отдаю %d Б',
+                       pad_target, len(_best) // 2)
+        return _best, 0
+    return _fallback_packet(0), default_range
+
+
+def _quic_handshake_packet(payload_hex: str, ascii_base: int) -> str:
+    """QUIC Handshake-пакет (long header, PN=0) + хвост CPS как у I2-I5.
+
+    Общий сборщик для клиентского и серверного флайта: отличается только
+    содержимое/длина payload и база случайных ASCII в хвосте.
+    """
+    dcid_hex = secrets.token_hex(8)
+    scid_hex = secrets.token_hex(8)
+    body_len = 1 + len(payload_hex) // 2      # PN(1) + payload
+    # Рев-45 (RFC 9001 §5.4): под Header Protection младший ниббл первого байта и
+    # PN выглядят случайными. Раньше было жёстко 0xe0 и PN=0 — стабильный отпечаток.
+    first_byte = 0xe0 | secrets.randbelow(16)
+    pn_byte = secrets.randbelow(256)
+    handshake_hex = (f"{first_byte:02x}00000001"
+                     f"08{dcid_hex}"
+                     f"08{scid_hex}"
+                     f"{_quic_varint(body_len)}"
+                     f"{pn_byte:02x}"                         # PN (замаскирован)
+                     f"{payload_hex}")
+    return generate_cps_packet(
+        static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
+        use_timestamp=True,
+        random_bytes=200, random_bytes_range=100,
+        random_ascii=ascii_base, random_ascii_range=100,
+        random_digits=10, random_digits_range=5,
+    )
+
+
+def _gen_quic_client_handshake():
+    """QUIC Handshake (завершение рукопожатия клиента)."""
+    return _quic_handshake_packet(secrets.token_hex(64), 100)
+
+
+def _gen_quic_server_handshake():
+    """QUIC серверный flight (EncryptedExtensions+Cert+CertVerify+Finished).
+
+    Handshake-пакеты шифруются ключами рукопожатия, которые DPI не может вывести
+    (нужны приватные ключи) — payload для него непрозрачен, поэтому достаточно
+    реалистичной длины. Рев-44: 600 байт, а не 1000 — при 1000 датаграмма
+    (сообщение 1026 + <t>4 + обязательный минимум трафика 600) выходила за бюджет
+    MTU 1452 и фрагментировалась в 89% случаев (замер аудита).
+    """
+    return _quic_handshake_packet(secrets.token_hex(600), 150)  # фрагмент flight с сертификатом
+
+
+def _gen_quic_appdata():
+    """QUIC 1-RTT (application data) — короткий заголовок.
+
+    Реальный хендшейк завершается данными приложения (1-RTT, short header).
+    Payload шифруется сессионными ключами — DPI видит только заголовок и длину.
+    """
+    payload = secrets.token_hex(48)
+    dcid_hex = secrets.token_hex(8)
+    # short header: 0x40 (fixed bit, pn_len=1) + DCID(8) + PN(1) + payload
+    # Рев-45: под Header Protection младшие 5 бит первого байта и PN случайны
+    appdata_hex = f"{0x40 | secrets.randbelow(32):02x}{dcid_hex}{secrets.randbelow(256):02x}{payload}"
+    return generate_cps_packet(
+        static_bytes=f"0x{appdata_hex}", static_bytes_range=0,
+        use_timestamp=True,
+        random_bytes=200, random_bytes_range=100,
+        random_ascii=100, random_ascii_range=100,
+        random_digits=10, random_digits_range=5,
+    )
+
+
+def _gen_quic():
+    """QUIC Initial простого пула (без SNI): сигнатура 0xc7 + трафик-хвост."""
+    return generate_cps_packet(
+        static_bytes="0xc7", static_bytes_range=20, use_timestamp=True,
+        random_bytes=120, random_bytes_range=80,
+        random_ascii=180, random_ascii_range=140,
+        random_digits=12, random_digits_range=6,
+    )
+
+
+# ─── CPS/I-параметры: простой пул и STUN (вынесены из _generate_i_params, рев-43) ───
+
+
+def _gen_dns():
+    return generate_cps_packet(
+        static_bytes="0x01", static_bytes_range=10, use_timestamp=False,
+        random_bytes=30, random_bytes_range=30,
+        random_ascii=60, random_ascii_range=60,
+        random_digits=10, random_digits_range=6,
+    )
+
+
+def _gen_dtls():
+    return generate_cps_packet(
+        static_bytes="0x16FEFD", static_bytes_range=15, use_timestamp=True,
+        random_bytes=80, random_bytes_range=70,
+        random_ascii=200, random_ascii_range=200,
+        random_digits=8, random_digits_range=6,
+    )
+
+
+def _gen_ntp():
+    return generate_cps_packet(
+        static_bytes="0x1B", static_bytes_range=3, use_timestamp=True,
+        random_bytes=0, random_bytes_range=0,
+        random_ascii=0, random_ascii_range=0,
+        random_digits=42, random_digits_range=6,
+    )
+
+
+def _gen_random():
+    return generate_cps_packet(
+        static_bytes=f"0x{secrets.token_hex(2)}", static_bytes_range=2, use_timestamp=False,
+        random_bytes=40, random_bytes_range=40,
+        random_ascii=50, random_ascii_range=50,
+        random_digits=0, random_digits_range=0,
+    )
+
+
+def _gen_srtp():
+    return generate_cps_packet(
+        static_bytes="0x8060", static_bytes_range=4, use_timestamp=True,
+        random_bytes=20, random_bytes_range=60,
+        random_ascii=0, random_ascii_range=0,
+        random_digits=8, random_digits_range=4,
+    )
+
+
+def _cps_with_std_tail(msg_hex: str, max_total: int = 1436) -> str:
+    """CPS-пакет: статичное сообщение протокола + стандартный хвост
+    `<t><r 200..300><rc 100..200><rd 10..15>` (одинаков у STUN и DTLS).
+
+    max_total — бюджет PAYLOAD WG-пакета, в который упаковывается I-строка:
+    1500 − 16 (заголовок WG) − 8 (UDP) − 40 (IPv6) = 1436. Если сообщение
+    большое, полосы хвоста урезаются пропорционально: пакет не должен
+    фрагментироваться (RFC 9000 §14.3/§14.4), иначе он перестаёт выглядеть как
+    настоящий. Минимум трафика (r+rc+rd >= 600) сохраняется — сообщения подобраны
+    так, чтобы в бюджет влезали и хвост, и минимум.
+    """
+    msg_len = len(msg_hex) // 2
+    budget = max(0, max_total - msg_len - 4)          # 4 байта — метка <t>
+    if msg_len + 4 > max_total:
+        # Рев-45: даже без хвоста сообщение не влезает — сообщаем явно, иначе
+        # такой пакет будет фрагментироваться без единого следа в логе.
+        logger.warning('⚠  CPS: сообщение %d Б не влезает в бюджет %d Б — '
+                       'датаграмма будет фрагментирована', msg_len + 4, max_total)
+    std_max = 300 + 200 + 15
+    if budget >= std_max:
+        rb, rr, cb, cr, db, dr = 200, 100, 100, 100, 10, 5
+    else:
+        k = max(0.0, budget - 3) / std_max            # 3 байта — минимумы баз
+        rb, rr = max(1, int(200 * k)), max(0, int(100 * k))
+        cb, cr = max(1, int(100 * k)), max(0, int(100 * k))
+        db, dr = max(1, int(10 * k)), max(0, int(5 * k))
+    return generate_cps_packet(
+        static_bytes=f"0x{msg_hex}", static_bytes_range=0,
+        use_timestamp=True,
+        random_bytes=rb, random_bytes_range=rr,
+        random_ascii=cb, random_ascii_range=cr,
+        random_digits=db, random_digits_range=dr,
+    )
+
+
+def _stun_mi_key(seed: str = "") -> str:
+    """Ключ MESSAGE-INTEGRITY: детерминированный от seed (session_id в STUN-серии),
+    иначе случайный. Реальный HMAC-SHA1, просто не привязан к живой ICE-сессии."""
+    if seed:
+        return hashlib.sha256(seed.encode()).hexdigest()
+    return secrets.token_hex(32)
+
+
+def _stun_ufrag(seed: str = "") -> str:
+    """Рев-25: уникальный ICE username fragment на конфиг (детерминированно
+    от seed; раньше константа «abc123:xyz789» — стабильный отпечаток во
+    ВСЕХ конфигах). В реальном ICE у каждой стороны свой ufrag."""
+    if seed:
+        h = hashlib.sha256(("stun-ufrag:" + seed).encode()).hexdigest()
+        return f"{h[:10]}:{h[10:16]}"
+    return secrets.token_hex(5) + ":" + secrets.token_hex(3)
+
+
+def _stun_build(msg_type_hex: str, attrs_hex: str, mi_key: str = "") -> str:
+    """Собирает STUN-сообщение (RFC 5389): header + attributes + [MESSAGE-INTEGRITY] + FINGERPRINT.
+
+    Header: type(2) + length(2) + magic cookie 0x2112A442 + transaction ID(12).
+    MESSAGE-INTEGRITY (0x0008, если задан mi_key): HMAC-SHA1 по сообщению с
+    обнулённым значением MI (RFC 5389 §15.4) — криптографически валидный.
+    FINGERPRINT (0x8028): CRC-32 сообщения (с обнулённым значением атрибута)
+    XOR 0x5354554E. DPI может проверить FINGERPRINT — считаем корректно.
+    """
+    txid = secrets.token_hex(12)
+    # length = attrs + MI(24, если есть: 4 header + 20 value) + FINGERPRINT(8); header = 20 байт
+    extra = 8 + (24 if mi_key else 0)
+    total_len = (len(attrs_hex) // 2) + extra
+    msg = msg_type_hex + f"{total_len:04x}" + "2112a442" + txid + attrs_hex
+    if mi_key:
+        # RFC 8489 §14.5: вход HMAC — сообщение ДО атрибута MI, а поле length
+        # указывает на конец MI (в нём уже учтён FINGERPRINT). Раньше в HMAC
+        # включался сам TLV MI с обнулённым значением — ни один конформный
+        # агент, знающий пароль, такую подпись не подтверждал.
+        _hdr = bytearray.fromhex(msg)
+        _hdr[2:4] = (total_len - 8).to_bytes(2, 'big')
+        mi = hmac.new(mi_key.encode(), bytes(_hdr), hashlib.sha1).hexdigest()
+        msg += "0008" + "0014" + mi
+    # FINGERPRINT: RFC 8489 §14.6 — CRC-32 по сообщению БЕЗ самого атрибута
+    # (фикс аудита: конкатенация «8028 0004 00000000» давала CRC, не
+    # совпадающий с проверкой специ-совместимого DPI).
+    fp = (zlib.crc32(bytes.fromhex(msg)) & 0xffffffff) ^ 0x5354554E
+    msg += "8028" + "0004" + f"{fp:08x}"
+    return msg
+
+
+def _gen_stun_client(seed: str = ""):
+    """STUN Binding Request (WebRTC ICE connectivity check)."""
+    priority = "0024" + "0004" + "6e7a1b7f"          # PRIORITY (1853634559)
+    ice_ctrl = "802a" + "0008" + secrets.token_hex(8)  # ICE-CONTROLLING tie-breaker
+    ufrag = _stun_ufrag(seed)                        # рев-25: уникальный per-конфиг
+    pad = (4 - (len(ufrag) % 4)) % 4                   # STUN: атрибуты кратны 4 байтам
+    username = "0006" + f"{len(ufrag):04x}" + ufrag.encode().hex() + "00" * pad
+    msg = _stun_build("0001", priority + ice_ctrl + username, mi_key=_stun_mi_key(seed))
+    return _cps_with_std_tail(msg)
+
+
+def _gen_stun_server(seed: str = ""):
+    """STUN Binding Success Response (XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY)."""
+    # XOR-MAPPED-ADDRESS (0x0020): reserved+family(1) + XOR-port(2) + XOR-addr(4)
+    # Рев-25: детерминированно от seed — раньше константы (192.168.1.1:52884)
+    # были отпечатком во всех конфигах.
+    if seed:
+        h = hashlib.sha256(("stun-xor:" + seed).encode()).digest()
+        port = 1024 + ((h[0] << 8 | h[1]) % (65535 - 1024 + 1))
+        ip = (10 << 24) | (h[2] << 16) | (h[3] << 8) | h[4]
+    else:
+        port = 1024 + secrets.randbelow(65535 - 1024 + 1)
+        ip = (10 << 24) | (secrets.randbelow(256) << 16) | (secrets.randbelow(256) << 8) | secrets.randbelow(256)
+    xport = port ^ 0x2112
+    xaddr = ip ^ 0x2112A442
+    xma = "0020" + "0008" + "0001" + f"{xport:04x}" + f"{xaddr:08x}"
+    # MESSAGE-INTEGRITY (0x0008): настоящий HMAC-SHA1(20) от ключа из seed.
+    msg = _stun_build("0101", xma, mi_key=_stun_mi_key(seed))
+    return _cps_with_std_tail(msg)
+
+
+
+# ─── CPS/I-параметры: DTLS и QUIC-генераторы (вынесены из _generate_i_params, рев-43) ───
+# Кэш Pion-сайдкара — модульный (раньше был nonlocal в замыкании).
+# Рев-51: кэш ключуется (domain, seed) и живёт весь процесс — иначе CH клиента и
+# флайт сервера берутся из разных рукопожатий и подпись SKX не проверяется.
+_DTLS_PION_CACHE: dict = {}
+
+# Историческое имя для DTLS-вызовов: тот же хвост, доменное название.
+_dtls_packet = _cps_with_std_tail
+
+
+def _quic_initial_via_aioquic(is_server: bool, domain: str = "") -> str | None:
+    """Генерирует реальный QUIC Initial/ServerHello пакет через aioquic (TLS 1.3).
+
+    Возвращает hex пакета или None если aioquic недоступен / произошла ошибка.
+    ClientHello содержит SNI (domain) и настоящий TLS 1.3 от BoringSSL-профиля.
+    """
+    if aioquic is None:
+        return None
+    try:
+        now = time.time()
+        alpn = ["h3"]
+        sni = domain or "www.example.com"
+
+        # Клиентский Initial (реальный TLS 1.3 ClientHello с SNI)
+        client_cfg = QuicConfiguration(is_client=True, alpn_protocols=alpn)
+        client_cfg.server_name = sni
+        client_conn = QuicConnection(configuration=client_cfg)
+        client_conn.connect(("192.0.2.1", 443), now=now)
+        client_dg = client_conn.datagrams_to_send(now=now)
+        if not client_dg:
+            return None
+        # datagrams_to_send возвращает список (datagram_bytes, addr)
+        client_initial = client_dg[0][0]
+
+        if not is_server:
+            return client_initial.hex()
+
+        # Серверный ответ (ServerHello) — нужен самоподписанный сертификат
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, sni)])
+        cert = (x509.CertificateBuilder()
+                .subject_name(name).issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+                .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
+                .sign(key, hashes.SHA256()))
+        # Серверу нужен original_destination_connection_id (DCID клиента) для вывода Initial-ключа
+        client_dcid = pull_quic_header(Buffer(data=client_initial), host_cid_length=8).destination_cid
+        server_cfg = QuicConfiguration(is_client=False, alpn_protocols=alpn)
+        server_cfg.certificate = cert
+        server_cfg.private_key = key
+        server_conn = QuicConnection(configuration=server_cfg,
+                                     original_destination_connection_id=client_dcid)
+        server_conn.receive_datagram(client_initial, addr=("192.0.2.1", 12345), now=now)
+        server_dg = server_conn.datagrams_to_send(now=now)
+        if not server_dg:
+            return None
+        return server_dg[0][0].hex()
+    except Exception:
+        return None
+
+
+def _quic_clienthello_via_utls(domain: str = "", seed: str = "") -> tuple[str, str, str] | None:
+    """Генерирует Chrome QUIC ClientHello и согласованный ServerHello через uTLS-сайдкар.
+
+    Возвращает (clienthello_hex, serverhello_hex, scid_hex) или None если сайдкар недоступен / ошибка.
+    clienthello_hex — полное handshake-сообщение ClientHello (тип 0x01 + длина + тело).
+    serverhello_hex — полное handshake-сообщение ServerHello (тип 0x02 + длина + тело),
+        согласованное с ClientHello (echo session_id). Может быть "" если сайдкар старый.
+    scid_hex — initial_source_connection_id из transport parameters (совпадает с SCID в header).
+    """
+    sidecar = _ensure_imitat_sidecar()
+    if not sidecar:
+        return None
+    try:
+        rc, out = exec_cmd([sidecar, "-mode", "utls", "-sni", domain or "www.example.com",
+                            "-seed", seed or ""], timeout=15)
+        if rc != 0:
+            logger.warning("⚠  uTLS-сайдкар вернул код %s: %s", rc, out.strip()[:200])
+            return None
+        data = json.loads(out.strip().splitlines()[-1])
+        ch_hex = data.get("clienthello_hex", "")
+        sh_hex = data.get("serverhello_hex", "")
+        scid_hex = data.get("scid_hex", "")
+        if not ch_hex or not scid_hex:
+            return None
+        return ch_hex, sh_hex, scid_hex
+    except Exception as e:
+        logger.warning("⚠  uTLS-сайдкар не сработал: %s", e)
+        return None
+
+
+def _gen_quic_client(domain: str = "", seed: str = "", try_aesgcm=None):
+    """QUIC Initial: uTLS (Chrome TLS 1.3) → aioquic (TLS 1.3) → рукописный TLS 1.2."""
+    utls = _quic_clienthello_via_utls(domain, seed)
+    if utls:
+        ch_hex, _, scid_hex = utls
+        # CRYPTO frame: type 06 + varint(offset=0) + varint(len) + данные.
+        # ФИКС 16.09.2026: раньше было "06"+"00000000"+f"{len:08x}" — 4 байта
+        # с неверным varint-префиксом (00…) → парсер читал длину 0, и реальные
+        # серверы (Cloudflare/Google) молча отбрасывали Initial. Проверено
+        # на стенде: с корректным varint серверы отвечают.
+        crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
+        # PADDING-фреймы до 1200 байт (RFC 9000 §14.1) — иначе дроп
+        quic_hex, qr_static_range = _build_quic_packet(crypto_hex, try_aesgcm, scid_hex_preset=scid_hex,
+                                                       pad_target=1200)
+        # Хвост не добавляем — см. комментарий в TLS-1.2 ветке ниже (MTU 1500).
+        return generate_cps_packet(
+            static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
+            use_timestamp=True,
+        )
+    aio_hex = _quic_initial_via_aioquic(False, domain)
+    if aio_hex:
+        return generate_cps_packet(
+            static_bytes=f"0x{aio_hex}", static_bytes_range=0,
+            use_timestamp=True,
+        )
+    sni_bytes = domain.encode('utf-8')
+    sni_hex = sni_bytes.hex()
+    random_hex = secrets.token_hex(32)
+
+    # TLS 1.2 cipher suites (первый — детерминированный от seed, совпадает с сервером)
+    # TLS-1.3-шифры ПЕРВЫМИ — как у Chrome. Без 0x13xx QUIC-сервер отвергает
+    # ClientHello (ниже выставляется supported_versions = TLS 1.3).
+    suites_pool = ["1301", "1302", "1303",
+                   "c02b", "c02f", "c02c", "c030", "cca8", "cca9",
+                   "c013", "c014", "0033", "0039", "002f", "009c"]
+    if seed:
+        # Тот же seed и тот же пул что на сервере → одинаковый выбранный cipher
+        rnd = random.Random(seed)
+        preferred = rnd.choice(["c02b", "c02f", "c02c", "c030", "cca8", "cca9"])
+        suites_pool.remove(preferred)
+        suites_pool.insert(0, preferred)
+    cipher_hex = "".join(suites_pool)
+    cipher_len = len(cipher_hex) // 2
+    # SNI extension data (RFC 6066): list_len + name_type(00) + name_len + name.
+    # ext_hex ниже добавляет ext_type(0000) + ext_data_len.
+    sni_ext_hex = f"{len(sni_bytes)+3:04x}00{len(sni_bytes):04x}{sni_hex}"
+    # supported_groups (x25519, secp256r1, secp384r1, secp521r1) — длины СЧИТАЮТСЯ,
+    # а не вписаны руками: в прежней версии было объявлено 20 Б при 19 реальных,
+    # из-за чего Cloudflare отвечал CONNECTION_CLOSE с TLS alert 50 (decode_error).
+    grp_list = "".join(["001d", "0017", "0018", "0019"])
+    groups_hex = ("000a" +
+                  f"{len(grp_list)//2 + 2:04x}" +      # ext data len: list_len(2) + группы
+                  f"{len(grp_list)//2:04x}" + grp_list)
+    # signature_algorithms — реальные коды из реестра IANA в порядке Chrome.
+    # Прежний список содержал несуществующие значения (0x0602/0x0502/0x0402/0x0508)
+    # и дубль 0x0804: Cloudflare отвечал CONNECTION_CLOSE с illegal_parameter.
+    sig_list = ["0403", "0503", "0603", "0804", "0805", "0806", "0807", "0808",
+                "0401", "0501", "0601"]
+    sigalgs_hex = ("000d" +
+                   f"{len(sig_list) * 2 + 2:04x}" +
+                   f"{len(sig_list) * 2:04x}" + "".join(sig_list))
+    # ALPN (h3) — для QUIC обязателен RFC 9114; h2/http1.1 в QUIC-ClientHello
+    # сервер отвергает (no_application_protocol). Проверено: с h2 Cloudflare
+    # отвечает CONNECTION_CLOSE, с h3 — ServerHello.
+    alpn_hex = "001000050003026833"
+    # supported_versions: TLS 1.3 (0x0304). QUIC требует именно 1.3 (RFC 9001 §4.2);
+    # с 0x0303 сервер тоже отвечает CONNECTION_CLOSE.
+    sv_hex = "002b0003020304"
+    # ec_point_formats НЕ отправляем: содержит TLS-1.2-only значение и в 1.3
+    # отвергается сервером (illegal_parameter) — Chrome его в 1.3 не шлёт.
+    # QUIC Transport Parameters
+    scid_hex = secrets.token_hex(8)
+    # QUIC Transport Parameters по RFC 9000 §18.2. ВАЖНО: initial_source_connection_id
+    # у клиента — это код 0x0f. Код 0x00 (original_destination_connection_id) —
+    # серверный, клиенту его слать ЗАПРЕЩЕНО (прежняя версия слала 0x00 → сервер
+    # отвечал CONNECTION_CLOSE). Длины считаются, а не вписаны руками.
+    def _tp(pid: int, val_hex: str) -> str:
+        # Длины — ИМЕННО QUIC-varint (RFC 9000 §16): для 2-байтной формы
+        # старшие биты обязаны быть 01 (0x4000|len). Прежняя запись «сырыми»
+        # 0008 читалась парсером как id=0/длина=0 + мусор.
+        return _quic_varint(pid) + _quic_varint(len(val_hex) // 2) + val_hex
+
+    def _tp_int(pid: int, value: int) -> str:
+        # Целочисленные параметры ТОЖЕ кодируются varint'ом, и длина обязана
+        # совпадать с числом байт varint'а (RFC 9000 §18.2). Прежняя запись
+        # фиксированной шириной (max_udp_payload_size = «04b0») читалась как
+        # varint «4» длиной 1 байт при заявленной длине 2 → строгий парсер
+        # отвечал TRANSPORT_PARAMETER_ERROR «length does not match»
+        # (проверено локальным aioquic-сервером).
+        v = _quic_varint(value)
+        return _quic_varint(pid) + _quic_varint(len(v) // 2) + v
+
+    tp_body = (
+        _tp_int(0x01, 30000) +     # max_idle_timeout = 30000 мс
+        _tp_int(0x03, 1200) +      # max_udp_payload_size = 1200
+        _tp_int(0x04, 65536) +     # initial_max_data
+        _tp_int(0x05, 65536) +     # initial_max_stream_data_bidi_local
+        _tp_int(0x06, 65536) +     # initial_max_stream_data_bidi_remote
+        _tp_int(0x07, 65536) +     # initial_max_stream_data_uni
+        _tp_int(0x08, 100) +       # initial_max_streams_bidi
+        _tp_int(0x09, 100) +       # initial_max_streams_uni
+        _tp_int(0x0e, 2) +         # active_connection_id_limit
+        _tp(0x0f, scid_hex)        # initial_source_connection_id = наш SCID
+    )
+    qtp_hex = "0039" + f"{len(tp_body)//2:04x}" + tp_body
+    # key_share (X25519 dummy public key)
+    ks_hex = "0033" + "0026" + "0024" + "001d" + "0020" + secrets.token_hex(32)
+    # All extensions
+    ext_hex = (f"0000{len(sni_ext_hex)//2:04x}{sni_ext_hex}"  # SNI
+               f"{groups_hex}"                                 # supported_groups
+               f"{sigalgs_hex}"                                # signature_algorithms
+               f"{sv_hex}"                                     # supported_versions
+               f"{alpn_hex}"                                   # ALPN
+               f"{qtp_hex}"                                    # QUIC transport params
+               f"{ks_hex}")                                    # key_share
+    ext_len = len(ext_hex) // 2
+    # ClientHello body
+    # RFC 9001 §8.1: в QUIC legacy_session_id ОБЯЗАН быть пустым (непустой →
+    # BoringSSL/QUICHE отвечает illegal_parameter). В uTLS-ветке это уже учтено.
+    ch_body = (f"0303{random_hex}00"                     # version + random + пустой session_id
+               f"{cipher_len:04x}{cipher_hex}"         # cipher suites
+               f"0100"                                 # compression: null
+               f"{ext_len:04x}{ext_hex}")              # extensions
+    ch_len = len(ch_body) // 2
+    ch_hex = f"01{ch_len:06x}{ch_body}"
+    # QUIC CRYPTO Frame (plaintext для шифрования) — varint длины корректный
+    crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
+    quic_hex, qr_static_range = _build_quic_packet(
+        crypto_hex, try_aesgcm, scid_hex_preset=scid_hex,
+        pad_target=1200)      # RFC 9000 §14.1: Initial >= 1200 и в фоллбэке тоже
+    # 16.10.2026: хвост <r>/<rc>/<rd> после QUIC Initial НЕ добавляем.
+    # 1200 Б Initial + хвост 400-500 Б давали датаграмму 1650-1716 Б >
+    # MTU 1500 → фрагментация, а настоящий QUIC Initial ровно 1200 Б
+    # (RFC 9000 §14.1) и на 1500-байтном пути не фрагментируется никогда.
+    # Вдобавок случайный хвост — это не валидный второй QUIC-пакет, то есть
+    # демаскировка. Объём серии и разброс размеров дают I2-I5, у них хвосты
+    # остаются (см. _gen_quic_client_handshake / _gen_quic_appdata).
+    return generate_cps_packet(
+        static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
+        use_timestamp=True,
+    )
+
+
+def _gen_quic_server(domain: str = "", seed: str = "", try_aesgcm=None):
+    """QUIC ServerHello: uTLS (согласованный с ClientHello) → aioquic TLS 1.3 → TLS 1.2."""
+    utls = _quic_clienthello_via_utls(domain, seed)
+    if utls:
+        _, sh_hex, _ = utls
+        if sh_hex:
+            # varint длины CRYPTO + PADDING до 1200 (см. _gen_quic_client, 16.09.2026)
+            crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(sh_hex) // 2) + sh_hex
+            quic_hex, qr_static_range = _build_quic_packet(crypto_hex, try_aesgcm, default_range=40,
+                                                           is_server=True, pad_target=1200)
+            # Хвост не добавляем — см. _gen_quic_client (MTU 1500).
+            return generate_cps_packet(
+                static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
+                use_timestamp=True,
+            )
+    aio_hex = _quic_initial_via_aioquic(True, domain)
+    if aio_hex:
+        return generate_cps_packet(
+            static_bytes=f"0x{aio_hex}", static_bytes_range=0,
+            use_timestamp=True,
+            random_bytes=0, random_bytes_range=0,
+            random_ascii=0, random_ascii_range=0,
+            random_digits=0, random_digits_range=0,
+        )
+    random_hex = secrets.token_hex(32)
+    # Рев-44: ServerHello объявляет supported_versions=0x0304, поэтому шифр обязан
+    # быть из наборов TLS 1.3 (0x13xx). Раньше 6 из 9 значений пула были TLS 1.2 —
+    # в 67% случаев получался внутренне противоречивый ServerHello.
+    chosen_cipher = (random.Random(seed).choice([
+        "1301", "1302", "1303"
+    ]) if seed else secrets.choice([
+        "1301", "1302", "1303"
+    ]))
+    # TLS 1.3 ServerHello обязан нести supported_versions=0x0304 и key_share
+    # (RFC 8446 §4.1.3/4.2.8) — без них ServerHello невалиден.
+    sh_ext = ("002b00020304"                              # supported_versions: TLS 1.3
+              "0033" + "0024" + "001d" + "0020" + secrets.token_hex(32))  # key_share x25519
+    sh_body = (f"0303{random_hex}00"          # RFC 9001 §8.1: session_id пустой
+               f"{chosen_cipher}"
+               f"00"
+               f"{len(sh_ext)//2:04x}{sh_ext}")
+    sh_len = len(sh_body) // 2
+    sh_hex = f"02{sh_len:06x}{sh_body}"
+    crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(sh_hex) // 2) + sh_hex
+    quic_hex, qr_static_range = _build_quic_packet(
+        crypto_hex, try_aesgcm, default_range=40, is_server=True,
+        pad_target=1200)      # RFC 9000 §14.1: Initial >= 1200 и в фоллбэке тоже
+
+    # Хвост не добавляем — см. _gen_quic_client (MTU 1500).
+    return generate_cps_packet(
+        static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
+        use_timestamp=True,
+    )
+
+
+def _dtls_suites(seed: str = ""):
+    """Cipher suites DTLS 1.2 (WebRTC): первый — детерминированный от seed."""
+    # Только те cipher suites, что предлагает Pion DTLS ClientHello (c02b/c02f/c02c/c030),
+    # чтобы ServerHello всегда выбирал cipher из списка клиента.
+    suites_pool = ["c02b", "c02f", "c02c", "c030"]
+    if seed:
+        rnd = random.Random(seed)
+        preferred = rnd.choice(suites_pool)
+        suites_pool.remove(preferred)
+        suites_pool.insert(0, preferred)
+    return suites_pool
+
+
+def _dtls_sni_ext(domain: str = ""):
+    """SNI extension (если задан domain)."""
+    if not domain:
+        return ""
+    sni_bytes = domain.encode('utf-8')
+    sni_hex = sni_bytes.hex()
+    # RFC 6066 §3: extension_data = ServerNameList(len 2) + name_type(1) + name(len 2)
+    return f"0000{len(sni_bytes)+5:04x}{len(sni_bytes)+3:04x}00{len(sni_bytes):04x}{sni_hex}"
+
+
+def _dtls_extensions(domain: str = ""):
+    """Набор extensions DTLS 1.2 как у Chrome WebRTC.
+
+    Порядок и состав повторяют реальный ClientHello: server_name,
+    extended_master_secret, renegotiation_info, supported_groups,
+    ec_point_formats, signature_algorithms, use_srtp. НЕ включаем
+    supported_versions (0x002b) — это фича TLS 1.3, в DTLS 1.2 её нет.
+    """
+    # Рев-44: длины пересчитаны (было объявлено 20 при 19 фактических байтах):
+    # ext_len=14, list_len=12, группы 001d/0017/0018/0019/0100/001c.
+    groups_hex = ("000a000e000c001d0017001800190100"
+                  "001c")
+    sigalgs_hex = ("000d001a001806010602060305010502"
+                   "0503040104020403080408040508")
+    ecpt_hex = "000b00020100"
+    srtp_hex = "000e00050002000100"        # RFC 5764 §4.1.1: list_len=2, профиль, mki
+    ems_hex = "00170000"          # extended_master_secret (пустое значение)
+    reneg_hex = "ff01000100"
+    return (_dtls_sni_ext(domain) + ems_hex + reneg_hex + groups_hex
+            + ecpt_hex + sigalgs_hex + srtp_hex)
+
+
+def _dtls_record(content_type: int, epoch: int, seq: int, payload_hex: str) -> str:
+    """DTLS 1.2 record: content_type(1) + version fefd + epoch(2) + seq(6) + length(2) + payload."""
+    return f"{content_type:02x}fefd{epoch:04x}{seq:012x}{len(payload_hex)//2:04x}{payload_hex}"
+
+
+def _dtls_handshake(msg_type: int, msg_seq: int, body_hex: str) -> str:
+    """DTLS handshake msg: type(1) + length(3) + msg_seq(2) + frag_offset(3) + frag_len(3) + body."""
+    body_len = len(body_hex) // 2
+    return f"{msg_type:02x}{body_len:06x}{msg_seq:04x}000000{body_len:06x}{body_hex}"
+
+
+def _dtls_clienthello_via_pion(domain: str = "", seed: str = ""):
+    """Генерирует настоящие WebRTC DTLS 1.2 сообщения через Pion DTLS-сайдкар.
+
+    Возвращает кортеж (clienthello_hex, serverhello_hex, certificate_hex,
+    skx_hex, shd_hex) — полные DTLS records, или None если сайдкар
+    недоступен / ошибка. Результат кэшируется: один запуск сайдкара на все
+    I-параметры, чтобы ServerHello и flight были согласованы с ClientHello
+    (один и тот же handshake).
+    """
+    global _DTLS_PION_CACHE
+    _cache_key = (domain, seed)
+    if _cache_key in _DTLS_PION_CACHE:
+        return _DTLS_PION_CACHE[_cache_key]
+    sidecar = _ensure_imitat_sidecar()
+    if not sidecar:
+        return None
+    try:
+        rc, out = exec_cmd([sidecar, "-mode", "dtls", "-sni", domain or "www.example.com",
+                            "-seed", seed or ""], timeout=15)  # рев-25: детерминированный серверный сертификат
+        if rc != 0:
+            logger.warning("⚠  DTLS-сайдкар вернул код %s: %s", rc, out.strip()[:200])
+            return None
+        data = json.loads(out.strip().splitlines()[-1])
+        ch_hex = data.get("clienthello_hex", "")
+        sh_hex = data.get("serverhello_hex", "")
+        cert_hex = data.get("certificate_hex", "")
+        skx_hex = data.get("skx_hex", "")
+        shd_hex = data.get("shd_hex", "")
+        if not ch_hex:
+            return None
+        _DTLS_PION_CACHE[_cache_key] = (ch_hex, sh_hex, cert_hex, skx_hex, shd_hex)
+        return _DTLS_PION_CACHE[_cache_key]
+    except Exception as e:
+        logger.warning("⚠  DTLS-сайдкар не сработал: %s", e)
+        return None
+
+
+def _gen_dtls_client(domain: str = "", seed: str = ""):
+    """DTLS 1.2 ClientHello (WebRTC) — msg_seq=0, epoch=0 seq=0.
+
+    Если доступен Pion DTLS-сайдкар — используем настоящий WebRTC ClientHello
+    (неотличим от реального). Иначе рукописный (та же структура, но без
+    точного порядка extensions реального стека).
+    """
+    pion = _dtls_clienthello_via_pion(domain, seed)
+    if pion:
+        return _dtls_packet(pion[0])
+    random_hex = secrets.token_hex(32)
+    cipher_hex = "".join(_dtls_suites(seed))
+    cipher_len = len(cipher_hex) // 2
+    ext_hex = _dtls_extensions(domain)
+    ext_len = len(ext_hex) // 2
+    # ClientHello body: version + random + session_id(0) + cookie(0) + ciphers + compression + extensions
+    ch_body = (f"fefd{random_hex}"
+               f"00"                       # session_id len 0
+               f"00"                       # cookie len 0
+               f"{cipher_len:04x}{cipher_hex}"
+               f"0100"                     # compression: len 1, null
+               f"{ext_len:04x}{ext_hex}")
+    return _dtls_packet(_dtls_record(0x16, 0, 0, _dtls_handshake(0x01, 0, ch_body)))
+
+
+def _gen_dtls_client_kex():
+    """DTLS 1.2 ClientKeyExchange (ECDHE) — msg_seq=1, epoch=0 seq=1."""
+    # SEC1 §2.3.3: compressed point начинается с 0x02/0x03 (раньше был случайный
+    # первый байт — ~99% точек формально невалидны).
+    pubkey = secrets.choice(["02", "03"]) + secrets.token_hex(32)   # compressed P-256 point
+    body = f"{33:02x}{pubkey}"
+    return _dtls_packet(_dtls_record(0x16, 0, 1, _dtls_handshake(0x10, 1, body)))
+
+
+def _gen_dtls_ccs(for_server: bool = False):
+    """DTLS ChangeCipherSpec. Record-seq: после server flight
+    (SH=0,Cert=1,SKX=2,SHD=3) — 4; у клиента (CH=0,CKE=1) — 2.
+    Фикс аудита: жёсткий seq=2 коллизировал с SKX в серверном пуле."""
+    return _dtls_packet(_dtls_record(0x14, 0, 4 if for_server else 2, "01"))
+
+
+def _gen_dtls_finished(for_server: bool = False):
+    """DTLS Finished (зашифрован) — epoch=1 seq=0.
+    msg_seq зависит от направления: сервер после ServerHelloDone(3) → 4,
+    клиент после ClientKeyExchange(1) → 2."""
+    body = secrets.token_hex(12)           # verify_data (SHA-256 PRF)
+    msg_seq = 4 if for_server else 2
+    return _dtls_packet(_dtls_record(0x16, 1, 0, _dtls_handshake(0x14, msg_seq, body)))
+
+
+def _gen_dtls_appdata():
+    """DTLS ApplicationData (зашифрован) — epoch=1 seq=1."""
+    payload = secrets.token_hex(random.randint(40, 120))
+    return _dtls_packet(_dtls_record(0x17, 1, 1, payload))
+
+
+def _gen_dtls_server(domain: str = "", seed: str = ""):
+    """DTLS 1.2 ServerHello (WebRTC) — msg_seq=0, epoch=0 seq=0.
+
+    Если доступен Pion DTLS-сайдкар — настоящий ServerHello (реальный стек,
+    cipher из набора клиента). Иначе рукописный (та же структура).
+    """
+    pion = _dtls_clienthello_via_pion(domain, seed)
+    if pion and pion[1]:
+        return _dtls_packet(pion[1])
+    random_hex = secrets.token_hex(32)
+    # Выбираем только из cipher suites, предлагаемых клиентом (Pion: c02b/c02f/c02c/c030).
+    chosen_cipher = (random.Random(seed).choice([
+        "c02b", "c02f", "c02c", "c030"
+    ]) if seed else secrets.choice([
+        "c02b", "c02f", "c02c", "c030"
+    ]))
+    # Рев-45: сервер ОБЯЗАН эхнуть расширения, которые предложил клиент
+    # (RFC 7627 §5.3 extended_master_secret, RFC 5746 §3.4 renegotiation_info,
+    # RFC 5764 §4.1.1 use_srtp) — без них handshake не может завершиться, а наш
+    # же ClientHello эти расширения предлагает (см. _dtls_extensions).
+    sh_ext = ("00170000"                  # extended_master_secret (пустое значение)
+              "ff01000100"                # renegotiation_info (пустой)
+              "000e00050002000100")       # use_srtp: SRTP_AES128_CM_HMAC_SHA1_80
+    # ServerHello body: version + random + session_id(0) + cipher + compression + extensions
+    sh_body = (f"fefd{random_hex}"
+               f"00"                       # session_id len 0
+               f"{chosen_cipher}"
+               f"00"                       # compression: null
+               f"{len(sh_ext) // 2:04x}{sh_ext}")
+    return _dtls_packet(_dtls_record(0x16, 0, 0, _dtls_handshake(0x02, 0, sh_body)))
+
+
+def _gen_dtls_server_cert(domain: str = "", seed: str = ""):
+    """DTLS 1.2 Certificate — msg_seq=1, epoch=0 seq=1.
+
+    Если доступен Pion DTLS-сайдкар — настоящий X.509 сертификат (реальный
+    DER, случайный serial/CN). Иначе рукописный (та же структура).
+    """
+    pion = _dtls_clienthello_via_pion(domain, seed)
+    if pion and pion[2]:
+        return _dtls_packet(pion[2])
+    cert = secrets.token_hex(random.randint(600, 900))
+    cert_entry = f"{len(cert)//2:06x}{cert}"
+    cert_body = f"{len(cert_entry)//2:06x}{cert_entry}"
+    return _dtls_packet(_dtls_record(0x16, 0, 1, _dtls_handshake(0x0b, 1, cert_body)))
+
+
+def _gen_dtls_server_skx(domain: str = "", seed: str = ""):
+    """DTLS 1.2 ServerKeyExchange — msg_seq=2, epoch=0 seq=2.
+
+    Если доступен Pion DTLS-сайдкар — настоящий SKX (реальная ECDSA-подпись
+    в ServerKeyExchange). Иначе рукописный.
+    """
+    pion = _dtls_clienthello_via_pion(domain, seed)
+    if pion and pion[3]:
+        return _dtls_packet(pion[3])
+    # Рев-45: sigalg и длина подписи обязаны соответствовать выбранному шифру:
+    # c02b/c02c — ECDSA (ecdsa_secp256r1_sha256 0403, ~70 байт),
+    # c02f/c030 — RSA (rsa_pss_rsae_sha256 0804, ~256 байт). Раньше всегда был
+    # 0603 (secp521r1) с 70-байтной подписью — при RSA-suite это противоречие.
+    # Шифр берём тем же способом и с тем же seed, что и в ServerHello, — пара
+    # SH/SKX остаётся согласованной.
+    _suites = ["c02b", "c02f", "c02c", "c030"]
+    _cipher = (random.Random(seed).choice(_suites) if seed else secrets.choice(_suites))
+    if _cipher in ("c02f", "c030"):
+        sigalg, sig_len = "0804", 256
+    else:
+        sigalg, sig_len = "0403", 70
+    # SEC1 §2.3.3: compressed point начинается с 0x02/0x03 (раньше был случайный байт)
+    skx_pub = secrets.choice(["02", "03"]) + secrets.token_hex(32)
+    skx_sig = secrets.token_hex(sig_len)
+    skx_body = f"030017{33:02x}{skx_pub}{sigalg}{sig_len:04x}{skx_sig}"
+    return _dtls_packet(_dtls_record(0x16, 0, 2, _dtls_handshake(0x0c, 2, skx_body)))
+
+
+def _gen_dtls_server_shd(domain: str = "", seed: str = ""):
+    """DTLS 1.2 ServerHelloDone — msg_seq=3, epoch=0 seq=3."""
+    pion = _dtls_clienthello_via_pion(domain, seed)
+    if pion and pion[4]:
+        return _dtls_packet(pion[4])
+    return _dtls_packet(_dtls_record(0x16, 0, 3, _dtls_handshake(0x0e, 3, "")))
+
+
+
 def _generate_i_params(for_client: bool = False, for_server: bool = True, domain: str = "", seed: str = "", proto: str = "") -> dict[str, str]:
+    # for_client сохранён для совместимости подписи (он есть и в old/preold-
+    # ревизиях): выбор пула определяется for_server/domain/proto, отдельного
+    # ветвления по for_client в теле нет — удаление параметра сломало бы вызовы.
     """Генерация I1-I5 (CPS-пакеты для маскировки под легитимные UDP протоколы).
 
     Если указан domain — генерируются QUIC ClientHello с его SNI (для клиента)
@@ -8956,6 +10323,11 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
       I_TRAFFIC_MIN/I_TRAFFIC_MAX — сумма <r>+<rc>+<rd> (байт трафика)
       Если результат выходит за диапазон — генерация повторяется.
     """
+
+    # Рев-43: кэш Pion-сайдкара живёт ровно один вызов (как было в замыкании) —
+    # иначе один и тот же DTLS-handshake переезжал бы в конфиги разных клиентов.
+    # Рев-51: кэш НЕ сбрасываем — серверный и клиентские наборы одного сервера
+    # должны получить одно рукопожатие (иначе подпись SKX не проверяется).
     # ─── Настраиваемые диапазоны ─────────────────────────────────
     I_TEXT_MIN = 60     # Мин. длина текста всех I-строк в конфиге
     I_TEXT_MAX = 180    # Макс. длина текста всех I-строк в конфиге
@@ -8976,816 +10348,68 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
     # ──────────────────────────────────────────────────────────────
 
     # Пул протоколов в виде функций — генерируется только при вызове
-    def _gen_dns():
-        return generate_cps_packet(
-            static_bytes="0x01", static_bytes_range=10, use_timestamp=False,
-            random_bytes=30, random_bytes_range=30,
-            random_ascii=60, random_ascii_range=60,
-            random_digits=10, random_digits_range=6,
-        )
 
-    def _gen_quic():
-        return generate_cps_packet(
-            static_bytes="0xc7", static_bytes_range=20, use_timestamp=True,
-            random_bytes=120, random_bytes_range=80,
-            random_ascii=180, random_ascii_range=140,
-            random_digits=12, random_digits_range=6,
-        )
 
-    def _gen_dtls():
-        return generate_cps_packet(
-            static_bytes="0x16FEFD", static_bytes_range=15, use_timestamp=True,
-            random_bytes=80, random_bytes_range=70,
-            random_ascii=200, random_ascii_range=200,
-            random_digits=8, random_digits_range=6,
-        )
 
-    def _gen_ntp():
-        return generate_cps_packet(
-            static_bytes="0x1B", static_bytes_range=3, use_timestamp=True,
-            random_bytes=0, random_bytes_range=0,
-            random_ascii=0, random_ascii_range=0,
-            random_digits=42, random_digits_range=6,
-        )
 
-    def _gen_random():
-        return generate_cps_packet(
-            static_bytes=f"0x{secrets.token_hex(2)}", static_bytes_range=2, use_timestamp=False,
-            random_bytes=40, random_bytes_range=40,
-            random_ascii=50, random_ascii_range=50,
-            random_digits=0, random_digits_range=0,
-        )
 
-    def _gen_srtp():
-        return generate_cps_packet(
-            static_bytes="0x8060", static_bytes_range=4, use_timestamp=True,
-            random_bytes=20, random_bytes_range=60,
-            random_ascii=0, random_ascii_range=0,
-            random_digits=8, random_digits_range=4,
-        )
 
     # ────────────────────────────────────────────────────────────────
 
     # Протоколы для маскировки под конкретный домен (через ;domain=)
     # ─── Шифрование QUIC Initial (AES-128-GCM + Header Protection) ───
-    _QUIC_INITIAL_SALT = bytes.fromhex('38762cf7f55934b34d179ae6a4c80cadccbb7f0a')
-    try_AESGCM = None
-    if cryptography is not None:
-
-        def _hkdf_extract(salt, ikm):
-            return hmac.new(salt, ikm, hashlib.sha256).digest()
-
-        def _hkdf_expand(prk, info, length):
-            hkdf = HKDFExpand(algorithm=hashes.SHA256(), length=length, info=info, backend=default_backend())
-            return hkdf.derive(prk)
-
-        def _hkdf_expand_label(secret, label, context, length):
-            """HKDF-Expand-Label (RFC 8446 §7.1): info = struct {uint16 len; opaque label; opaque context}."""
-            full_label = b"tls13 " + label
-            hkdf_label = (struct.pack(">H", length) + bytes([len(full_label)]) +
-                          full_label + bytes([len(context)]) + context)
-            return _hkdf_expand(secret, hkdf_label, length)
-
-        def _quic_encrypt_initial(dcid_hex: str, scid_hex: str, plaintext_hex: str,
-                                  is_server: bool = False) -> str:
-            dcid = bytes.fromhex(dcid_hex)
-            scid = bytes.fromhex(scid_hex)
-            # RFC 9001 §5.2: initial_secret -> client/server_initial_secret -> key/iv/hp
-            prk = _hkdf_extract(_QUIC_INITIAL_SALT, dcid)
-            secret = _hkdf_expand_label(prk, b'server in' if is_server else b'client in', b'', 32)
-            key = _hkdf_expand_label(secret, b'quic key', b'', 16)
-            iv  = _hkdf_expand_label(secret, b'quic iv', b'', 12)
-            hp  = _hkdf_expand_label(secret, b'quic hp', b'', 16)
-
-            plaintext = bytes.fromhex(plaintext_hex)
-            pn = 0
-            pn_len = 1
-            pn_bytes = pn.to_bytes(pn_len, 'big')
-            # Заголовок (без PN): type + version + DCID_len + DCID + SCID_len + SCID + Token_len + Length
-            header = (b'\xc0\x00\x00\x00\x01'
-                      b'\x08' + dcid +
-                      b'\x08' + scid +
-                      b'\x00')
-            payload_len = len(plaintext) + pn_len + 16  # +PN byte, +16 GCM tag
-            header += bytes.fromhex(_quic_varint(payload_len))
-            # RFC 9001 §5.4.2: AAD = заголовок + unmasked PN
-            aad = header + pn_bytes
-            # RFC 9001 §5.3: nonce = IV XOR PN, PN пишется в ПОСЛЕДНИЕ байты IV
-            nonce = bytearray(iv)
-            nonce[12 - pn_len] ^= pn
-            nonce = bytes(nonce)
-            # AES-128-GCM encrypt
-            aesgcm = AESGCM(key)
-            ct = aesgcm.encrypt(nonce, plaintext, aad)
-            encrypted = ct[:-16]
-            tag = ct[-16:]
-            # RFC 9001 §5.4.2: sample берётся с pn_offset + 4 (PN считается 4-байтовым).
-            # encrypted начинается с pn_offset+pn_len, поэтому sample = encrypted[4-pn_len : 20-pn_len]
-            if len(encrypted) < 16:  # фикс аудита: guard для короткого plaintext
-                raise ValueError("QUIC: ciphertext короче 16 байт для Header Protection")
-            sample = encrypted[4 - pn_len : 20 - pn_len]
-            ecb_cipher = Cipher(algorithms.AES(hp), modes.ECB(), backend=default_backend())
-            ecb_enc = ecb_cipher.encryptor()
-            mask = ecb_enc.update(sample) + ecb_enc.finalize()
-
-            first_byte = 0xc0 ^ (mask[0] & 0x0f)
-            pn_protected = bytes([pn_bytes[0] ^ (mask[1] if len(mask) > 1 else 0)])
-
-            result_hex = (
-                first_byte.to_bytes(1, 'big').hex() +
-                header[1:].hex() +
-                pn_protected.hex() +
-                encrypted.hex() +
-                tag.hex()
-            )
-            return result_hex
-
-        try_AESGCM = _quic_encrypt_initial
-
-    def _build_quic_packet(crypto_hex: str, default_range: int = 60,
-                           scid_hex_preset: str = "", is_server: bool = False,
-                           pad_target: int = 0) -> tuple[str, int]:
-        """Оборачивает hex CRYPTO frame в QUIC Long Header (с шифрованием если доступно).
-
-        pad_target > 0 — добрать PADDING-фреймы (0x00 в ЗАЩИЩЁННОМ payload, RFC 9000 §19.1)
-        до точного размера пакета (RFC 9000 §14.1: Initial от клиента и от сервера обязан
-        быть >= 1200 байт). Фикс 16.09.2026: без паддинга реальные QUIC-серверы
-        (Cloudflare, Google — проверено на стенде) молча отбрасывают Initial,
-        с паддингом — отвечают.
-        """
-        dcid_hex = secrets.token_hex(8)
-        scid_hex = scid_hex_preset or secrets.token_hex(8)
-        if try_AESGCM is not None:
-            if pad_target > 0:
-                for _pad in range(pad_target):
-                    pkt = try_AESGCM(dcid_hex, scid_hex, crypto_hex + "00" * _pad,
-                                     is_server=is_server)
-                    pkt_len = len(pkt) // 2
-                    if pkt_len == pad_target:
-                        return pkt, 0
-                    if pkt_len > pad_target:
-                        break
-                raise ValueError(f"QUIC: не удалось набрать PADDING до {pad_target} байт")
-            return try_AESGCM(dcid_hex, scid_hex, crypto_hex, is_server=is_server), 0
-        # Фоллбэк без cryptography (пакет не зашифрован — только для вида); паддинг нулями
-        def _fallback_packet(pad: int) -> str:
-            """QUIC long header + CRYPTO-фрейм + `pad` нулевых байт (PADDING-фреймы)."""
-            payload_len = len(crypto_hex) // 2 + 1 + pad
-            return (f"c000000001"
-                    f"08{dcid_hex}"
-                    f"08{scid_hex}"
-                    f"00"
-                    f"{_quic_varint(payload_len)}"
-                    f"00"
-                    f"{crypto_hex}{'00' * pad}")
-
-        if pad_target > 0:
-            for _pad in range(pad_target):
-                quic_hex = _fallback_packet(_pad)
-                if len(quic_hex) // 2 == pad_target:
-                    return quic_hex, 0
-                if len(quic_hex) // 2 > pad_target:
-                    break
-            raise ValueError(f"QUIC: не удалось набрать PADDING до {pad_target} байт (фоллбэк)")
-        return _fallback_packet(0), default_range
-
-    def _quic_varint(value: int) -> str:
-        """Кодирует целое в QUIC variable-length integer (hex)."""
-        if value < 64:
-            return f"{value:02x}"
-        elif value < 16384:
-            return f"{(0x4000 | value):04x}"
-        elif value < 1073741824:
-            return f"{(0x80000000 | value):08x}"
-        else:
-            return f"{(0xc000000000000000 | value):016x}"
+    # Реализация вынесена на модульный уровень (рев-43): _quic_encrypt_initial.
+    try_AESGCM = _quic_encrypt_initial if cryptography is not None else None
 
     # ─── Реальный QUIC через aioquic (TLS 1.3, настоящий стек) ───
-    def _quic_initial_via_aioquic(is_server: bool) -> str | None:
-        """Генерирует реальный QUIC Initial/ServerHello пакет через aioquic (TLS 1.3).
-
-        Возвращает hex пакета или None если aioquic недоступен / произошла ошибка.
-        ClientHello содержит SNI (domain) и настоящий TLS 1.3 от BoringSSL-профиля.
-        """
-        if aioquic is None:
-            return None
-        try:
-            now = time.time()
-            alpn = ["h3"]
-            sni = domain or "www.example.com"
-
-            # Клиентский Initial (реальный TLS 1.3 ClientHello с SNI)
-            client_cfg = QuicConfiguration(is_client=True, alpn_protocols=alpn)
-            client_cfg.server_name = sni
-            client_conn = QuicConnection(configuration=client_cfg)
-            client_conn.connect(("192.0.2.1", 443), now=now)
-            client_dg = client_conn.datagrams_to_send(now=now)
-            if not client_dg:
-                return None
-            # datagrams_to_send возвращает список (datagram_bytes, addr)
-            client_initial = client_dg[0][0]
-
-            if not is_server:
-                return client_initial.hex()
-
-            # Серверный ответ (ServerHello) — нужен самоподписанный сертификат
-            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-            name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, sni)])
-            cert = (x509.CertificateBuilder()
-                    .subject_name(name).issuer_name(name)
-                    .public_key(key.public_key())
-                    .serial_number(x509.random_serial_number())
-                    .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-                    .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
-                    .sign(key, hashes.SHA256()))
-            # Серверу нужен original_destination_connection_id (DCID клиента) для вывода Initial-ключа
-            client_dcid = pull_quic_header(Buffer(data=client_initial), host_cid_length=8).destination_cid
-            server_cfg = QuicConfiguration(is_client=False, alpn_protocols=alpn)
-            server_cfg.certificate = cert
-            server_cfg.private_key = key
-            server_conn = QuicConnection(configuration=server_cfg,
-                                         original_destination_connection_id=client_dcid)
-            server_conn.receive_datagram(client_initial, addr=("192.0.2.1", 12345), now=now)
-            server_dg = server_conn.datagrams_to_send(now=now)
-            if not server_dg:
-                return None
-            return server_dg[0][0].hex()
-        except Exception:
-            return None
 
     # ────────────────────────────────────────────────────────────────
 
-    def _quic_clienthello_via_utls() -> tuple[str, str, str] | None:
-        """Генерирует Chrome QUIC ClientHello и согласованный ServerHello через uTLS-сайдкар.
 
-        Возвращает (clienthello_hex, serverhello_hex, scid_hex) или None если сайдкар недоступен / ошибка.
-        clienthello_hex — полное handshake-сообщение ClientHello (тип 0x01 + длина + тело).
-        serverhello_hex — полное handshake-сообщение ServerHello (тип 0x02 + длина + тело),
-            согласованное с ClientHello (echo session_id). Может быть "" если сайдкар старый.
-        scid_hex — initial_source_connection_id из transport parameters (совпадает с SCID в header).
-        """
-        sidecar = _ensure_imitat_sidecar()
-        if not sidecar:
-            return None
-        try:
-            rc, out = exec_cmd([sidecar, "-mode", "utls", "-sni", domain or "www.example.com",
-                                "-seed", seed or ""], timeout=15)
-            if rc != 0:
-                logger.warning("⚠  uTLS-сайдкар вернул код %s: %s", rc, out.strip()[:200])
-                return None
-            data = json.loads(out.strip().splitlines()[-1])
-            ch_hex = data.get("clienthello_hex", "")
-            sh_hex = data.get("serverhello_hex", "")
-            scid_hex = data.get("scid_hex", "")
-            if not ch_hex or not scid_hex:
-                return None
-            return ch_hex, sh_hex, scid_hex
-        except Exception as e:
-            logger.warning("⚠  uTLS-сайдкар не сработал: %s", e)
-            return None
 
-    def _gen_quic_client():
-        """QUIC Initial: uTLS (Chrome TLS 1.3) → aioquic (TLS 1.3) → рукописный TLS 1.2."""
-        utls = _quic_clienthello_via_utls()
-        if utls:
-            ch_hex, _, scid_hex = utls
-            # CRYPTO frame: type 06 + varint(offset=0) + varint(len) + данные.
-            # ФИКС 16.09.2026: раньше было "06"+"00000000"+f"{len:08x}" — 4 байта
-            # с неверным varint-префиксом (00…) → парсер читал длину 0, и реальные
-            # серверы (Cloudflare/Google) молча отбрасывали Initial. Проверено
-            # на стенде: с корректным varint серверы отвечают.
-            crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
-            # PADDING-фреймы до 1200 байт (RFC 9000 §14.1) — иначе дроп
-            quic_hex, qr_static_range = _build_quic_packet(crypto_hex, scid_hex_preset=scid_hex,
-                                                           pad_target=1200)
-            # Хвост не добавляем — см. комментарий в TLS-1.2 ветке ниже (MTU 1500).
-            return generate_cps_packet(
-                static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
-                use_timestamp=True,
-            )
-        aio_hex = _quic_initial_via_aioquic(is_server=False)
-        if aio_hex:
-            return generate_cps_packet(
-                static_bytes=f"0x{aio_hex}", static_bytes_range=0,
-                use_timestamp=True,
-            )
-        sni_bytes = domain.encode('utf-8')
-        sni_hex = sni_bytes.hex()
-        random_hex = secrets.token_hex(32)
-        session_id_hex = hashlib.sha256(seed.encode()).hexdigest() if seed else secrets.token_hex(32)  # рев-25: эхо session_id (RFC 5246): обе стороны — от seed → сервер эхо-отражает клиента
 
-        # TLS 1.2 cipher suites (первый — детерминированный от seed, совпадает с сервером)
-        # TLS-1.3-шифры ПЕРВЫМИ — как у Chrome. Без 0x13xx QUIC-сервер отвергает
-        # ClientHello (ниже выставляется supported_versions = TLS 1.3).
-        suites_pool = ["1301", "1302", "1303",
-                       "c02b", "c02f", "c02c", "c030", "cca8", "cca9",
-                       "c013", "c014", "0033", "0039", "002f", "009c"]
-        if seed:
-            # Тот же seed и тот же пул что на сервере → одинаковый выбранный cipher
-            rnd = random.Random(seed)
-            preferred = rnd.choice(["c02b", "c02f", "c02c", "c030", "cca8", "cca9"])
-            suites_pool.remove(preferred)
-            suites_pool.insert(0, preferred)
-        cipher_hex = "".join(suites_pool)
-        cipher_len = len(cipher_hex) // 2
-        # SNI extension data (RFC 6066): list_len + name_type(00) + name_len + name.
-        # ext_hex ниже добавляет ext_type(0000) + ext_data_len.
-        sni_ext_hex = f"{len(sni_bytes)+3:04x}00{len(sni_bytes):04x}{sni_hex}"
-        # supported_groups (x25519, secp256r1, secp384r1, secp521r1) — длины СЧИТАЮТСЯ,
-        # а не вписаны руками: в прежней версии было объявлено 20 Б при 19 реальных,
-        # из-за чего Cloudflare отвечал CONNECTION_CLOSE с TLS alert 50 (decode_error).
-        grp_list = "".join(["001d", "0017", "0018", "0019"])
-        groups_hex = ("000a" +
-                      f"{len(grp_list)//2 + 2:04x}" +      # ext data len: list_len(2) + группы
-                      f"{len(grp_list)//2:04x}" + grp_list)
-        # signature_algorithms — реальные коды из реестра IANA в порядке Chrome.
-        # Прежний список содержал несуществующие значения (0x0602/0x0502/0x0402/0x0508)
-        # и дубль 0x0804: Cloudflare отвечал CONNECTION_CLOSE с illegal_parameter.
-        sig_list = ["0403", "0503", "0603", "0804", "0805", "0806", "0807", "0808",
-                    "0401", "0501", "0601"]
-        sigalgs_hex = ("000d" +
-                       f"{len(sig_list) * 2 + 2:04x}" +
-                       f"{len(sig_list) * 2:04x}" + "".join(sig_list))
-        # ALPN (h3) — для QUIC обязателен RFC 9114; h2/http1.1 в QUIC-ClientHello
-        # сервер отвергает (no_application_protocol). Проверено: с h2 Cloudflare
-        # отвечает CONNECTION_CLOSE, с h3 — ServerHello.
-        alpn_hex = "001000050003026833"
-        # supported_versions: TLS 1.3 (0x0304). QUIC требует именно 1.3 (RFC 9001 §4.2);
-        # с 0x0303 сервер тоже отвечает CONNECTION_CLOSE.
-        sv_hex = "002b0003020304"
-        # ec_point_formats НЕ отправляем: содержит TLS-1.2-only значение и в 1.3
-        # отвергается сервером (illegal_parameter) — Chrome его в 1.3 не шлёт.
-        # QUIC Transport Parameters
-        scid_hex = secrets.token_hex(8)
-        # QUIC Transport Parameters по RFC 9000 §18.2. ВАЖНО: initial_source_connection_id
-        # у клиента — это код 0x0f. Код 0x00 (original_destination_connection_id) —
-        # серверный, клиенту его слать ЗАПРЕЩЕНО (прежняя версия слала 0x00 → сервер
-        # отвечал CONNECTION_CLOSE). Длины считаются, а не вписаны руками.
-        def _tp(pid: int, val_hex: str) -> str:
-            # Длины — ИМЕННО QUIC-varint (RFC 9000 §16): для 2-байтной формы
-            # старшие биты обязаны быть 01 (0x4000|len). Прежняя запись «сырыми»
-            # 0008 читалась парсером как id=0/длина=0 + мусор.
-            return _quic_varint(pid) + _quic_varint(len(val_hex) // 2) + val_hex
 
-        def _tp_int(pid: int, value: int) -> str:
-            # Целочисленные параметры ТОЖЕ кодируются varint'ом, и длина обязана
-            # совпадать с числом байт varint'а (RFC 9000 §18.2). Прежняя запись
-            # фиксированной шириной (max_udp_payload_size = «04b0») читалась как
-            # varint «4» длиной 1 байт при заявленной длине 2 → строгий парсер
-            # отвечал TRANSPORT_PARAMETER_ERROR «length does not match»
-            # (проверено локальным aioquic-сервером).
-            v = _quic_varint(value)
-            return _quic_varint(pid) + _quic_varint(len(v) // 2) + v
 
-        tp_body = (
-            _tp_int(0x01, 30000) +     # max_idle_timeout = 30000 мс
-            _tp_int(0x03, 1200) +      # max_udp_payload_size = 1200
-            _tp_int(0x04, 65536) +     # initial_max_data
-            _tp_int(0x05, 65536) +     # initial_max_stream_data_bidi_local
-            _tp_int(0x06, 65536) +     # initial_max_stream_data_bidi_remote
-            _tp_int(0x07, 65536) +     # initial_max_stream_data_uni
-            _tp_int(0x08, 100) +       # initial_max_streams_bidi
-            _tp_int(0x09, 100) +       # initial_max_streams_uni
-            _tp_int(0x0e, 2) +         # active_connection_id_limit
-            _tp(0x0f, scid_hex)        # initial_source_connection_id = наш SCID
-        )
-        qtp_hex = "0039" + f"{len(tp_body)//2:04x}" + tp_body
-        # key_share (X25519 dummy public key)
-        ks_hex = "0033" + "0026" + "0024" + "001d" + "0020" + secrets.token_hex(32)
-        # All extensions
-        ext_hex = (f"0000{len(sni_ext_hex)//2:04x}{sni_ext_hex}"  # SNI
-                   f"{groups_hex}"                                 # supported_groups
-                   f"{sigalgs_hex}"                                # signature_algorithms
-                   f"{sv_hex}"                                     # supported_versions
-                   f"{alpn_hex}"                                   # ALPN
-                   f"{qtp_hex}"                                    # QUIC transport params
-                   f"{ks_hex}")                                    # key_share
-        ext_len = len(ext_hex) // 2
-        # ClientHello body
-        ch_body = (f"0303{random_hex}20{session_id_hex}"  # version + random + session
-                   f"{cipher_len:04x}{cipher_hex}"         # cipher suites
-                   f"0100"                                 # compression: null
-                   f"{ext_len:04x}{ext_hex}")              # extensions
-        ch_len = len(ch_body) // 2
-        ch_hex = f"01{ch_len:06x}{ch_body}"
-        # QUIC CRYPTO Frame (plaintext для шифрования) — varint длины корректный
-        crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(ch_hex) // 2) + ch_hex
-        quic_hex, qr_static_range = _build_quic_packet(
-            crypto_hex, scid_hex_preset=scid_hex,
-            pad_target=1200 if try_AESGCM is not None else 0)
-        # 16.10.2026: хвост <r>/<rc>/<rd> после QUIC Initial НЕ добавляем.
-        # 1200 Б Initial + хвост 400-500 Б давали датаграмму 1650-1716 Б >
-        # MTU 1500 → фрагментация, а настоящий QUIC Initial ровно 1200 Б
-        # (RFC 9000 §14.1) и на 1500-байтном пути не фрагментируется никогда.
-        # Вдобавок случайный хвост — это не валидный второй QUIC-пакет, то есть
-        # демаскировка. Объём серии и разброс размеров дают I2-I5, у них хвосты
-        # остаются (см. _gen_quic_client_handshake / _gen_quic_appdata).
-        return generate_cps_packet(
-            static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
-            use_timestamp=True,
-        )
 
-    def _quic_handshake_packet(payload_hex: str, ascii_base: int) -> str:
-        """QUIC Handshake-пакет (long header, PN=0) + хвост CPS как у I2-I5.
-
-        Общий сборщик для клиентского и серверного флайта: отличается только
-        содержимое/длина payload и база случайных ASCII в хвосте.
-        """
-        dcid_hex = secrets.token_hex(8)
-        scid_hex = secrets.token_hex(8)
-        body_len = 1 + len(payload_hex) // 2      # PN(1) + payload
-        handshake_hex = (f"e000000001"
-                         f"08{dcid_hex}"
-                         f"08{scid_hex}"
-                         f"{_quic_varint(body_len)}"
-                         f"00"                                     # PN = 0
-                         f"{payload_hex}")
-        return generate_cps_packet(
-            static_bytes=f"0x{handshake_hex}", static_bytes_range=30,
-            use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=ascii_base, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
-        )
-
-    def _gen_quic_client_handshake():
-        """QUIC Handshake (завершение рукопожатия клиента)."""
-        return _quic_handshake_packet(secrets.token_hex(64), 100)
-
-    def _gen_quic_server():
-        """QUIC ServerHello: uTLS (согласованный с ClientHello) → aioquic TLS 1.3 → TLS 1.2."""
-        utls = _quic_clienthello_via_utls()
-        if utls:
-            _, sh_hex, _ = utls
-            if sh_hex:
-                # varint длины CRYPTO + PADDING до 1200 (см. _gen_quic_client, 16.09.2026)
-                crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(sh_hex) // 2) + sh_hex
-                quic_hex, qr_static_range = _build_quic_packet(crypto_hex, default_range=40,
-                                                               is_server=True, pad_target=1200)
-                # Хвост не добавляем — см. _gen_quic_client (MTU 1500).
-                return generate_cps_packet(
-                    static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
-                    use_timestamp=True,
-                )
-        aio_hex = _quic_initial_via_aioquic(is_server=True)
-        if aio_hex:
-            return generate_cps_packet(
-                static_bytes=f"0x{aio_hex}", static_bytes_range=0,
-                use_timestamp=True,
-                random_bytes=0, random_bytes_range=0,
-                random_ascii=0, random_ascii_range=0,
-                random_digits=0, random_digits_range=0,
-            )
-        random_hex = secrets.token_hex(32)
-        session_id_hex = hashlib.sha256(seed.encode()).hexdigest() if seed else secrets.token_hex(32)  # рев-25: эхо session_id (RFC 5246): обе стороны — от seed → сервер эхо-отражает клиента
-        chosen_cipher = (random.Random(seed).choice([
-            "1301", "1302", "1303", "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
-        ]) if seed else secrets.choice([
-            "1301", "1302", "1303", "c02b", "c02f", "c02c", "c030", "cca8", "cca9"
-        ]))
-        # TLS 1.3 ServerHello обязан нести supported_versions=0x0304 и key_share
-        # (RFC 8446 §4.1.3/4.2.8) — без них ServerHello невалиден.
-        sh_ext = ("002b00020304"                              # supported_versions: TLS 1.3
-                  "0033" + "0024" + "001d" + "0020" + secrets.token_hex(32))  # key_share x25519
-        sh_body = (f"0303{random_hex}20{session_id_hex}"
-                   f"{chosen_cipher}"
-                   f"00"
-                   f"{len(sh_ext)//2:04x}{sh_ext}")
-        sh_len = len(sh_body) // 2
-        sh_hex = f"02{sh_len:06x}{sh_body}"
-        crypto_hex = "06" + _quic_varint(0) + _quic_varint(len(sh_hex) // 2) + sh_hex
-        quic_hex, qr_static_range = _build_quic_packet(
-            crypto_hex, default_range=40, is_server=True,
-            pad_target=1200 if try_AESGCM is not None else 0)
-
-        # Хвост не добавляем — см. _gen_quic_client (MTU 1500).
-        return generate_cps_packet(
-            static_bytes=f"0x{quic_hex}", static_bytes_range=qr_static_range,
-            use_timestamp=True,
-        )
-
-    def _gen_quic_server_handshake():
-        """QUIC серверный flight (EncryptedExtensions+Cert+CertVerify+Finished).
-
-        Handshake-пакеты шифруются ключами рукопожатия, которые DPI не может вывести
-        (нужны приватные ключи) — payload для него непрозрачен. Поэтому достаточно
-        реалистичной ДЛИНЫ: серверный flight с сертификатом ~1000+ байт.
-        """
-        return _quic_handshake_packet(secrets.token_hex(1000), 150)  # фрагмент flight с сертификатом
-
-    def _gen_quic_appdata():
-        """QUIC 1-RTT (application data) — короткий заголовок.
-
-        Реальный хендшейк завершается данными приложения (1-RTT, short header).
-        Payload шифруется сессионными ключами — DPI видит только заголовок и длину.
-        """
-        payload = secrets.token_hex(48)
-        dcid_hex = secrets.token_hex(8)
-        # short header: 0x40 (fixed bit, pn_len=1) + DCID(8) + PN(1) + payload
-        appdata_hex = f"40{dcid_hex}00{payload}"
-        return generate_cps_packet(
-            static_bytes=f"0x{appdata_hex}", static_bytes_range=0,
-            use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
-        )
 
     # ─── STUN имитация (WebRTC ICE / NAT traversal) ─────────────
-    def _stun_mi_key() -> str:
-        """Ключ MESSAGE-INTEGRITY: детерминированный от seed (session_id в STUN-серии),
-        иначе случайный. Реальный HMAC-SHA1, просто не привязан к живой ICE-сессии."""
-        if seed:
-            return hashlib.sha256(seed.encode()).hexdigest()
-        return secrets.token_hex(32)
 
-    def _stun_ufrag() -> str:
-        """Рев-25: уникальный ICE username fragment на конфиг (детерминированно
-        от seed; раньше константа «abc123:xyz789» — стабильный отпечаток во
-        ВСЕХ конфигах). В реальном ICE у каждой стороны свой ufrag."""
-        if seed:
-            h = hashlib.sha256(("stun-ufrag:" + seed).encode()).hexdigest()
-            return f"{h[:10]}:{h[10:16]}"
-        return secrets.token_hex(5) + ":" + secrets.token_hex(3)
 
-    def _stun_build(msg_type_hex: str, attrs_hex: str, mi_key: str = "") -> str:
-        """Собирает STUN-сообщение (RFC 5389): header + attributes + [MESSAGE-INTEGRITY] + FINGERPRINT.
 
-        Header: type(2) + length(2) + magic cookie 0x2112A442 + transaction ID(12).
-        MESSAGE-INTEGRITY (0x0008, если задан mi_key): HMAC-SHA1 по сообщению с
-        обнулённым значением MI (RFC 5389 §15.4) — криптографически валидный.
-        FINGERPRINT (0x8028): CRC-32 сообщения (с обнулённым значением атрибута)
-        XOR 0x5354554E. DPI может проверить FINGERPRINT — считаем корректно.
-        """
-        txid = secrets.token_hex(12)
-        # length = attrs + MI(24, если есть: 4 header + 20 value) + FINGERPRINT(8); header = 20 байт
-        extra = 8 + (24 if mi_key else 0)
-        total_len = (len(attrs_hex) // 2) + extra
-        msg = msg_type_hex + f"{total_len:04x}" + "2112a442" + txid + attrs_hex
-        if mi_key:
-            # MI: HMAC-SHA1 по сообщению + header MI (type+len), значение 0
-            mi_input = msg + "0008" + "0014" + "00" * 20
-            mi = hmac.new(mi_key.encode(), bytes.fromhex(mi_input), hashlib.sha1).hexdigest()
-            msg += "0008" + "0014" + mi
-        # FINGERPRINT: RFC 8489 §14.6 — CRC-32 по сообщению БЕЗ самого атрибута
-        # (фикс аудита: конкатенация «8028 0004 00000000» давала CRC, не
-        # совпадающий с проверкой специ-совместимого DPI).
-        fp = (zlib.crc32(bytes.fromhex(msg)) & 0xffffffff) ^ 0x5354554E
-        msg += "8028" + "0004" + f"{fp:08x}"
-        return msg
 
-    def _gen_stun_client():
-        """STUN Binding Request (WebRTC ICE connectivity check)."""
-        priority = "0024" + "0004" + "6e7a1b7f"          # PRIORITY (1853634559)
-        ice_ctrl = "802a" + "0008" + secrets.token_hex(8)  # ICE-CONTROLLING tie-breaker
-        ufrag = _stun_ufrag()                            # рев-25: уникальный per-конфиг
-        pad = (4 - (len(ufrag) % 4)) % 4                   # STUN: атрибуты кратны 4 байтам
-        username = "0006" + f"{len(ufrag):04x}" + ufrag.encode().hex() + "00" * pad
-        msg = _stun_build("0001", priority + ice_ctrl + username, mi_key=_stun_mi_key())
-        return _cps_with_std_tail(msg)
-
-    def _gen_stun_server():
-        """STUN Binding Success Response (XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY)."""
-        # XOR-MAPPED-ADDRESS (0x0020): reserved+family(1) + XOR-port(2) + XOR-addr(4)
-        # Рев-25: детерминированно от seed — раньше константы (192.168.1.1:52884)
-        # были отпечатком во всех конфигах.
-        if seed:
-            h = hashlib.sha256(("stun-xor:" + seed).encode()).digest()
-            port = 1024 + ((h[0] << 8 | h[1]) % (65535 - 1024 + 1))
-            ip = (10 << 24) | (h[2] << 16) | (h[3] << 8) | h[4]
-        else:
-            port = 1024 + secrets.randbelow(65535 - 1024 + 1)
-            ip = (10 << 24) | (secrets.randbelow(256) << 16) | (secrets.randbelow(256) << 8) | secrets.randbelow(256)
-        xport = port ^ 0x2112
-        xaddr = ip ^ 0x2112A442
-        xma = "0020" + "0008" + "0001" + f"{xport:04x}" + f"{xaddr:08x}"
-        # MESSAGE-INTEGRITY (0x0008): настоящий HMAC-SHA1(20) от ключа из seed.
-        msg = _stun_build("0101", xma, mi_key=_stun_mi_key())
-        return _cps_with_std_tail(msg)
 
     # ─── DTLS 1.2 имитация (WebRTC) ─────────────────────────────
-    def _dtls_suites():
-        """Cipher suites DTLS 1.2 (WebRTC): первый — детерминированный от seed."""
-        # Только те cipher suites, что предлагает Pion DTLS ClientHello (c02b/c02f/c02c/c030),
-        # чтобы ServerHello всегда выбирал cipher из списка клиента.
-        suites_pool = ["c02b", "c02f", "c02c", "c030"]
-        if seed:
-            rnd = random.Random(seed)
-            preferred = rnd.choice(suites_pool)
-            suites_pool.remove(preferred)
-            suites_pool.insert(0, preferred)
-        return suites_pool
 
-    def _dtls_sni_ext():
-        """SNI extension (если задан domain)."""
-        if not domain:
-            return ""
-        sni_bytes = domain.encode('utf-8')
-        sni_hex = sni_bytes.hex()
-        return f"0000{len(sni_bytes)+5:04x}00{len(sni_bytes):04x}{sni_hex}"
 
-    def _dtls_extensions():
-        """Набор extensions DTLS 1.2 как у Chrome WebRTC.
 
-        Порядок и состав повторяют реальный ClientHello: server_name,
-        extended_master_secret, renegotiation_info, supported_groups,
-        ec_point_formats, signature_algorithms, use_srtp. НЕ включаем
-        supported_versions (0x002b) — это фича TLS 1.3, в DTLS 1.2 её нет.
-        """
-        groups_hex = ("000a00140012001d0017001800190100"
-                      "1c000b000a0009")
-        sigalgs_hex = ("000d001a001806010602060305010502"
-                       "0503040104020403080408040508")
-        ecpt_hex = "000b00020100"
-        srtp_hex = "000e0005000200010000"
-        ems_hex = "00170000"          # extended_master_secret (пустое значение)
-        reneg_hex = "ff01000100"
-        return (_dtls_sni_ext() + ems_hex + reneg_hex + groups_hex
-                + ecpt_hex + sigalgs_hex + srtp_hex)
 
-    def _dtls_record(content_type: int, epoch: int, seq: int, payload_hex: str) -> str:
-        """DTLS 1.2 record: content_type(1) + version fefd + epoch(2) + seq(6) + length(2) + payload."""
-        return f"{content_type:02x}fefd{epoch:04x}{seq:012x}{len(payload_hex)//2:04x}{payload_hex}"
 
-    def _dtls_handshake(msg_type: int, msg_seq: int, body_hex: str) -> str:
-        """DTLS handshake msg: type(1) + length(3) + msg_seq(2) + frag_offset(3) + frag_len(3) + body."""
-        body_len = len(body_hex) // 2
-        return f"{msg_type:02x}{body_len:06x}{msg_seq:04x}000000{body_len:06x}{body_hex}"
 
-    def _cps_with_std_tail(msg_hex: str) -> str:
-        """CPS-пакет: статичное сообщение протокола + стандартный хвост
-        `<t><r 200..300><rc 100..200><rd 10..15>` (одинаков у STUN и DTLS)."""
-        return generate_cps_packet(
-            static_bytes=f"0x{msg_hex}", static_bytes_range=0,
-            use_timestamp=True,
-            random_bytes=200, random_bytes_range=100,
-            random_ascii=100, random_ascii_range=100,
-            random_digits=10, random_digits_range=5,
-        )
 
-    # Историческое имя для DTLS-вызовов (14 мест): тот же хвост, доменное название.
-    _dtls_packet = _cps_with_std_tail
 
-    _dtls_pion_cache = None
 
-    def _dtls_clienthello_via_pion():
-        """Генерирует настоящие WebRTC DTLS 1.2 сообщения через Pion DTLS-сайдкар.
 
-        Возвращает кортеж (clienthello_hex, serverhello_hex, certificate_hex,
-        skx_hex, shd_hex) — полные DTLS records, или None если сайдкар
-        недоступен / ошибка. Результат кэшируется: один запуск сайдкара на все
-        I-параметры, чтобы ServerHello и flight были согласованы с ClientHello
-        (один и тот же handshake).
-        """
-        nonlocal _dtls_pion_cache
-        if _dtls_pion_cache is not None:
-            return _dtls_pion_cache
-        sidecar = _ensure_imitat_sidecar()
-        if not sidecar:
-            return None
-        try:
-            rc, out = exec_cmd([sidecar, "-mode", "dtls", "-sni", domain or "www.example.com",
-                                "-seed", seed or ""], timeout=15)  # рев-25: детерминированный серверный сертификат
-            if rc != 0:
-                logger.warning("⚠  DTLS-сайдкар вернул код %s: %s", rc, out.strip()[:200])
-                return None
-            data = json.loads(out.strip().splitlines()[-1])
-            ch_hex = data.get("clienthello_hex", "")
-            sh_hex = data.get("serverhello_hex", "")
-            cert_hex = data.get("certificate_hex", "")
-            skx_hex = data.get("skx_hex", "")
-            shd_hex = data.get("shd_hex", "")
-            if not ch_hex:
-                return None
-            _dtls_pion_cache = (ch_hex, sh_hex, cert_hex, skx_hex, shd_hex)
-            return _dtls_pion_cache
-        except Exception as e:
-            logger.warning("⚠  DTLS-сайдкар не сработал: %s", e)
-            return None
 
-    def _gen_dtls_client():
-        """DTLS 1.2 ClientHello (WebRTC) — msg_seq=0, epoch=0 seq=0.
 
-        Если доступен Pion DTLS-сайдкар — используем настоящий WebRTC ClientHello
-        (неотличим от реального). Иначе рукописный (та же структура, но без
-        точного порядка extensions реального стека).
-        """
-        pion = _dtls_clienthello_via_pion()
-        if pion:
-            return _dtls_packet(pion[0])
-        random_hex = secrets.token_hex(32)
-        cipher_hex = "".join(_dtls_suites())
-        cipher_len = len(cipher_hex) // 2
-        ext_hex = _dtls_extensions()
-        ext_len = len(ext_hex) // 2
-        # ClientHello body: version + random + session_id(0) + cookie(0) + ciphers + compression + extensions
-        ch_body = (f"fefd{random_hex}"
-                   f"00"                       # session_id len 0
-                   f"00"                       # cookie len 0
-                   f"{cipher_len:04x}{cipher_hex}"
-                   f"0100"                     # compression: len 1, null
-                   f"{ext_len:04x}{ext_hex}")
-        return _dtls_packet(_dtls_record(0x16, 0, 0, _dtls_handshake(0x01, 0, ch_body)))
 
-    def _gen_dtls_client_kex():
-        """DTLS 1.2 ClientKeyExchange (ECDHE) — msg_seq=1, epoch=0 seq=1."""
-        pubkey = secrets.token_hex(33)         # compressed P-256 point
-        body = f"{33:02x}{pubkey}"
-        return _dtls_packet(_dtls_record(0x16, 0, 1, _dtls_handshake(0x10, 1, body)))
 
-    def _gen_dtls_ccs():
-        """DTLS ChangeCipherSpec. Record-seq: после server flight
-        (SH=0,Cert=1,SKX=2,SHD=3) — 4; у клиента (CH=0,CKE=1) — 2.
-        Фикс аудита: жёсткий seq=2 коллизировал с SKX в серверном пуле."""
-        return _dtls_packet(_dtls_record(0x14, 0, 4 if for_server else 2, "01"))
 
-    def _gen_dtls_finished():
-        """DTLS Finished (зашифрован) — epoch=1 seq=0.
-        msg_seq зависит от направления: сервер после ServerHelloDone(3) → 4,
-        клиент после ClientKeyExchange(1) → 2."""
-        body = secrets.token_hex(12)           # verify_data (SHA-256 PRF)
-        msg_seq = 4 if for_server else 2
-        return _dtls_packet(_dtls_record(0x16, 1, 0, _dtls_handshake(0x14, msg_seq, body)))
-
-    def _gen_dtls_appdata():
-        """DTLS ApplicationData (зашифрован) — epoch=1 seq=1."""
-        payload = secrets.token_hex(random.randint(40, 120))
-        return _dtls_packet(_dtls_record(0x17, 1, 1, payload))
-
-    def _gen_dtls_server():
-        """DTLS 1.2 ServerHello (WebRTC) — msg_seq=0, epoch=0 seq=0.
-
-        Если доступен Pion DTLS-сайдкар — настоящий ServerHello (реальный стек,
-        cipher из набора клиента). Иначе рукописный (та же структура).
-        """
-        pion = _dtls_clienthello_via_pion()
-        if pion and pion[1]:
-            return _dtls_packet(pion[1])
-        random_hex = secrets.token_hex(32)
-        # Выбираем только из cipher suites, предлагаемых клиентом (Pion: c02b/c02f/c02c/c030).
-        chosen_cipher = (random.Random(seed).choice([
-            "c02b", "c02f", "c02c", "c030"
-        ]) if seed else secrets.choice([
-            "c02b", "c02f", "c02c", "c030"
-        ]))
-        # ServerHello body: version + random + session_id(0) + cipher + compression + extensions(0)
-        sh_body = (f"fefd{random_hex}"
-                   f"00"                       # session_id len 0
-                   f"{chosen_cipher}"
-                   f"00"                       # compression: null
-                   f"0000")                    # extensions len 0
-        return _dtls_packet(_dtls_record(0x16, 0, 0, _dtls_handshake(0x02, 0, sh_body)))
-
-    def _gen_dtls_server_cert():
-        """DTLS 1.2 Certificate — msg_seq=1, epoch=0 seq=1.
-
-        Если доступен Pion DTLS-сайдкар — настоящий X.509 сертификат (реальный
-        DER, случайный serial/CN). Иначе рукописный (та же структура).
-        """
-        pion = _dtls_clienthello_via_pion()
-        if pion and pion[2]:
-            return _dtls_packet(pion[2])
-        cert = secrets.token_hex(random.randint(600, 900))
-        cert_entry = f"{len(cert)//2:06x}{cert}"
-        cert_body = f"{len(cert_entry)//2:06x}{cert_entry}"
-        return _dtls_packet(_dtls_record(0x16, 0, 1, _dtls_handshake(0x0b, 1, cert_body)))
-
-    def _gen_dtls_server_skx():
-        """DTLS 1.2 ServerKeyExchange — msg_seq=2, epoch=0 seq=2.
-
-        Если доступен Pion DTLS-сайдкар — настоящий SKX (реальная ECDSA-подпись
-        в ServerKeyExchange). Иначе рукописный.
-        """
-        pion = _dtls_clienthello_via_pion()
-        if pion and pion[3]:
-            return _dtls_packet(pion[3])
-        skx_pub = secrets.token_hex(33)
-        skx_sig = secrets.token_hex(70)        # ECDSA P-256 подпись ~70 байт
-        skx_body = f"030017{33:02x}{skx_pub}0603{70:04x}{skx_sig}"
-        return _dtls_packet(_dtls_record(0x16, 0, 2, _dtls_handshake(0x0c, 2, skx_body)))
-
-    def _gen_dtls_server_shd():
-        """DTLS 1.2 ServerHelloDone — msg_seq=3, epoch=0 seq=3."""
-        pion = _dtls_clienthello_via_pion()
-        if pion and pion[4]:
-            return _dtls_packet(pion[4])
-        return _dtls_packet(_dtls_record(0x16, 0, 3, _dtls_handshake(0x0e, 3, "")))
 
     # Определяем пул в зависимости от направления, протокола и domain
     if proto == "dtls":
         if for_server:
-            pool_fns = [_gen_dtls_server, _gen_dtls_server_cert, _gen_dtls_server_skx, _gen_dtls_server_shd, _gen_dtls_ccs, _gen_dtls_finished, _gen_dtls_appdata]
+            pool_fns = [partial(_gen_dtls_server, domain, seed), partial(_gen_dtls_server_cert, domain, seed), partial(_gen_dtls_server_skx, domain, seed), partial(_gen_dtls_server_shd, domain, seed), partial(_gen_dtls_ccs, for_server), partial(_gen_dtls_finished, for_server), _gen_dtls_appdata]
         else:
-            pool_fns = [_gen_dtls_client, _gen_dtls_client_kex, _gen_dtls_ccs, _gen_dtls_finished, _gen_dtls_appdata]
+            pool_fns = [partial(_gen_dtls_client, domain, seed), _gen_dtls_client_kex, partial(_gen_dtls_ccs, for_server), partial(_gen_dtls_finished, for_server), _gen_dtls_appdata]
     elif proto == "stun":
         if for_server:
-            pool_fns = [_gen_stun_server]
+            pool_fns = [partial(_gen_stun_server, seed)]
         else:
-            pool_fns = [_gen_stun_client]
+            pool_fns = [partial(_gen_stun_client, seed)]
     elif for_server and domain:
-        pool_fns = [_gen_quic_server, _gen_quic_server_handshake, _gen_quic_appdata]
+        pool_fns = [partial(_gen_quic_server, domain, seed, try_AESGCM), _gen_quic_server_handshake, _gen_quic_appdata]
     elif domain:
-        pool_fns = [_gen_quic_client, _gen_quic_client_handshake, _gen_quic_appdata]
+        pool_fns = [partial(_gen_quic_client, domain, seed, try_AESGCM), _gen_quic_client_handshake, _gen_quic_appdata]
     else:
         # Стандартный случайный пул
         pool_fns = [_gen_dns, _gen_quic, _gen_dtls, _gen_ntp, _gen_random, _gen_srtp]
@@ -9814,10 +10438,10 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
             if for_server:
                 # Сервер всегда шлёт полный flight (ServerHello+Cert+SKX+SHD) → минимум 4.
                 count = random.randint(4, I_SNI_COUNT_MAX)
-                order = [_gen_dtls_server, _gen_dtls_server_cert, _gen_dtls_server_skx, _gen_dtls_server_shd, _gen_dtls_ccs, _gen_dtls_finished, _gen_dtls_appdata]
+                order = [partial(_gen_dtls_server, domain, seed), partial(_gen_dtls_server_cert, domain, seed), partial(_gen_dtls_server_skx, domain, seed), partial(_gen_dtls_server_shd, domain, seed), partial(_gen_dtls_ccs, for_server), partial(_gen_dtls_finished, for_server), _gen_dtls_appdata]
             else:
                 count = random.randint(I_SNI_COUNT_MIN, I_SNI_COUNT_MAX)
-                order = [_gen_dtls_client, _gen_dtls_client_kex, _gen_dtls_ccs, _gen_dtls_finished, _gen_dtls_appdata]
+                order = [partial(_gen_dtls_client, domain, seed), _gen_dtls_client_kex, partial(_gen_dtls_ccs, for_server), partial(_gen_dtls_finished, for_server), _gen_dtls_appdata]
             current = [order[min(i, len(order) - 1)]() for i in range(count)]
         elif is_imitation_pool:
             count = random.randint(I_SNI_COUNT_MIN, I_SNI_COUNT_MAX)
@@ -9826,9 +10450,9 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
             #   сервер: ServerHello → Flight → AppData
             # (после первого пакета остальные заполняются AppData)
             if for_server:
-                order = [_gen_quic_server, _gen_quic_server_handshake, _gen_quic_appdata]
+                order = [partial(_gen_quic_server, domain, seed, try_AESGCM), _gen_quic_server_handshake, _gen_quic_appdata]
             else:
-                order = [_gen_quic_client, _gen_quic_client_handshake, _gen_quic_appdata]
+                order = [partial(_gen_quic_client, domain, seed, try_AESGCM), _gen_quic_client_handshake, _gen_quic_appdata]
             current = [order[min(i, len(order) - 1)]() for i in range(count)]
         else:
             is_single_pool = len(pool_fns) == 1
@@ -9891,6 +10515,8 @@ def _generate_i_params(for_client: bool = False, for_server: bool = True, domain
 
 
 def generate_all_params(version: str, for_client: bool = False, for_server: bool = True, for_warp: bool = False, domain: str = "", tun_name: str = "", seed_override: str = "", proto: str = "", server_pubkey: str = "") -> dict:
+    # tun_name сохранён для совместимости подписи (есть и в old/preold-ревизиях):
+    # имена WARP-конфигов строит generate_warp_configs, здесь он не нужен.
     """
     УНИВЕРСАЛЬНАЯ ФУНКЦИЯ — генерирует ВСЕ параметры обфускации сразу.
     Возвращает полный набор параметров, но неподдерживаемые версии = None.
@@ -10078,7 +10704,7 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
             result.update(dict(zip(keys, values, strict=True)))
             result[comment_key] = comment_val
         else:
-            result.update({k: None for k in keys})
+            result.update(dict.fromkeys(keys))
 
     # Jc, Jmin, Jmax — генерируются и для WARP
     _add_param_group(("Jc", "Jmin", "Jmax"), (Jc, Jmin, Jmax), supports_jc, "_J_comment", "AWG+",
@@ -10190,6 +10816,17 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
             logger.warning("⚠  I-строка %s длиной %d обрезана до %d (крайняя мера)", _ik, len(_s), _keep)
             result[_ik] = _s[:_keep]
 
+    # Рев-50 (проверено на стенде): Cloudflare WARP — ЧИСТЫЙ WireGuard, и мусорные
+    # пакеты перед рукопожатием (Jc > 0) он дропает: с Jc = 100 рукопожатия нет
+    # («0 B received, 6.04 KiB sent», пинг 0 из 3), с Jc = 0 — рукопожатие и пинг есть.
+    # Поэтому для WARP Jc = 0 — но ТОЛЬКО там, где Jc вообще поддерживается
+    # (для версии WG параметра нет, и добавлять его нельзя).
+    if for_warp and result.get("Jc") is not None:
+        if result["Jc"] != "0":
+            logger.info("ℹ️  WARP: Jc=%s → 0 (Cloudflare дропает рукопожатие с мусором перед ним)",
+                        result["Jc"])
+        result["Jc"] = "0"
+
     return result
 
 # ----------------- Генерация ключей -----------------
@@ -10275,15 +10912,11 @@ def atomic_write_text(path: pathlib.Path, text: str, encoding: str = "utf-8") ->
         # Сохраняем права/владельца существующего файла (аудит-20: mkstemp
         # создавал файл 0600, сбивая ручные chmod/chown на конфигах).
         if prev_mode is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.chmod(str(path), prev_mode)
-            except OSError:
-                pass
         if prev_uid is not None and hasattr(os, 'chown'):
-            try:
+            with contextlib.suppress(OSError):
                 os.chown(str(path), prev_uid, prev_gid)
-            except OSError:
-                pass
         # fsync родительской директории (фикс аудита): rename сам по себе
         # не гарантирует переживания краха хоста без durable-каталога.
         try:
@@ -10317,6 +10950,35 @@ def _chmod_owner_only(path: pathlib.Path, what: str = "файл") -> None:
                        pathlib.Path(path).name, e, what)
 
 
+@contextlib.contextmanager
+def _file_lock(path: pathlib.Path):
+    """Эксклюзивная блокировка файла через <path>.lock (fcntl, Linux).
+
+    Рев-45: без неё параллельные -a/-u/-d перекрывались в окне между проверкой
+    mtime и os.replace, и правка одного процесса терялась целиком. Вне Linux
+    (нет fcntl) — no-op: остаётся прежняя защита по mtime.
+    """
+    _fh = None
+    try:
+        # Ветки Linux-only: на машине разработки (Windows) fcntl отсутствует, а на
+        # сервере отсутствует ветка except — обе помечены как платформенные.
+        import fcntl  # pragma: no cover  # noqa: PLC0415 — только Linux
+        # Хэндл lock-файла обязан жить всё время блокировки (закрываем в finally)
+        _fh = open(str(path) + ".lock", "a+", encoding="utf-8")  # pragma: no cover  # noqa: SIM115 — хэндл живёт всё время блокировки
+        fcntl.flock(_fh.fileno(), fcntl.LOCK_EX)  # pragma: no cover
+    except Exception:
+        if _fh is not None:  # pragma: no cover — только при сбое fcntl/open
+            _fh.close()  # pragma: no cover
+        _fh = None
+    try:
+        yield
+    finally:
+        if _fh is not None:  # pragma: no cover — только Linux
+            with contextlib.suppress(Exception):  # pragma: no cover
+                fcntl.flock(_fh.fileno(), fcntl.LOCK_UN)  # pragma: no cover
+            _fh.close()  # pragma: no cover
+
+
 def _atomic_rmw(path: pathlib.Path, make, attempts: int = 3) -> str:
     """Атомарный read-modify-write с повторной попыткой по mtime (фикс аудита-A1:
     параллельные -a/-u/-d теряли клиента/правку; без fcntl, переносимо).
@@ -10327,27 +10989,30 @@ def _atomic_rmw(path: pathlib.Path, make, attempts: int = 3) -> str:
     """
     _path = pathlib.Path(path)
     _last: Exception | None = None
-    for _attempt in range(1, attempts + 1):
-        try:
-            _st1 = _path.stat()
-        except OSError:
-            _st1 = None
-        text = make()
-        try:
-            _st2 = _path.stat()
-        except OSError:
-            _st2 = None
-        if _st1 is not None and _st2 is not None:
-            def _fkey(st):
-                return (getattr(st, "st_mtime_ns", st.st_mtime), st.st_size, getattr(st, "st_ino", 0))
-            if _fkey(_st1) != _fkey(_st2):
-                _last = RuntimeError(
-                    f'Конфиг {_path.name} изменён параллельно (попытка {_attempt}/{attempts}), перечитываю...')
-                logger.warning("%s", _last)
-                continue
-        atomic_write_text(_path, text)
-        return text
-    raise RuntimeError(f'Конфиг {_path} меняется параллельно: не удалось сохранить за {attempts} попытки') from _last
+    # Рев-45: эксклюзивная блокировка на весь цикл — параллельные
+    # процессы ждут, а не перечитывают вслепую (mtime-проверка остаётся).
+    with _file_lock(_path):
+        for _attempt in range(1, attempts + 1):
+            try:
+                _st1 = _path.stat()
+            except OSError:
+                _st1 = None
+            text = make()
+            try:
+                _st2 = _path.stat()
+            except OSError:
+                _st2 = None
+            if _st1 is not None and _st2 is not None:
+                def _fkey(st):
+                    return (getattr(st, "st_mtime_ns", st.st_mtime), st.st_size, getattr(st, "st_ino", 0))
+                if _fkey(_st1) != _fkey(_st2):
+                    _last = RuntimeError(
+                        f'Конфиг {_path.name} изменён параллельно (попытка {_attempt}/{attempts}), перечитываю...')
+                    logger.warning("%s", _last)
+                    continue
+            atomic_write_text(_path, text)
+            return text
+        raise RuntimeError(f'Конфиг {_path} меняется параллельно: не удалось сохранить за {attempts} попытки') from _last
 
 
 def exec_cmd(cmd, input: str | None = None, shell: bool = False, timeout: int | None = None,
@@ -10637,8 +11302,10 @@ class WGConfig:
                     iface = secitem
                 continue
             parsed = line
+            _commented = False
             if parsed.startswith('#_') and '=' in parsed:
                 parsed = parsed[2:]
+                _commented = True
             if parsed.startswith('#'):
                 continue
             if '=' not in parsed:
@@ -10647,6 +11314,12 @@ class WGConfig:
             vname = parsed[:xv].strip()
             value = parsed[xv + 1 :].strip()
             if not secitem or not lineitem:
+                continue
+            # Рев-44: активное значение приоритетнее закомментированного. Раньше
+            # побеждала последняя строка, поэтому `#_Address = <payload>` перекрывал
+            # настоящий Address (wg-quick такие строки игнорирует) — и payload уходил
+            # в root-bash. Теперь `#_`-строка не может перезаписать активный ключ.
+            if _commented and vname in secitem:
                 continue
             secitem[vname] = value
             lineitem[vname] = n
@@ -10895,10 +11568,8 @@ def check_endpoint(host_port: str, timeout: float = 1.5) -> bool:
                 s.close()
                 return True
             except Exception:
-                try:
+                with contextlib.suppress(Exception):
                     s.close()
-                except Exception:
-                    pass
     except Exception:
         pass
     # Попытка UDP
@@ -10925,10 +11596,8 @@ def check_endpoint(host_port: str, timeout: float = 1.5) -> bool:
                 s.close()
                 return True
             except Exception:
-                try:
+                with contextlib.suppress(Exception):
                     s.close()
-                except Exception:
-                    pass
     except Exception:
         pass
     return False
@@ -11269,6 +11938,24 @@ def _sanitize_label(lbl: str) -> str:
     return lbl2
 
 
+def _valid_endpoint_host(host: str) -> bool:
+    """Годен ли хост endpoint'а: IP-адрес или DNS-имя.
+
+    Рев-44: раньше хост не проверялся вовсе — мусорные токены ("domain=ya.ru",
+    "1300", "1.2.3.4:99") становились отдельными endpoint'ами, и на каждого пира
+    генерировался лишний клиентский .conf с недостижимым Endpoint.
+    """
+    h = str(host).strip().strip('[]')
+    if not h or h.startswith('.') or h.endswith('.'):
+        return False
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    return bool(re.fullmatch(r'[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?', h))
+
+
 def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]:
     out = []
     if not text:
@@ -11294,10 +11981,9 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
                 # Параметр = key=value без порта (domain=yandex.ru, mtu=1340, ;mtu=1340)
                 if "=" in part and ":" not in part:
                     key_part = part.split("=", 1)[0].strip().lstrip(";")
-                    if key_part.isalpha():
-                        if merged:
-                            merged[-1] += "," + part
-                            continue
+                    if key_part.isalpha() and merged:
+                        merged[-1] += "," + part
+                        continue
                 merged.append(part)
             tokens.extend(merged)
 
@@ -11307,6 +11993,14 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
         mtu_val = ""
         domain_val = ""
         proto_val = ""
+
+        # Рев-44: параметры могут быть приклеены ЗАПЯТОЙ без пробела
+        # ("1.2.3.4:51820,mtu=1300"): такой токен не содержал ";", параметры
+        # не читались, а хвост ломал разбор порта — endpoint терялся целиком.
+        if "," in p and ";" not in p:
+            _head, _sep, _tail = p.partition(",")
+            if _tail and re.fullmatch(r'[a-z]+=[^,;]*(?:,[a-z]+=[^,;]*)*', _tail):
+                p = _head + ";" + _tail
 
         # Парсинг ;key=value,key=value (разделители параметров: ',' или ';')
         if ";" in p:
@@ -11318,10 +12012,15 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
                     k, v = pair.split("=", 1)
                     params[k.strip()] = v.strip()
             m = params.get("mtu", "")
-            if m and m.isdigit():
-                mi = int(m)
-                if 1280 <= mi <= 1440:
-                    mtu_val = m
+            if m:
+                # Рев-44: isdigit() истинно для Unicode-цифр (², ①, ١٢٣), а int() их
+                # не разбирает — был необработанный ValueError (падение всего прогона).
+                try:
+                    mi = int(m)
+                except ValueError:
+                    mi = None
+                if mi is not None and 1280 <= mi <= 1440:
+                    mtu_val = str(mi)
             d = params.get("domain", "")
             if d:
                 domain_val = d
@@ -11333,6 +12032,11 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
         # замыкания на переменные цикла — B023): default-аргументы захватывают
         # значения СЕЙЧАС, поведение идентично старому.
         def _append(host, port, label, _mtu=mtu_val, _domain=domain_val, _proto=proto_val):
+            # Рев-44: хост проверяем — иначе мусорные токены ("domain=ya.ru",
+            # "1300") становились отдельными endpoint'ами (см. _valid_endpoint_host).
+            if not _valid_endpoint_host(host):
+                logger.warning("⚠  Пропущен endpoint с недопустимым хостом: %r", host)
+                return
             out.append({"host": host, "port": str(port), "label": label,
                         "mtu": _mtu, "domain": _domain, "proto": _proto})
 
@@ -11357,16 +12061,16 @@ def parse_endpoints_config(text: str, default_port: str) -> list[dict[str, str]]
                 host = host_section.strip()
                 if not host:
                     continue
-                if not str(port).isdigit():
-                    port = default_port
-                else:
-                    try:
-                        port_int = int(port)
-                        if not (1 <= port_int <= 65535):
-                            port = default_port
-                    except Exception:
-                        port = default_port
-                _append(host, port, label)
+                # Рев-44: храним НОРМАЛИЗОВАННЫЙ порт. Раньше валидация шла по int(port),
+                # а в конфиг уходила исходная строка — Unicode-цифры («[::1]:١٢٣») попадали
+                # в Endpoint дословно.
+                try:
+                    port_int = int(str(port).strip())
+                except (TypeError, ValueError):
+                    port_int = 0
+                if not (1 <= port_int <= 65535):
+                    port_int = int(default_port)
+                _append(host, str(port_int), label)
                 continue
             except ValueError:
                 hostport = p
@@ -11491,6 +12195,9 @@ def parse_allowedips_config(text: str, server_addr: str = "") -> tuple[dict[str,
         # Первая часть должна содержать определение
         def_part = parts[0]
         if '=' not in def_part:
+            # Рев-46: раньше строка молча игнорировалась — опечатка в
+            # _allowedips.config давала клиента без нужных AllowedIPs без предупреждения
+            logger.warning('⚠  Строка _allowedips.config без "=": %r — пропущена', line)
             continue
             
         name, ips = def_part.split('=', 1)
@@ -11546,10 +12253,9 @@ def init_interface_paths(interface_name: str):
 
 def _ensure_endpoint_file_exists(default_addr: str) -> None:
     try:
-        if not g_endpoint_config_fn.exists():
-            if default_addr and default_addr.strip():
-                atomic_write_text(g_endpoint_config_fn, (default_addr or "") + "\n")
-                logger.info("✅ _endpoint.config создан: %s", g_endpoint_config_fn)
+        if not g_endpoint_config_fn.exists() and default_addr and default_addr.strip():
+            atomic_write_text(g_endpoint_config_fn, (default_addr or "") + "\n")
+            logger.info("✅ _endpoint.config создан: %s", g_endpoint_config_fn)
     except Exception as e:
         logger.warning("⚠  Не удалось создать _endpoint.config: %s", e)
 
@@ -11798,6 +12504,13 @@ def _process_interface_path(raw_input: str) -> tuple[pathlib.Path, str]:
     # и ломали пути (tun_name идёт в каталоги и shell). Запрещаем явно.
     if tun_name in ('.', '..'):
         raise RuntimeError(f'Недопустимое имя интерфейса "{raw_input}": нельзя "." и ".."')
+    # Рев-44: имя, у которого после отбрасывания ".conf" ничего не осталось
+    # (".conf", "....conf"), даёт ПУСТОЕ имя интерфейса — awg-quick выводит его как
+    # `basename <файл> .conf`, и интерфейс не создаётся. Отклоняем сразу.
+    if not tun_name or tun_name.startswith('.'):
+        raise RuntimeError(
+            f'Недопустимое имя интерфейса "{raw_input}": после отбрасывания ".conf" '
+            f'не остаётся имени (получилось {tun_name!r})')
     # Рев-37: имена, которые физически не дают создать интерфейс.
     # `ip link add <name> type amneziawg` разбирает аргументы по ПРЕФИКСУ
     # ключевых слов iproute2, поэтому однобуквенное имя «t» понимается как
@@ -11974,6 +12687,20 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
     # (IFACE="...") и source-ится от root — строгий whitelist, как у tun_name.
     if not re.fullmatch(r'[A-Za-z0-9_.\-]+', main_iface) or main_iface in ('.', '..'):
         raise RuntimeError(f'Недопустимое имя интерфейса "{main_iface}"')
+
+    # Безопасность (рев-44, критично): server_addr уходит внутрь "..." в bash-скриптах,
+    # которые root source-ит (LOCAL_SUBNETS="...", SUBNETS_LIMITS, LAN_ALLOW).
+    # Раньше значение бралось из конфига СЫРЫМ: конфиг с `#_Address = 10.0.0.1/24$(...)`
+    # (или `10.0.0.1/24"; touch /tmp/x; #`) давал исполнение команд от root при подъёме.
+    for _part in str(server_addr).split(','):
+        _part = _part.strip()
+        if not _part:
+            continue          # хвостовая/двойная запятая — не повод отказывать
+        try:
+            ipaddress.ip_network(_part, strict=False)
+        except ValueError:
+            raise RuntimeError(
+                f'Недопустимый адрес в Address серверного конфига: {_part!r}') from None
 
     if warp_configs:
         warp_list_str = "\n".join([f'  \"{pathlib.Path(cfg).stem}\"' for cfg in warp_configs])
@@ -12260,14 +12987,14 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
                     continue
 
                 # Проверяем что блок не заканчивается на broadcast
-                if ipv4_block_end == int(net_ipv4.broadcast_address):
-                    if not server_on_network:
-                        continue
+                if ipv4_block_end == int(net_ipv4.broadcast_address) and not server_on_network:
+                    continue
 
                 # Проверяем IPv6 broadcast
-                if net_ipv6 and ipv6_block_end == int(net_ipv6.broadcast_address):  # pragma: no cover — в реальных подсетях v6-broadcast не совпадает с концом v4-блока
-                    if not server_on_network:
-                        continue
+                # pragma: no cover — в реальных подсетях v6-broadcast не совпадает с концом v4-блока
+                if (net_ipv6 and ipv6_block_end == int(net_ipv6.broadcast_address)
+                        and not server_on_network):  # pragma: no cover
+                    continue
 
                 # Проверяем что блок не содержит адрес сервера (IPv4)
                 if ipv4_block_start <= server_ip_int_ipv4 <= ipv4_block_end:
@@ -12493,14 +13220,56 @@ def _init_random_seed(extra_entropy: int | None = None) -> None:
 def _read_server_protocol(conf_path: pathlib.Path) -> str:
     """Единая точка чтения версии протокола ('# Protocol: ...') из серверного
     конфига. Используется handle_add/handle_update/handle_confgen (ранее —
-    три копии одного сниппета, 16.09.2026 сведены сюда). По умолчанию AWG1.0."""
+    три копии одного сниппета, 16.09.2026 сведены сюда).
+
+    Рев-44: если заголовка нет (конфиг собран/переформатирован вручную), версия
+    определяется ПО ФАКТИЧЕСКИМ ПАРАМЕТРАМ. Раньше молча возвращался AWG1.0, из-за
+    чего `_get_server_params` не отдавал S3/S4/HeaderProtectionKey, активные на
+    сервере, — клиентские конфиги выходили без них и рукопожатие молча не проходило.
+    """
+    text = ""
     try:
-        for line in conf_path.read_text(encoding='utf-8').splitlines():
+        text = conf_path.read_text(encoding='utf-8')
+        for line in text.splitlines():
             if line.startswith('# Protocol:'):
-                return line.split(':', 1)[1].strip()
+                value = line.split(':', 1)[1].strip()
+                # Рев-45: значение обязано быть известной версией. Иначе (например,
+                # незаполненный плейсхолдер «<PROTOCOL>» или опечатка) вернуть его
+                # нельзя: gate по min_version отсечёт ВСЕ параметры, и клиентский
+                # конфиг молча выйдет без S/H/I (рукопожатие не пройдёт).
+                if value in ("WG", "AWG", "AWG1.0", "AWG1.5", "AWG2.0", "AWG3.0", "AWG3.1"):
+                    return value
+                logger.warning("⚠  Некорректная версия в '# Protocol: %s' — определяю по "
+                               "параметрам конфига", value)
+                break
     except Exception:
-        pass
-    return "AWG1.0"
+        return "AWG1.0"
+
+    def _has(name: str) -> bool:
+        # активная или служебная (#_) строка "Name = ..." (не задевая Name0 = ...)
+        # Рев-45: только АКТИВНАЯ или служебная (#_) строка. Обычные комментарии-
+        # подсказки ("# ContentPaddingAddition = …") тул сам пишет в конфиги версий
+        # ниже 3.0 — раньше из-за них такой конфиг определялся как AWG3.0, и клиент
+        # получал активные параметры ИЗ КОММЕНТАРИЕВ (рукопожатие молча не проходило).
+        return re.search(rf'^\s*(?:#_)?{name}\s*=', text, re.M) is not None
+
+    if _has('HeaderProtectionKey'):
+        version = "AWG3.1"
+    elif _has('ContentPaddingAddition') or _has('RekeyAfterTime'):
+        version = "AWG3.0"
+    elif _has('S3') or _has('S4'):
+        version = "AWG2.0"
+    elif _has('I1'):
+        version = "AWG1.5"
+    elif _has('H1'):
+        version = "AWG1.0"
+    elif _has('S1'):
+        version = "AWG"
+    else:
+        version = "WG"
+    logger.warning("⚠  В конфиге нет строки '# Protocol:' — версия определена по "
+                   "параметрам: %s. Если это неверно, добавьте заголовок.", version)
+    return version
 
 
 def _generate_persistent_keepalive(version: str = "AWG2.0") -> str:
@@ -12536,26 +13305,33 @@ def _get_param_value(conf_text: str, param: str, version: str, min_version: str)
 
     for line in conf_text.split('\n'):
         line = line.strip()
-        # Проверяем активный параметр: "S1 = 42"
-        if line.startswith(f'{param} = '):
-            # maxsplit=1: значение само может содержать '=' (base64
-            # HeaderProtectionKey с паддингом) — без него терялся '='.
-            return line.split('=', 1)[1].strip()
-        # Проверяем закомментированный: "# S1 = 42  # AWG+"
-        if line.startswith(f'# {param} = '):
-            # Извлекаем значение между "# S1 = " и следующим "#"
-            value_part = line[2:]  # Убираем "# "
-            if '=' in value_part:
-                value = value_part.split('=', 1)[1].strip()
-                # Убираем комментарий после значения
-                if '  #' in value:
-                    value = value.split('  #')[0].strip()
-                return value
-        # Проверяем служебную запись с данными: "#_PublicKey = X"
-        # (свой публичный ключ сервера хранится только так; раньше парсер
-        # находил ключ ПЕРВОГО [Peer] — баг 1.1)
-        if line.startswith(f'#_{param} = '):
-            return line.split('=', 1)[1].strip()
+        if not line:
+            continue
+        # Служебная запись с данными: "#_PublicKey = X" (свой публичный ключ
+        # сервера хранится только так; раньше парсер находил ключ ПЕРВОГО [Peer]).
+        if line.startswith(f'#_{param}'):
+            rest = line[len(f'#_{param}'):].lstrip()
+            if rest.startswith('='):
+                # Рев-45: срезаем хвостовой комментарий, как в общей ветке — иначе
+                # '#_PublicKey = ABC  # srv pub' отдавал значение с мусором
+                return rest.split('=', 1)[1].split('#', 1)[0].strip()
+            continue
+        # Рев-44: нормализация как в wg (config.c: config_read_line режет строку по
+        # '#' и допускает любые пробелы вокруг '='). Раньше требовался точный префикс
+        # "S1 = ", поэтому "S2=43" не находился вовсе (плейсхолдер <S2_LINE>
+        # вычищался из клиентских конфигов — S не совпадали с сервером и рукопожатие
+        # молча не проходило), а "S1 = 42  # AWG+" отдавал значение вместе с
+        # комментарием — валидатор считал корректный конфиг битым.
+        body = line[1:].lstrip() if line.startswith('#') else line
+        body = body.split('#', 1)[0]
+        if '=' not in body:
+            continue
+        name, _, value = body.partition('=')
+        if name.strip() != param:
+            continue
+        # maxsplit=1: значение само может содержать '=' (base64 HeaderProtectionKey
+        # с паддингом) — без него терялся '='.
+        return value.strip()
     return None
 
 
@@ -12586,11 +13362,16 @@ def _parse_awg_int_or_range(value) -> tuple[int, int] | None:
     if value is None:
         return None
     s = str(value).strip()
-    if not re.fullmatch(r'\d+(?:-\d+)?', s):
+    # Рев-44: только ASCII-цифры (ядро/strtoul не понимают Unicode-цифры '١٢'),
+    # и отсечка по длине: int() на >4300 цифрах в CPython >= 3.11 бросает
+    # ValueError, хотя контракт функции — «мусор -> None».
+    if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?', s):
         return None
-    if '-' in s:
-        lo, hi = s.split('-', 1)
-        return int(lo), int(hi)
+    _parts = s.split('-', 1)
+    if any(len(_p) > 20 for _p in _parts):      # защита от int() на 4300+ цифрах
+        return None
+    if len(_parts) == 2:
+        return int(_parts[0]), int(_parts[1])
     return int(s), int(s)
 
 
@@ -12766,7 +13547,12 @@ def _fix_client_allowed_ips(client_allowed_ips: str, srv_addr: str) -> str:
     net_ipv6 = None
     
     for subnet_str in raw_subnets:
-        net = ipaddress.ip_network(subnet_str, strict=False)
+        # Рев-44: битая запись (пустая, лишняя запятая) не должна ронять всю
+        # функцию — иначе маски не исправляются ни у одного клиента.
+        try:
+            net = ipaddress.ip_network(subnet_str, strict=False)
+        except ValueError:
+            continue
         if isinstance(net, ipaddress.IPv4Network):
             net_ipv4 = net
         else:
@@ -12994,11 +13780,12 @@ def handle_makecfg(opt) -> None:
         _apply_awg_param_checks(cfg.iface, f"существующий конфиг {g_main_config_fn.name}")
         _cfg_stat = g_main_config_fn.stat()
 
-        # Определяем версию протокола из существующего конфига
-        _file_version = "AWG1.0"
-        _line_start = cfg.lines[0] if cfg.lines else ""
-        if "# Protocol:" in _line_start:
-            _file_version = _line_start.split(":")[-1].strip()
+        # Определяем версию протокола из существующего конфига.
+        # Рев-45: через общую точку `_read_server_protocol` — третья копия сниппета
+        # читала только ПЕРВУЮ строку и молча падала на "AWG1.0", если заголовок
+        # стоял ниже (пустая строка/комментарий сверху) или содержал опечатку;
+        # для 3.x-конфига это переписывало PersistentKeepalive диапазоном→числом.
+        _file_version = _read_server_protocol(g_main_config_fn)
 
         srv = cfg.iface
 
@@ -13050,7 +13837,9 @@ def handle_makecfg(opt) -> None:
         # Добавляем новые I-строки перед MTU
         if mtu_pos is not None:
             for i in range(5, 0, -1):
-                if i not in i_added and obf_params.get(f"I{i}") is not None:
+                # Рев-45: не активируем I-подсказки в версиях без I1-I5
+                # (WG/AWG/AWG1.0) — иначе повторный --make ломал конфиг.
+                if i not in i_added and obf_params.get(f"I{i}") is not None and not obf_params.get("_I_comment"):
                     new_lines.insert(mtu_pos, f"I{i} = {obf_params[f'I{i}']}")
         else:
             # Fallback (конфиг без MTU; фикс 16.09.2026): НЕ в конец файла —
@@ -13059,7 +13848,10 @@ def handle_makecfg(opt) -> None:
             _peer_pos = next((_idx for _idx, _l in enumerate(new_lines)
                               if _l.startswith('[Peer]')), len(new_lines))
             _ins = [f"I{i} = {obf_params[f'I{i}']}" for i in range(1, 6)
-                    if i not in i_added and obf_params.get(f"I{i}") is not None]
+                    # Рев-45: не активируем I-подсказки в версиях без I1-I5
+                    # (WG/AWG/AWG1.0) — иначе повторный --make ломал конфиг.
+                    if i not in i_added and obf_params.get(f"I{i}") is not None
+                    and not obf_params.get("_I_comment")]
             new_lines[_peer_pos:_peer_pos] = _ins
         cfg.lines = new_lines
 
@@ -13080,6 +13872,10 @@ def handle_makecfg(opt) -> None:
             # WARP-список переносим из СТАРОГО параметр-файла (не перегенерируем
             # WARP-конфиги и не теряем существующие конфигурации)
             _warp_cfgs = []
+            # Рев-45: инициализируем ДО try — иначе при отсутствии/нечитаемости
+            # <tun>.sh присваивание не выполнялось и обращение к _old_params ниже
+            # давало UnboundLocalError (блок перегенерации скриптов пропускался).
+            _old_params = ""
             try:
                 _old_params = _params_path.read_text(encoding='utf-8')
                 _m = re.search(r'WARP_LIST=\((.*?)\)', _old_params, re.S)
@@ -13087,8 +13883,13 @@ def handle_makecfg(opt) -> None:
                     # Фикс аудита-C2: ручные формы «warp1=subnet» НЕ являются
                     # путями конфигов — при перегенерации они давали мусорные
                     # имена через Path.stem; переносим только имена.
+                        # Рев-44 (безопасность): имя уходит в WARP_LIST=( "..." )
+                        # внутри root-bash — строгий whitelist, иначе строка старого
+                        # файла вида `"x";touch /tmp/pwn;echo "` исполнилась бы при source.
                     _warp_cfgs = [x.strip().strip('"') for x in _m.group(1).splitlines()
-                                  if x.strip().strip('"') and '=' not in x.strip().strip('"')]
+                                  if x.strip().strip('"') and '=' not in x.strip().strip('"')
+                                      and re.fullmatch(r'[A-Za-z0-9_.\-]{1,64}', x.strip().strip('"'))
+                                      and '..' not in x.strip().strip('"')]
             except Exception:
                 pass
             main_iface = getattr(opt, 'iface', '') or get_main_iface() or 'net0'
@@ -13192,10 +13993,8 @@ def handle_makecfg(opt) -> None:
         except Exception as e:
             logger.warning("⚠  Не удалось создать вспомогательные файлы: %s", e)
     except Exception:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(str(g_main_config_fn))
-        except OSError:
-            pass
         raise
 
     sys.exit(0)
@@ -13234,7 +14033,7 @@ def handle_add(opt) -> None:
                 or c_name in ('..', '.', '__this_server__'):
             raise RuntimeError(f'Недопустимое имя клиента "{c_name}": разрешены только '
                                f'буквы/цифры/._-/ без пробелов (макс. 64), нельзя ".." и "__this_server__"')
-        if c_name.lower() in (x.lower() for x in cfg.peer.keys()):
+        if c_name.lower() in (x.lower() for x in cfg.peer):
             raise RuntimeError(f'Пользователь "{c_name}" уже существует')
 
         # --- Парсинг LOCAL_SUBNETS (IPv4 + IPv6) ---
@@ -13297,7 +14096,7 @@ def handle_update(opt) -> None:
     def _make_update() -> str:
         cfg = WGConfig(str(g_main_config_fn))
         srv_proto = _read_server_protocol(srv_path)
-        actual_name = next((n for n in cfg.peer.keys() if n.lower() == p_name.lower()), None)
+        actual_name = next((n for n in cfg.peer if n.lower() == p_name.lower()), None)
         if actual_name is None:
             raise RuntimeError(f'Клиент "{p_name}" не найден')
         logger.info('🔄 Сброс ключей для "%s"...', actual_name)
@@ -13314,6 +14113,10 @@ def handle_update(opt) -> None:
         logger.info('✅ Ключи сброшены для "%s". IP=%s NewPK=%s', actual_name, ipaddr, new_pk)
         return "\n".join(cfg.lines) + "\n"  # та же сериализация, что WGConfig.save
 
+    # Рев-45: копия ДО правки — сброс ключей необратим (старые розданные
+    # конфиги становятся мёртвыми, а PrivateKey/PSK в конфиге — единственный
+    # источник для повторной генерации).
+    _backup_file(srv_path, suffix=".bak-update")
     _atomic_rmw(srv_path, _make_update)
 
 
@@ -13324,7 +14127,7 @@ def handle_delete(opt) -> None:
 
     def _make_delete() -> str:
         cfg = WGConfig(str(g_main_config_fn))
-        actual_name = next((n for n in cfg.peer.keys() if n.lower() == p_name.lower()), None)
+        actual_name = next((n for n in cfg.peer if n.lower() == p_name.lower()), None)
         if actual_name is None:
             raise RuntimeError(f'Клиент "{p_name}" не найден')
         logger.info('🗑️  Удаление пользователя "%s"...', actual_name)
@@ -13332,7 +14135,33 @@ def handle_delete(opt) -> None:
         logger.info('✅ Удалён "%s". Освобождён IP=%s', actual_name, ipaddr)
         return "\n".join(cfg.lines) + "\n"
 
+    # Рев-45: копия ДО удаления — вместе с [Peer] удаляются #_PrivateKey и
+    # PresharedKey, восстановить клиента после этого нечем.
+    _backup_file(srv_path, suffix=".bak-delete")
     _atomic_rmw(srv_path, _make_delete)
+
+    # Рев-47: артефакты удалённого клиента (конфиги/QR/архивы с его приватным
+    # ключом) убираем в .bak — иначе `bob.zip` с приватником остаётся навсегда и
+    # неотличим от свежих архивов, а последующий `-z` его сохраняет.
+    _removed_artifacts = 0
+    _art_suffixes = _client_artifact_suffixes()
+    for _f in list(g_conf_dir.glob(f"{p_name}*")):
+        if _f.suffix not in ('.conf', '.png', '.zip'):
+            continue
+        # строгая якорная семантика (общий хелпер): «c1» не трогает «c10All.conf»
+        if not _client_artifact_matches(_f.name, p_name, _art_suffixes):
+            continue
+        try:
+            # os.replace перезаписывает существующий .bak атомарно — отдельный
+            # unlink создавал окно, в котором старый бэкап уже удалён, а новый
+            # ещё не создан (рев-47).
+            _bak = _f.with_name(_f.name + '.bak')
+            os.replace(_f, _bak)
+            _removed_artifacts += 1
+        except Exception:
+            pass
+    if _removed_artifacts:
+        logger.info('🧹 Артефакты клиента "%s" убраны в .bak: %d', p_name, _removed_artifacts)
 
 
 def handle_warp_gen(opt) -> list[str]:
@@ -13398,6 +14227,27 @@ def handle_confgen(opt) -> set[str]:
         atomic_write_text(g_defclient_config_fn, out)
 
     tmpcfg = g_defclient_config_fn.read_text(encoding='utf-8')
+    # Рев-45: шаблон мог остаться от старой версии инструмента (или быть заполнен
+    # вручную) — тогда плейсхолдеры 3.x отсутствуют, и клиентский конфиг молча
+    # выходит без HeaderProtectionKey/CPA/таймингов, т.е. рукопожатие не проходит.
+    # Добавляем недостающие плейсхолдеры в [Interface], сохраняя правки шаблона.
+    _required_ph = ("<JC_LINE>", "<S1_LINE>", "<H1_LINE>", "<I1_LINE>",
+                    "<HEADERPROTECTIONKEY_LINE>", "<CONTENTPADDINGADDITION_LINE>",
+                    "<REKEYAFTERTIME_LINE>", "<REKEYTIMEOUT_LINE>",
+                    "<REJECTAFTERTIME_LINE>", "<KEEPALIVETIMEOUT_LINE>",
+                    "<MAXHANDSHAKEATTEMPTS_LINE>", "<RANDOMTRAILERS_LINE>",
+                    "<DISABLECOOKIES_LINE>")
+    _missing_ph = [ph for ph in _required_ph if ph not in tmpcfg]
+    if _missing_ph:
+        logger.warning('⚠  Шаблон %s устарел: нет %d плейсхолдеров — дополняю из встроенного '
+                       '(резервная копия рядом)', g_defclient_config_fn.name, len(_missing_ph))
+        _backup_file(g_defclient_config_fn, suffix=".bak-old")
+        _tpl_lines = tmpcfg.splitlines()
+        _iface_at = next((k for k, _l in enumerate(_tpl_lines)
+                          if _l.strip() == '[Interface]'), 0)
+        _tpl_lines[_iface_at + 1:_iface_at + 1] = _missing_ph
+        tmpcfg = "\n".join(_tpl_lines) + "\n"
+        atomic_write_text(g_defclient_config_fn, tmpcfg)
     
     # Читаем версию протокола из серверного конфига
     server_protocol = _read_server_protocol(g_main_config_fn)
@@ -13451,21 +14301,17 @@ def handle_confgen(opt) -> set[str]:
             logger.error("Пример: %s", example_addr)
             raise RuntimeError("Не удалось создать _endpoint.config — укажите Endpoint вручную") from None
 
-    # Очистка (кроме серверного конфига) — ПОСЛЕ валидаций --only и endpoint
-    # (фикс аудита-D2: раньше удаление было первым, сбой генерации оставлял
-    # пустой conf/ — конфиги с PrivateKey терялись безвозвратно).
-    for ext in ("conf", "png"):
-        for fn in glob.glob(str(g_conf_dir.joinpath(f"*.{ext}"))):
-            if ext == "conf" and fn.endswith(g_main_config_fn.name):
-                continue
-            try:
-                os.remove(fn)
-            except Exception:
-                pass
 
     raw_listen = srv.get('ListenPort', '') or ""
     default_port = str(opt.port)
-    if raw_listen and str(raw_listen).strip().isdigit():
+    # Рев-44: порт из ListenPort проверяем по диапазону и ASCII-цифрам —
+    # isdigit() пропускал 0/70000/Unicode-цифры, и такой порт уходил в
+    # Endpoint ВСЕХ клиентских конфигов (клиент не подключился бы).
+    try:
+        _lp = int(str(raw_listen).strip()) if raw_listen else 0
+    except ValueError:
+        _lp = 0
+    if raw_listen and 1 <= _lp <= 65535:
         default_port = str(raw_listen).strip()
     else:
         if raw_listen:
@@ -13490,10 +14336,29 @@ def handle_confgen(opt) -> set[str]:
     # несовместим с ядром (например S < 12 при HeaderProtectionKey), клиенты получат
     # те же нерабочие значения, и туннель молча не поднимется.
     _apply_awg_param_checks(server_params, f"серверный конфиг {g_main_config_fn.name}")
+    # Очистка (кроме серверного конфига) — ТОЛЬКО после ВСЕХ проверок
+    # (рев-45: раньше стояла до _get_server_params/_apply_awg_param_checks,
+    # и битый серверный конфиг приводил к удалению conf/ БЕЗ генерации —
+    # клиентские .conf и QR .png терялись безвозвратно).
+    # (фикс аудита-D2: раньше удаление было первым, сбой генерации оставлял
+    # пустой conf/ — конфиги с PrivateKey терялись безвозвратно).
+    for ext in ("conf", "png"):
+        for fn in glob.glob(str(g_conf_dir.joinpath(f"*.{ext}"))):
+            if ext == "conf" and fn.endswith(g_main_config_fn.name):
+                continue
+            with contextlib.suppress(Exception):
+                os.remove(fn)
 
     for peer_name, peer in peers:
         if 'Name' not in peer or 'PrivateKey' not in peer:
             logger.info('Пропуск peer с публичным ключом %s', peer.get("PublicKey", "<no>"))
+            continue
+        # Рев-45: имя клиента идёт в имена файлов .conf/.png/.zip и в пути — без
+        # проверки «../evil» уводил запись за пределы conf/, а имя вне whitelist
+        # («Иван Петров») давало пустой архив (conf пропускался, zip создавался).
+        if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,64}', str(peer_name)) or '..' in str(peer_name):
+            logger.error('❌ Пропуск клиента с недопустимым именем %r: разрешены буквы, '
+                         'цифры, точка, дефис и подчёркивание (до 64 символов)', peer_name)
             continue
         # Lazy-генерация PSK только при реальном отсутствии (аудит-20: дефолт в
         # dict.get вычислялся всегда, лишний вызов openssl на каждом пире).
@@ -13504,6 +14369,15 @@ def handle_confgen(opt) -> set[str]:
             # set_param без force кидает RuntimeError для отсутствующего параметра
             # (битые конфиги/легаси-импорт) — добавляем с force.
             cfg.set_param(peer_name, 'PresharedKey', psk, force=True)
+            # Рев-45: сохраняем СРАЗУ, до записи клиентских файлов — иначе сбой или
+            # параллельный -a оставлял розданные конфиги с PSK, которого нет на сервере
+            # (рукопожатие молча не проходило, следующий -c выдавал другой PSK).
+            try:
+                _ensure_file_unchanged(g_main_config_fn, _cfg_stat, "Серверный конфиг")
+                cfg.save()
+                psk_added = False
+            except Exception as e:
+                logger.warning("⚠  Не удалось сохранить PresharedKey в серверном конфиге: %s", e)
             psk_added = True
 
         # Инициализируем random уникальным seed для каждого клиента
@@ -13520,6 +14394,7 @@ def handle_confgen(opt) -> set[str]:
         # (ключ первого [Peer]), что ломало согласование session_id/cipher (баг 1.1).
         i_seed = srv.get('PublicKey', '')
 
+        _wrote_conf = False      # рев-45: признак успешной записи хотя бы одного .conf
         for idx, ep in enumerate(endpoints, start=1):
             host = ep.get('host', '')
             port = ep.get('port', default_port)
@@ -13545,7 +14420,7 @@ def handle_confgen(opt) -> set[str]:
             )
 
             if single_endpoint:
-                ep_label = "" if not raw_label else raw_label
+                ep_label = raw_label if raw_label else ""
             else:
                 ep_label = raw_label if raw_label else str(idx)
 
@@ -13598,12 +14473,16 @@ def handle_confgen(opt) -> set[str]:
                     atomic_write_text(conf_path, final_conf)
                     # Конфиг содержит PrivateKey/PSK клиента — только владелец
                     _chmod_owner_only(conf_path, "конфиг клиента")
+                    _wrote_conf = True
                 except Exception as e:
                     logger.warning("⚠  Не удалось записать conf-файл %s: %s", conf_name, e)
                     continue
 
-            if peer_name not in clients_for_zip:
+            if _wrote_conf and peer_name not in clients_for_zip:
                 clients_for_zip.append(peer_name)
+            elif not _wrote_conf:
+                logger.warning('⚠  Для клиента "%s" не записан ни один конфиг — в архив не попадёт',
+                               peer_name)
 
     if psk_added:
         try:
@@ -13700,10 +14579,8 @@ def generate_qr_codes(
 
     # Очистка старых PNG клиентских конфигов (WARP очищает handle_warp_gen)
     for png in g_conf_dir.glob("*.png"):
-        try:
+        with contextlib.suppress(Exception):
             os.remove(str(png))
-        except Exception:
-            pass
 
     # --- Единый цикл генерации QR ---
     logger.info('📱 Генерация QR-кодов (%d конфигов)...', len(all_configs))
@@ -13761,10 +14638,7 @@ def _walk_file_dir() -> list[tuple[str, bool]]:
         return entries
     for root, _dirs, files in os.walk(g_file_dir):
         rel_root = os.path.relpath(root, g_file_dir)
-        if rel_root == ".":
-            rel_root = ""
-        else:
-            rel_root = rel_root.rstrip("/") + "/"
+        rel_root = "" if rel_root == "." else rel_root.rstrip("/") + "/"
         if rel_root:
             entries.append((rel_root, True))
         for fname in files:
@@ -13844,6 +14718,32 @@ def zip_all(warp_configs: list[str] | None = None) -> None:
             zip_client_files(p.stem, base_dir=p.parent, file_dir_entries=entries)
 
 
+def _client_artifact_suffixes() -> list[str]:
+    """Суффиксы имён артефактов клиента из `_allowedips.config` (или ['All'])."""
+    if g_allowedips_config_fn.exists():
+        try:
+            _ips, _ = parse_allowedips_config(g_allowedips_config_fn.read_text('utf-8'))
+            if _ips:
+                return list(_ips.keys())
+        except Exception:
+            pass
+    return ['All']
+
+
+def _client_artifact_matches(fname: str, name: str, suffixes: list[str]) -> bool:
+    """Строгая принадлежность файла клиенту: `{имя}{суффикс}.(conf|png)` или `{имя}.zip`.
+
+    Рев-47: префиксное сравнение («bob» ловит «bobby») недопустимо — оно уводило
+    в .bak артефакты ЧУЖОГО клиента.
+    """
+    if fname == f"{name}.zip":
+        return True
+    if not suffixes:
+        return False
+    pat = rf'^{re.escape(name)}(?:{"|".join(re.escape(x) for x in suffixes)})\.(?:conf|png)$'
+    return re.match(pat, fname) is not None
+
+
 def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip: bool = False,
                         allowed_names: list[str] | None = None) -> None:
     keep_files = set()
@@ -13856,28 +14756,11 @@ def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip
     # сохранял чужие файлы («bob» спасал «bobby…»). Для conf/png допускаются
     # только {имя}{суффикс}.conf|png (суффиксы из _allowedips); для zip —
     # точное равенство имени (см. ниже).
-    _suf = []
-    if allowed_names:
-        if g_allowedips_config_fn.exists():
-            try:
-                _ips, _ = parse_allowedips_config(g_allowedips_config_fn.read_text('utf-8'))
-                _suf = list(_ips.keys())
-            except Exception:
-                _suf = []
-        if not _suf:
-            # Дефолт генерации (тот же, что в generate_qr_codes при отсутствии
-            # файла: {'All'}) — иначе суффиксные файлы (u1All.conf) не считались
-            # бы принадлежащими клиенту u1.
-            _suf = ['All']
+    # Рев-47: матчер вынесен в общий хелпер (используется и при удалении клиента)
+    _suf = _client_artifact_suffixes() if allowed_names else []
 
     def _belongs(fname: str, name: str) -> bool:
-        # zip — точное равенство имени (для пропуска через фильтр; сам
-        # keep_zip ниже так же требует точного равенства). conf/png — строго
-        # {имя}{суффикс}.(conf|png): _suf всегда непуст (фоллбэк ['All']).
-        if fname == f"{name}.zip":
-            return True
-        _p = rf'^{re.escape(name)}(?:{"|".join(re.escape(s) for s in _suf)})\.(?:conf|png)$'
-        return re.match(_p, fname) is not None
+        return _client_artifact_matches(fname, name, _suf)
 
     for f in os.listdir(g_conf_dir):
         if allowed_names and not any(_belongs(f, name) for name in allowed_names):
@@ -13893,12 +14776,21 @@ def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip
             elif f.endswith('.zip'):
                 keep_files.add(f)
     
+    # Рев-45: НЕ удаляем безвозвратно — переименовываем в `.bak`. Раньше `-c`
+    # сносил все *.png/*.zip, `-z` — все клиентские *.conf/*.png, включая файлы
+    # чужих клиентов, которых инструмент не создавал и восстановить не мог.
+    _moved = 0
     for f in os.listdir(g_conf_dir):
         if f not in keep_files and (f.endswith('.conf') or f.endswith('.png') or f.endswith('.zip')):
+            src = g_conf_dir.joinpath(f)
+            dst = g_conf_dir.joinpath(f + '.bak')
             try:
-                os.remove(g_conf_dir.joinpath(f))
+                os.replace(src, dst)      # перезаписывает .bak атомарно (рев-47)
+                _moved += 1
             except Exception:
                 pass
+    if _moved:
+        logger.info('🧹 Убрано в .bak: %d файл(ов) в %s', _moved, g_conf_dir)
 
 
 # ----------------- CLI -----------------
@@ -14108,15 +15000,27 @@ def _handle_reload(override: str | None = None) -> None:
 
 
 def _remove_files_by_suffix(directory: pathlib.Path, suffixes: tuple[str, ...]) -> None:
-    """Удаляет файлы в директории, чьи имена заканчиваются на любой из suffixes."""
+    """Убирает файлы в директории с указанными суффиксами, ПЕРЕИМЕНАМИ в `.bak`.
+
+    Рев-45: раньше файлы удалялись безвозвратно, а каталог WARP общий для всех
+    туннелей — `--warp 1 -z` уничтожал WARP-конфиги (с приватными ключами и
+    регистрациями Cloudflare) других интерфейсов. Переименование сохраняет
+    прежнее поведение «остаются только нужные артефакты», но обратимо.
+    """
     if not directory.is_dir():
         return  # каталога нет (например, автономный WARP без -z) — нечего чистить
+    moved = 0
     for f in os.listdir(directory):
         if f.endswith(suffixes):
+            src = directory.joinpath(f)
+            dst = directory.joinpath(f + '.bak')
             try:
-                os.remove(directory.joinpath(f))
+                os.replace(src, dst)      # перезаписывает .bak атомарно (рев-47)
+                moved += 1
             except Exception:
                 pass
+    if moved:
+        logger.info('🧹 Убрано в .bak: %d файл(ов) в %s', moved, directory)
 
 
 def main() -> None:
@@ -14207,6 +15111,13 @@ def main() -> None:
         return
 
     if opt.makecfg:
+        # Рев-53: --make берёт путь из СВОЕГО аргумента, а -s для него не применяется.
+        # Молчаливое игнорирование приводило к созданию лишнего конфига в каталоге
+        # по умолчанию (проверено на стенде) — теперь предупреждаем явно.
+        if getattr(opt, 'server_cfg', ''):
+            logger.warning("⚠  --make использует свой аргумент как имя/путь конфига; "
+                           "-s/--serv-cfg (%s) игнорируется. Нужен другой путь — укажите "
+                           "его прямо: --make /путь/к/имя.conf", opt.server_cfg)
         handle_makecfg(opt)
         return
 
