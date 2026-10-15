@@ -972,6 +972,13 @@ quota_value_bytes() {
       *[tT]) _dig="${_v%[tT]}"; _mul=1099511627776 ;;
       *) _dig="${_v:-0}" ;;
     esac
+    # Нечисловой вход ("xyz", "5Gg", "100mbi") → 0: раньше строка уезжала в
+    # арифметику (bash: «слишком большое значение для основания») либо
+    # возвращалась как есть, и мусор попадал в правило/ipset. Симметрично
+    # quota_throttle_bits; ноль затем отбраковывается quota_rule_parse.
+    case "$_dig" in
+      ''|*[!0-9]*) echo "0"; return 0 ;;
+    esac
     # насыщение: цифровая строка > 9223372036854775807 или результат > 2^63-1
     if [ "${#_dig}" -gt 19 ] || { [ "${#_dig}" -eq 19 ] && [ "$_dig" \> "9223372036854775807" ]; }; then
       echo "9223372036854775807"; return 0
@@ -1131,8 +1138,8 @@ period_last() {
              [ "$cand" -gt "$ts" ] && cand=$(( cand - 7 * 86400 ))
            else
              delta=$(( ( p - uu + 7 ) % 7 ))
-             cand=$(TZ="$QUOTA_TIMEZONE" date -d "$d -$(((7 - delta) % 7)) days 00:00" +%s)
-             [ "$cand" -gt "$ts" ] && cand=$(TZ="$QUOTA_TIMEZONE" date -d "$d -$(((7 - delta) % 7) + 7) days 00:00" +%s)
+             cand=$(TZ="$QUOTA_TIMEZONE" date -d "$d -$(( (7 - delta) % 7 )) days 00:00" +%s)
+             [ "$cand" -gt "$ts" ] && cand=$(TZ="$QUOTA_TIMEZONE" date -d "$d -$(( (7 - delta) % 7 + 7 )) days 00:00" +%s)
            fi ;;
         M) local ym din tgt
            ym=$(TZ="$QUOTA_TIMEZONE" date -d "@$ts" +%Y-%m)
@@ -2805,10 +2812,15 @@ parse_ddos_by_port() {
     [ -z "$DDOS_REPLY_BW" ] && DDOS_REPLY_BW="0"
     [ -z "$DDOS_IFACE" ] && DDOS_IFACE=""
     # Нормализация burst: iptables требует 1..1000000 (0 невалиден, молча
-    # гасил правила; фикс аудита-DDoS)
+    # гасил правила; фикс аудита-DDoS). DDOS_NEW_BURST здесь пропущен не был:
+    # без явного «+Burst» в части <Connlimit,NewRate/Период в правило уходило
+    # «--hashlimit-burst 0», iptables его отвергал и DDoS-правило проброшенного
+    # порта не вставало (проверено на стенде 2026-10-15 трассировкой).
     [ "$DDOS_BURST" = "0" ] && DDOS_BURST="5"
     [ "$DDOS_EST_BURST" = "0" ] && DDOS_EST_BURST="5"
     [ "$DDOS_REPLY_EST_BURST" = "0" ] && DDOS_REPLY_EST_BURST="5"
+    [ -z "$DDOS_NEW_BURST" ] && DDOS_NEW_BURST="5"
+    [ "$DDOS_NEW_BURST" = "0" ] && DDOS_NEW_BURST="5"
     return 0
   done
 
@@ -2947,6 +2959,10 @@ ddos_apply_rules() {
   [ "$DDOS_BURST" = "0" ] && DDOS_BURST="5"
   [ "$DDOS_EST_BURST" = "0" ] && DDOS_EST_BURST="5"
   [ "$DDOS_REPLY_EST_BURST" = "0" ] && DDOS_REPLY_EST_BURST="5"
+  # NEW_BURST: тот же класс (см. комментарий выше) — без нормализации в правило
+  # уходил «--hashlimit-burst 0» и iptables отвергал его целиком.
+  [ -z "$DDOS_NEW_BURST" ] && DDOS_NEW_BURST="5"
+  [ "$DDOS_NEW_BURST" = "0" ] && DDOS_NEW_BURST="5"
 
   # Length_min
   if [ -n "$DDOS_LENGTH_MIN" ] && [ "$DDOS_LENGTH_MIN" != "0" ]; then
@@ -6104,7 +6120,19 @@ QUOTASCRIPT
   else
     echo "⚠️  cron не установлен — почасовое обновление квот работать не будет (apt install cron)" >&2
   fi
-  echo "📊 Квоты трафика включены (правил: ${#TRAFFIC_QUOTAS[@]}; клиентов: $(echo "$_QSETS" | wc -w))"
+  # Честный отчёт: перепроверяем правила тем же парсером, что и построение
+  # (фикс: печаталось число записей из конфига, а отброшенные правила не давали
+  # ни цепочек, ни предупреждения — «правил: 3» при одном рабочем).
+  _qbad=0; _qbad_list=""
+  for _qc in "${TRAFFIC_QUOTAS[@]}"; do
+    case "$(quota_rule_parse "$_qc")" in
+      N\|*) _qbad=$(( _qbad + 1 )); _qbad_list="$_qbad_list '$_qc'" ;;
+    esac
+  done
+  if [ "$_qbad" -gt 0 ]; then
+    echo "⚠️  Квоты: пропущено невалидных правил: $_qbad —$_qbad_list (проверьте объём и период)" >&2
+  fi
+  echo "📊 Квоты трафика включены (правил: $(( ${#TRAFFIC_QUOTAS[@]} - _qbad )) из ${#TRAFFIC_QUOTAS[@]}; клиентов: $(echo "$_QSETS" | wc -w))"
   else
     echo "⚠️  КВОТЫ ПРОПУЩЕНЫ (ipset/xt_set недоступны) — остальной up продолжается" >&2
   fi
@@ -6186,6 +6214,18 @@ fi
       echo "Ошибка: не удалось загрузить модуль ifb"
       exit 1
     fi
+  fi
+
+  # Счётчик сбоев применения tc (фикс: «✅ Лимиты настроены» печаталось даже
+  # когда не встало ни одно правило — «Cannot find device» × N и exit 0).
+  TC_FAIL_COUNT=0
+  _tc_fail() { TC_FAIL_COUNT=$((TC_FAIL_COUNT + 1)); echo "⚠️ tc filter" >&2; }
+
+  # Структурная проверка: без устройства не применится ни класс, ни фильтр —
+  # сообщаем причину одной строкой вместо каскада «Cannot find device».
+  if ! ip link show "$TUN" >/dev/null 2>&1; then
+    echo "❌ Лимиты скорости: интерфейс $TUN не найден — правила tc примениться не могут" >&2
+    TC_FAIL_COUNT=$((TC_FAIL_COUNT + 1))
   fi
 
   # Устанавливаем TUN_SUBNET4/6 из уже распарсенных LOCAL_SUBNETS
@@ -6388,18 +6428,18 @@ fi
   # Catch-all mirred: трафик вне SUBNETS_LIMITS попадает на IFB_MIX (BRIDGE лимит)
   # Per-subnet mirred внутри loop имеют приоритет (first-match-wins)
   if [ "$_needs_mix" = "1" ]; then
-    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
-    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
-    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
-    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || _tc_fail
+    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || _tc_fail
+    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || _tc_fail
+    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_MIX" || _tc_fail
   fi
   if [ "$_needs_out" = "1" ]; then
-    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" || echo "⚠️ tc filter" >&2
-    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent 1: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" || _tc_fail
+    tc filter add dev "$TUN" parent 1: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_OUT" || _tc_fail
   fi
   if [ "$_needs_in" = "1" ]; then
-    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" || echo "⚠️ tc filter" >&2
-    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" || echo "⚠️ tc filter" >&2
+    tc filter add dev "$TUN" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" || _tc_fail
+    tc filter add dev "$TUN" parent ffff: protocol ipv6 u32 match u32 0 0 action mirred egress redirect dev "$IFB_IN" || _tc_fail
   fi
 
   echo "📊 Настройка лимитов скорости..."
@@ -6494,15 +6534,15 @@ fi
         if [ "$_rule_type" = "mix" ]; then
             # MIX: оба направления на IFB_MIX (prio 100 — раньше catch-all 49152,
             # фикс аудита: иначе catch-all затенял per-subnet в MIX+SEPARATE)
-            tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio 100 u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
-            tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio 100 u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || echo "⚠️ tc filter" >&2
+            tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio 100 u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || _tc_fail
+            tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio 100 u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || _tc_fail
         else
             # Separate: OUT на parent 1: (egress=download=dst), IN на parent ffff: (ingress=upload=src)
             if [ "$_create_down" = "1" ]; then
-                tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio 100 u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_OUT" || echo "⚠️ tc filter" >&2
+                tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio 100 u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_OUT" || _tc_fail
             fi
             if [ "$_create_up" = "1" ]; then
-                tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio 100 u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_IN" || echo "⚠️ tc filter" >&2
+                tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio 100 u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_IN" || _tc_fail
             fi
         fi
   done
@@ -6599,11 +6639,11 @@ fi
               if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
                   tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
-                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
-                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || _tc_fail
+                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $ip flowid $_classid || _tc_fail
                   else
-                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
-                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $ip flowid $_classid || _tc_fail
+                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $ip flowid $_classid || _tc_fail
                   fi
                   tc qdisc add dev "$IFB_MIX" parent $_classid fq_codel 2>/dev/null || true
               fi
@@ -6621,9 +6661,9 @@ fi
                   tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # OUT на parent 1: (egress) = download = dst клиента
-                      tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || _tc_fail
                   else
-                      tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $ip flowid $_classid || _tc_fail
                   fi
                   tc qdisc add dev "$IFB_OUT" parent $_classid fq_codel 2>/dev/null || true
               fi
@@ -6641,9 +6681,9 @@ fi
                   tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # IN на parent ffff: (ingress) = upload = src клиента
-                      tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $ip flowid $_classid || _tc_fail
                   else
-                      tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $ip flowid $_classid || echo "⚠️ tc filter" >&2
+                      tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $ip flowid $_classid || _tc_fail
                   fi
                   tc qdisc add dev "$IFB_IN" parent $_classid fq_codel 2>/dev/null || true
               fi
@@ -6868,28 +6908,28 @@ fi
                       if [ "$_rule_type" = "mix" ]; then
                           if [ "$_create_down" = "1" ]; then
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
-                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || _tc_fail
+                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || _tc_fail
                               else
-                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
-                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || _tc_fail
+                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || _tc_fail
                               fi
                           fi
                       else
                           if [ "$_create_down" = "1" ]; then
                               # OUT на parent 1: (egress) = download = dst клиента
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || _tc_fail
                               else
-                                  tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || _tc_fail
                               fi
                           fi
                           if [ "$_create_up" = "1" ]; then
                               # IN на parent ffff: (ingress) = upload = src клиента
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || _tc_fail
                               else
-                                  tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || echo "⚠️ tc filter" >&2
+                                  tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || _tc_fail
                               fi
                           fi
                       fi
@@ -6918,7 +6958,23 @@ fi
           fi
         fi
     done
-    echo "✅ Лимиты скорости настроены"
+    # Итог по факту, а не безусловно. Политика: одиночный сбой фильтра —
+    # предупреждение (одно правило не должно ронять туннель), а «не встало ни
+    # одного» — структурный отказ: ошибка + ненулевой код, чтобы awg-quick
+    # откатил подъём (молчаливый EXIT=0 скрывал это и от автоматики).
+    _lim_applied=$( { tc filter show dev "$TUN" 2>/dev/null
+                      tc filter show dev "$IFB_MIX" 2>/dev/null
+                      tc filter show dev "$IFB_OUT" 2>/dev/null
+                      tc filter show dev "$IFB_IN" 2>/dev/null
+                    } | grep -c 'filter' )
+    if [ "$TC_FAIL_COUNT" -gt 0 ] && [ "${_lim_applied:-0}" -eq 0 ]; then
+      echo "❌ Лимиты скорости НЕ применены (сбоев tc: $TC_FAIL_COUNT, ни одного фильтра не встало) — шейпинг не действует" >&2
+      UP_FAIL=$(( ${UP_FAIL:-0} + 1 ))
+    elif [ "$TC_FAIL_COUNT" -gt 0 ]; then
+      echo "⚠️  Лимиты скорости применены ЧАСТИЧНО (сбоев tc: $TC_FAIL_COUNT) — часть правил не действует, см. предупреждения выше" >&2
+    else
+      echo "✅ Лимиты скорости настроены"
+    fi
   fi
 fi
 
@@ -6979,7 +7035,9 @@ if [ "$UPLOG" = "1" ]; then
   echo "📄 Лог сохранён: $LOG_FILE"
 fi
 
-exit 0
+# Ненулевой код возврата при неприменённых правилах: awg-quick считает сбой
+# PostUp фатальным, а ручной запуск up.sh больше не «выглядит успешным».
+exit "${UP_FAIL:-0}"
 '''
 
 #####################################################################################################################################################################################
@@ -7070,7 +7128,7 @@ fi
 # --- Парсинг LOCAL_SUBNETS (IPv4 + IPv6) ---
 LOCAL_SUBNETS_IPV4=""
 LOCAL_SUBNETS_IPV6=""
-if command -v parse_local_subnets &>/dev/null 2>/dev/null; then
+if command -v parse_local_subnets &>/dev/null; then
   parse_local_subnets
 fi
 
@@ -7101,7 +7159,7 @@ fi
 
 # "Безопасное" имя туннеля для суффиксов (только буквы/цифры/_)
 TUN_SAFE="$(echo "$TUN" | sed 's/[^a-zA-Z0-9]/_/g')"
-if command -v safe_tun_name &>/dev/null 2>/dev/null; then
+if command -v safe_tun_name &>/dev/null; then
   TUN_SAFE=$(safe_tun_name "$TUN")
 fi
 # Суффиксированные/уникальные имена цепочек/ресурсов
@@ -7122,7 +7180,7 @@ echo "————————————————————————�
 # сдвинутый диапазон не будет найден и правила останутся).
 if [ -f "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" ]; then
   MARK_BASE=$(cat "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" 2>/dev/null)
-elif command -v calc_mark_base &>/dev/null 2>/dev/null; then
+elif command -v calc_mark_base &>/dev/null; then
   # Рев-46: сначала выделенное значение (как в up/down) — иначе
   # проверочный скрипт печатал метку, которой нет в правилах
   MARK_BASE=$(cat "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" 2>/dev/null)
@@ -7277,7 +7335,7 @@ done
 # уже загружены через source в начале скрипта.
 
 # Разбираем LOCAL_SUBNETS на IPv4 и IPv6
-if command -v parse_local_subnets &>/dev/null 2>/dev/null; then
+if command -v parse_local_subnets &>/dev/null; then
   parse_local_subnets
 fi
 
@@ -7639,6 +7697,14 @@ if [ -n "$TUN" ]; then
   iptables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -D INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-55: три -D выше требуют ТОЧНОЙ спецификации правила, поэтому прыжок
+  # вида `-A INPUT -p udp --dport <порт> -j INPUT_<tun>` не снимается, когда
+  # $PORT неизвестен (копию параметров в .data/temp удалил предыдущий down,
+  # либо up не дошёл до её записи). Тогда цепочка оставалась висеть вместе с
+  # прыжком. Снимаем снапшотом по имени цепочки — как quota_jump_del ниже.
+  iptables-save 2>/dev/null | grep -E -- "-j ${INPUT_CHAIN}( |\$)" | while read -r _line; do
+    ( set -f; iptables -t filter -D ${_line#-A } 2>/dev/null || true )
+  done
   iptables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -X "$INPUT_CHAIN" 2>/dev/null || true
 fi
@@ -7651,6 +7717,10 @@ if [ -n "$TUN" ]; then
   ip6tables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -D INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-55: то же для IPv6 — снапшот по имени цепочки (см. комментарий выше).
+  ip6tables-save 2>/dev/null | grep -E -- "-j ${INPUT_CHAIN}( |\$)" | while read -r _line; do
+    ( set -f; ip6tables -t filter -D ${_line#-A } 2>/dev/null || true )
+  done
   ip6tables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -X "$INPUT_CHAIN" 2>/dev/null || true
 fi
@@ -9924,7 +9994,7 @@ def _gen_quic_client(domain: str = "", seed: str = "", try_aesgcm=None):
     # supported_groups (x25519, secp256r1, secp384r1, secp521r1) — длины СЧИТАЮТСЯ,
     # а не вписаны руками: в прежней версии было объявлено 20 Б при 19 реальных,
     # из-за чего Cloudflare отвечал CONNECTION_CLOSE с TLS alert 50 (decode_error).
-    grp_list = "".join(["001d", "0017", "0018", "0019"])
+    grp_list = "001d001700180019"
     groups_hex = ("000a" +
                   f"{len(grp_list)//2 + 2:04x}" +      # ext data len: list_len(2) + группы
                   f"{len(grp_list)//2:04x}" + grp_list)
@@ -10138,7 +10208,6 @@ def _dtls_clienthello_via_pion(domain: str = "", seed: str = ""):
     I-параметры, чтобы ServerHello и flight были согласованы с ClientHello
     (один и тот же handshake).
     """
-    global _DTLS_PION_CACHE
     _cache_key = (domain, seed)
     if _cache_key in _DTLS_PION_CACHE:
         return _DTLS_PION_CACHE[_cache_key]
@@ -10962,7 +11031,7 @@ def _file_lock(path: pathlib.Path):
     try:
         # Ветки Linux-only: на машине разработки (Windows) fcntl отсутствует, а на
         # сервере отсутствует ветка except — обе помечены как платформенные.
-        import fcntl  # pragma: no cover  # noqa: PLC0415 — только Linux
+        import fcntl  # pragma: no cover — только Linux
         # Хэндл lock-файла обязан жить всё время блокировки (закрываем в finally)
         _fh = open(str(path) + ".lock", "a+", encoding="utf-8")  # pragma: no cover  # noqa: SIM115 — хэндл живёт всё время блокировки
         fcntl.flock(_fh.fileno(), fcntl.LOCK_EX)  # pragma: no cover
@@ -11763,7 +11832,7 @@ def generate_warp_config(tun_name: str, index: int, mtu: int, proxy: str = "", v
             continue
 
     if not chosen:
-        raise RuntimeError("Не найден доступный endpoint для WARP (проверено %d endpoint'ов)" % total_endpoints)
+        raise RuntimeError(f"Не найден доступный endpoint для WARP (проверено {total_endpoints} endpoint'ов)")
 
     # Генерируем все параметры обфускации через общую функцию
     # WARP это клиентский конфиг, поэтому for_client=True
@@ -12165,8 +12234,11 @@ def get_server_public_address(cfg) -> str:
         s.close()
         if ip:
             return ip
-    except Exception:
-        pass
+    except Exception as e:
+        # Фоллбэк на адрес из конфига: при сбое пробы маршрута там может лежать
+        # туннельный адрес — клиенты получат нерабочий Endpoint без объяснений.
+        logger.debug("Определение публичного адреса через маршрут не удалось (%s) — "
+                     "беру адрес интерфейса", e)
     addr = iface.get("Address", "")
     return addr.split("/")[0] if addr else ""
 
@@ -12904,7 +12976,7 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
                                             server_ip_int_ipv4, used_ips_ipv4,
                                             server_on_network_ipv4, broadcast_int_ipv4)
 
-                ipaddr_ipv4 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
+                ipaddr_ipv4 = f"{manual_ip.network_address!s}/{manual_ip.prefixlen}"
                 # Регистрируем ВЕСЬ диапазон как занятый (фикс аудита: ручной
                 # /16 не защищал авто-выдачу внутри себя)
                 used_ips_ipv4.add((int(manual_ip.network_address), int(manual_ip.broadcast_address)))
@@ -12921,7 +12993,7 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
                                             server_on_network_ipv6,
                                             int(net_ipv6.broadcast_address))
 
-                ipaddr_ipv6 = f"{str(manual_ip.network_address)}/{manual_ip.prefixlen}"
+                ipaddr_ipv6 = f"{manual_ip.network_address!s}/{manual_ip.prefixlen}"
                 used_ips_ipv6.add((int(manual_ip.network_address), int(manual_ip.broadcast_address)))
     else:
         # --- АВТОМАТИЧЕСКИЙ IP ---
@@ -12948,7 +13020,7 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
             if chosen_ipv6 is None:
                 raise RuntimeError('Нет свободных IPv6 адресов')
             used_ips_ipv6.add(chosen_ipv6)
-            ipaddr_ipv6 = f"{str(ipaddress.IPv6Address(chosen_ipv6))}/{ipv6_client_mask}"
+            ipaddr_ipv6 = f"{ipaddress.IPv6Address(chosen_ipv6)!s}/{ipv6_client_mask}"
         else:
             # --- АВТОМАТИЧЕСКИЙ IP (IPv4, опционально IPv6) ---
             # Вычисляем маски клиентов и коэффициент кратности
@@ -13033,10 +13105,10 @@ def _allocate_client_ip(opt, net_ipv4, net_ipv6, server_on_network_ipv4, server_
                 used_ips_ipv6.add(chosen_ipv6)
 
             # Формируем адрес с маской клиента
-            ipaddr_ipv4 = f"{str(ipaddress.IPv4Address(chosen_ipv4))}/{ipv4_client_mask}"
+            ipaddr_ipv4 = f"{ipaddress.IPv4Address(chosen_ipv4)!s}/{ipv4_client_mask}"
 
             if net_ipv6 and chosen_ipv6 is not None:
-                ipaddr_ipv6 = f"{str(ipaddress.IPv6Address(chosen_ipv6))}/{ipv6_client_mask}"
+                ipaddr_ipv6 = f"{ipaddress.IPv6Address(chosen_ipv6)!s}/{ipv6_client_mask}"
             elif net_ipv6:  # pragma: no cover — цикл пар: найдя v4-блок, всегда ставит и v6; иначе raise «Нет свободных пар»
                 logger.warning('⚠  Нет свободных пар IPv4+IPv6, выдаём только IPv4')
                 ipaddr_ipv6 = None
@@ -13060,7 +13132,9 @@ def _add_client_to_config(srv_path: pathlib.Path, c_name: str, ipaddr: str,
     srvcfg += '\n'
     srvcfg += '[Peer]\n'
     srvcfg += f'#_Name = {c_name}\n'
-    srvcfg += f'#_GenKeyTime = {datetime.datetime.now().isoformat()}\n'
+    # Время генерации пишем в UTC явно: naive-значение неотличимо от локального
+    # (фикс DTZ005: стенд обычно в UTC, а конфиг уезжает на машину с другим поясом)
+    srvcfg += f'#_GenKeyTime = {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n'
     srvcfg += f'#_PrivateKey = {priv_key}\n'
     srvcfg += f'PublicKey = {pub_key}\n'
     srvcfg += f'PresharedKey = {psk}\n'
@@ -13242,7 +13316,11 @@ def _read_server_protocol(conf_path: pathlib.Path) -> str:
                 logger.warning("⚠  Некорректная версия в '# Protocol: %s' — определяю по "
                                "параметрам конфига", value)
                 break
-    except Exception:
+    except Exception as e:
+        # Молчаливый откат к AWG1.0 отключал у клиентов всю обфускацию 3.x —
+        # теперь причина видна (ключи/PSK при этом не страдают).
+        logger.warning("⚠  Не удалось разобрать '# Protocol:' (%s) — принимаю AWG1.0, "
+                       "параметры 3.x применены не будут", e)
         return "AWG1.0"
 
     def _has(name: str) -> bool:
@@ -13251,7 +13329,7 @@ def _read_server_protocol(conf_path: pathlib.Path) -> str:
         # подсказки ("# ContentPaddingAddition = …") тул сам пишет в конфиги версий
         # ниже 3.0 — раньше из-за них такой конфиг определялся как AWG3.0, и клиент
         # получал активные параметры ИЗ КОММЕНТАРИЕВ (рукопожатие молча не проходило).
-        return re.search(rf'^\s*(?:#_)?{name}\s*=', text, re.M) is not None
+        return re.search(rf'^\s*(?:#_)?{name}\s*=', text, re.MULTILINE) is not None
 
     if _has('HeaderProtectionKey'):
         version = "AWG3.1"
@@ -13668,7 +13746,11 @@ def _default_gateways() -> list[str]:
                 ["ip", "-6", "route", "show", "default"]):
         try:
             rc, out = exec_cmd(cmd)
-        except Exception:
+        except Exception as e:
+            # Без этого проверка конфликта подсети со шлюзом просто не выполнится,
+            # а её пропуск означает «сервер может потерять сеть» без предупреждения.
+            logger.debug("Не удалось получить маршруты по умолчанию (%s): %s",
+                         " ".join(cmd), e)
             continue
         if rc != 0:
             continue
@@ -13752,7 +13834,7 @@ def handle_makecfg(opt) -> None:
     if g_main_config_fn.exists():
         try:
             _cfg_txt = g_main_config_fn.read_text(encoding='utf-8', errors='ignore')
-            for _m in re.finditer(r'^\s*Address\s*=\s*(.+)$', _cfg_txt, re.M):
+            for _m in re.finditer(r'^\s*Address\s*=\s*(.+)$', _cfg_txt, re.MULTILINE):
                 _check_cidrs += [c.strip() for c in _m.group(1).split(',') if c.strip()]
         except OSError:
             pass
@@ -13878,7 +13960,7 @@ def handle_makecfg(opt) -> None:
             _old_params = ""
             try:
                 _old_params = _params_path.read_text(encoding='utf-8')
-                _m = re.search(r'WARP_LIST=\((.*?)\)', _old_params, re.S)
+                _m = re.search(r'WARP_LIST=\((.*?)\)', _old_params, re.DOTALL)
                 if _m:
                     # Фикс аудита-C2: ручные формы «warp1=subnet» НЕ являются
                     # путями конфигов — при перегенерации они давали мусорные
@@ -13890,8 +13972,13 @@ def handle_makecfg(opt) -> None:
                                   if x.strip().strip('"') and '=' not in x.strip().strip('"')
                                       and re.fullmatch(r'[A-Za-z0-9_.\-]{1,64}', x.strip().strip('"'))
                                       and '..' not in x.strip().strip('"')]
-            except Exception:
-                pass
+            except FileNotFoundError:
+                pass  # первый --make: параметр-файла ещё нет — переносить нечего
+            except Exception as e:
+                # Нечитаемый <tun>.sh = WARP-список не переносится, и после
+                # --make маршрутизация через WARP молча исчезнет из скриптов.
+                logger.warning("⚠  Не удалось перенести WARP-список из %s (%s) — "
+                               "скрипты останутся без WARP", _params_path.name, e)
             main_iface = getattr(opt, 'iface', '') or get_main_iface() or 'net0'
             srv_addr = srv.get('Address', '')
             # Параметры перегенерации БЕРЁМ ИЗ СУЩЕСТВУЮЩЕГО КОНФИГА (порт),
@@ -13908,7 +13995,7 @@ def handle_makecfg(opt) -> None:
             # «пропадали» при каждом повторном --make. Переносим старый rate,
             # когда в CLI лимит явно не задан.
             if not _upd_opt.limit:
-                _m2 = re.search(r'SUBNETS_LIMITS=\((.*?)\)', _old_params, re.S)
+                _m2 = re.search(r'SUBNETS_LIMITS=\((.*?)\)', _old_params, re.DOTALL)
                 if _m2:
                     _rates = re.findall(r':(\d+)"', _m2.group(1))
                     if _rates:
@@ -13957,7 +14044,7 @@ def handle_makecfg(opt) -> None:
 
     out = g_defserver_config
     out = out.replace("<PROTOCOL>", awg_version)
-    out = out.replace("<SERVER_KEY_TIME>", datetime.datetime.now().isoformat())
+    out = out.replace("<SERVER_KEY_TIME>", datetime.datetime.now(datetime.timezone.utc).isoformat())
     out = out.replace("<SERVER_PRIVATE_KEY>", priv)
     out = out.replace("<SERVER_PUBLIC_KEY>", pub)
     out = out.replace("<SERVER_ADDR>", ipaddr_display)
@@ -14052,7 +14139,11 @@ def handle_add(opt) -> None:
                         used_ips_ipv4.add((int(peer_ip.network_address), int(peer_ip.broadcast_address)))
                     else:
                         used_ips_ipv6.add((int(peer_ip.network_address), int(peer_ip.broadcast_address)))
-            except Exception:
+            except Exception as e:
+                # Пропущенный пир = его адрес считается свободным и может быть
+                # выдан второму клиенту (дубликат IP ломает туннель обоим).
+                logger.warning("⚠  Не удалось разобрать AllowedIPs пира '%s' (%s) — "
+                               "адрес не учтён как занятый", peer_ip_str, e)
                 continue
 
         srvcfg = srv_path.read_text(encoding='utf-8')
@@ -14105,7 +14196,7 @@ def handle_update(opt) -> None:
         cfg.set_param(actual_name, '_PrivateKey', priv_key, force=True, offset=2)
         cfg.set_param(actual_name, 'PublicKey', pub_key)
         cfg.set_param(actual_name, 'PresharedKey', psk)
-        gentime = datetime.datetime.now().isoformat()
+        gentime = datetime.datetime.now(datetime.timezone.utc).isoformat()
         cfg.set_param(actual_name, '_GenKeyTime', gentime, force=True, offset=2)
         new_pk = _generate_persistent_keepalive(srv_proto)
         cfg.set_param(actual_name, 'PersistentKeepalive', str(new_pk), force=True, offset=3)
@@ -14144,6 +14235,7 @@ def handle_delete(opt) -> None:
     # ключом) убираем в .bak — иначе `bob.zip` с приватником остаётся навсегда и
     # неотличим от свежих архивов, а последующий `-z` его сохраняет.
     _removed_artifacts = 0
+    _failed_artifacts = 0
     _art_suffixes = _client_artifact_suffixes()
     for _f in list(g_conf_dir.glob(f"{p_name}*")):
         if _f.suffix not in ('.conf', '.png', '.zip'):
@@ -14158,10 +14250,16 @@ def handle_delete(opt) -> None:
             _bak = _f.with_name(_f.name + '.bak')
             os.replace(_f, _bak)
             _removed_artifacts += 1
-        except Exception:
-            pass
+        except Exception as e:
+            _failed_artifacts += 1
+            logger.debug('Не удалось убрать артефакт %s в .bak: %s', _f.name, e)
     if _removed_artifacts:
         logger.info('🧹 Артефакты клиента "%s" убраны в .bak: %d', p_name, _removed_artifacts)
+    if _failed_artifacts:
+        # Содержимое этих файлов включает приватный ключ удалённого клиента —
+        # молча оставить их на месте нельзя (считалось бы, что клиент удалён).
+        logger.warning('⚠  Не удалось убрать артефакты клиента "%s": %d файл(ов) остались '
+                       '(в них приватный ключ — уберите вручную)', p_name, _failed_artifacts)
 
 
 def handle_warp_gen(opt) -> list[str]:
@@ -14780,17 +14878,22 @@ def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip
     # сносил все *.png/*.zip, `-z` — все клиентские *.conf/*.png, включая файлы
     # чужих клиентов, которых инструмент не создавал и восстановить не мог.
     _moved = 0
+    _failed = 0
     for f in os.listdir(g_conf_dir):
-        if f not in keep_files and (f.endswith('.conf') or f.endswith('.png') or f.endswith('.zip')):
+        if f not in keep_files and f.endswith(('.conf', '.png', '.zip')):
             src = g_conf_dir.joinpath(f)
             dst = g_conf_dir.joinpath(f + '.bak')
             try:
                 os.replace(src, dst)      # перезаписывает .bak атомарно (рев-47)
                 _moved += 1
-            except Exception:
-                pass
+            except Exception as e:
+                _failed += 1
+                logger.debug('Не удалось убрать %s в .bak: %s', f, e)
     if _moved:
         logger.info('🧹 Убрано в .bak: %d файл(ов) в %s', _moved, g_conf_dir)
+    if _failed:
+        logger.warning('⚠  Не удалось убрать в .bak: %d файл(ов) в %s (остались на месте)',
+                       _failed, g_conf_dir)
 
 
 # ----------------- CLI -----------------
@@ -14943,7 +15046,12 @@ def get_main_config_path(check: bool = True, override: str | None = None) -> str
 
 
 def _handle_reload(override: str | None = None) -> None:
-    """Перезагрузить конфиг работающего интерфейса без отключения (strip + syncconf)."""
+    """Перезагрузить конфиг работающего интерфейса без отключения (strip + syncconf).
+
+    Рев-56: заодно пересобирает up/down-скрипты из текущего генератора (шаблоны
+    плейсхолдеров не содержат), чтобы фиксы генератора доходили до существующих
+    интерфейсов. Файл параметров при этом НЕ перезаписывается — в нём правки рук.
+    """
     if g_main_config_fn is None:
         get_main_config_path(check=True, override=override)
     if g_main_config_fn is None or not g_main_config_fn.exists():
@@ -14957,6 +15065,27 @@ def _handle_reload(override: str | None = None) -> None:
     temp_conf = temp_dir / f"{tun}.{os.getpid()}.conf"
 
     logger.info("🔄 Перезагрузка конфига %s без отключения...", tun)
+
+    # Рев-56: пересборка up/down-скриптов из текущего генератора. Делаем ДО
+    # проверки интерфейса — скрипты нужны и когда туннель опущен. Шаблоны этих
+    # файлов плейсхолдеров не содержат (все значения читаются из параметр-файла),
+    # поэтому пересборка ничего не теряет. Сам параметр-файл НЕ трогаем: в нём
+    # правки рук (лимиты, квоты, пробросы), а пересборка из CLI-дефолтов их бы
+    # стёрла — именно поэтому «-r пересобирает скрипты» реализовано без него.
+    _up_path = g_main_config_fn.parent / f"{tun}up.sh"
+    _down_path = g_main_config_fn.parent / f"{tun}down.sh"
+    _params_path = g_main_config_fn.parent / f"{tun}.sh"
+    try:
+        atomic_write_text(_up_path, up_script_template_warp)
+        atomic_write_text(_down_path, down_script_template_warp)
+        os.chmod(str(_up_path), 0o755)
+        os.chmod(str(_down_path), 0o755)
+        logger.info("🔄 up/down-скрипты пересобраны: %s, %s", _up_path.name, _down_path.name)
+        if not _params_path.exists():
+            logger.warning("⚠  Файл параметров %s отсутствует — up/down пересобраны, но "
+                           "интерфейсу нужен и он (создаётся через --make)", _params_path.name)
+    except OSError as e:
+        logger.warning("⚠  Не удалось пересобрать up/down-скрипты: %s", e)
 
     # Если интерфейс не запущен — предупреждаем и выходим ДО syncconf
     # (иначе awg syncconf падает с неоднозначной ошибкой)
@@ -15010,6 +15139,7 @@ def _remove_files_by_suffix(directory: pathlib.Path, suffixes: tuple[str, ...]) 
     if not directory.is_dir():
         return  # каталога нет (например, автономный WARP без -z) — нечего чистить
     moved = 0
+    failed = 0
     for f in os.listdir(directory):
         if f.endswith(suffixes):
             src = directory.joinpath(f)
@@ -15017,10 +15147,14 @@ def _remove_files_by_suffix(directory: pathlib.Path, suffixes: tuple[str, ...]) 
             try:
                 os.replace(src, dst)      # перезаписывает .bak атомарно (рев-47)
                 moved += 1
-            except Exception:
-                pass
+            except Exception as e:
+                failed += 1
+                logger.debug('Не удалось убрать %s в .bak: %s', f, e)
     if moved:
         logger.info('🧹 Убрано в .bak: %d файл(ов) в %s', moved, directory)
+    if failed:
+        logger.warning('⚠  Не удалось убрать в .bak: %d файл(ов) в %s (остались на месте)',
+                       failed, directory)
 
 
 def main() -> None:
