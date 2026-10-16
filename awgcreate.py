@@ -1630,6 +1630,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   # --- Парсинг LOCAL_SUBNETS на IPv4 и IPv6 (точно как в up.sh) ---
   parse_local_subnets
 
+  # Рев-57: отсутствие IPv6-цепочки при конфиге БЕЗ IPv6 — не ошибка: цепочки
+  # создаются по подсетям конфига. Раньше чекер писал ❌ и верный односкековый
+  # интерфейс выглядел сломанным. ❌ оставляем только когда IPv6 в конфиге есть.
+  _chain6() {
+    ip6tables -t "$1" -L "$2" -n -v 2>/dev/null || {
+      if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+        echo "   ❌ Цепочка не найдена"
+      else
+        echo "   ℹ️  цепочки нет: в конфиге нет IPv6 (односкековый интерфейс)"
+      fi
+    }
+  }
+
   # --- Вычисление BROADCAST_ADDR (только из IPv4, как в up.sh) ---
   BROADCAST_ADDR=""
   if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
@@ -1642,7 +1655,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "   IPv4 правила:"
   iptables -t filter -L "$INPUT_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
   echo "   IPv6 правила:"
-  ip6tables -t filter -L "$INPUT_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  _chain6 filter "$INPUT_CHAIN"
   echo ""
 
   # --- 1.1. DDoS проверка hashlimit статистики ---
@@ -1673,35 +1686,35 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "   IPv4:"
   iptables -t nat -L "$HAIRPIN_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
   echo "   IPv6:"
-  ip6tables -t nat -L "$HAIRPIN_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  _chain6 nat "$HAIRPIN_CHAIN"
   echo ""
 
   echo "   Проброс портов (NAT: $PF_CHAIN_NAT):"
   echo "   IPv4:"
   iptables -t nat -L "$PF_CHAIN_NAT" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
   echo "   IPv6:"
-  ip6tables -t nat -L "$PF_CHAIN_NAT" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  _chain6 nat "$PF_CHAIN_NAT"
   echo ""
 
   echo "   Проброс портов (FILTER: $PF_CHAIN_FILTER):"
   echo "   IPv4:"
   iptables -t filter -L "$PF_CHAIN_FILTER" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
   echo "   IPv6:"
-  ip6tables -t filter -L "$PF_CHAIN_FILTER" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  _chain6 filter "$PF_CHAIN_FILTER"
   echo ""
 
   echo "   Проброс портов (SNAT: $PF_CHAIN_SNAT):"
   echo "   IPv4:"
   iptables -t nat -L "$PF_CHAIN_SNAT" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
   echo "   IPv6:"
-  ip6tables -t nat -L "$PF_CHAIN_SNAT" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  _chain6 nat "$PF_CHAIN_SNAT"
   echo ""
 
   echo "   Random WARP ($RANDOM_WARP_CHAIN):"
   echo "   IPv4:"
   iptables -t mangle -L "$RANDOM_WARP_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
   echo "   IPv6:"
-  ip6tables -t mangle -L "$RANDOM_WARP_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  _chain6 mangle "$RANDOM_WARP_CHAIN"
   echo ""
 
   # --- 2.1. Общие правила PREROUTING и FORWARD ---
@@ -1923,14 +1936,22 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ✅ IPv4:"
     echo "$_ip4_rules" | while IFS= read -r _rline; do echo "        $_rline"; done
   else
-    echo "   ❌ IPv4: WARP fwmark-правила не созданы"
+    if [ ${#WARP_LIST[@]} -gt 0 ]; then
+      echo "   ❌ IPv4: WARP fwmark-правила не созданы"
+    else
+      echo "   ℹ️  IPv4: WARP не настроен (WARP_LIST пуст)"
+    fi
   fi
   _ip6_rules=$(ip -6 rule show 2>/dev/null | grep -E "fwmark|mark" || true)
   if [ -n "$_ip6_rules" ]; then
     echo "   ✅ IPv6:"
     echo "$_ip6_rules" | while IFS= read -r _rline; do echo "        $_rline"; done
   else
-    echo "   ❌ IPv6: WARP fwmark-правила не созданы"
+    if [ ${#WARP_LIST[@]} -gt 0 ]; then
+      echo "   ❌ IPv6: WARP fwmark-правила не созданы"
+    else
+      echo "   ℹ️  IPv6: WARP не настроен (WARP_LIST пуст)"
+    fi
   fi
   echo ""
 
