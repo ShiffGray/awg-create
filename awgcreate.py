@@ -1775,24 +1775,30 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   IFB_OUT="ifb_${TUN_SAFE}_out"
   IFB_MIX="ifb_${TUN_SAFE}_mix"
   echo "   IFB устройства:"
-  if ip link show "$IFB_IN" &>/dev/null; then
-    echo "   ✅ $IFB_IN активен"
-    ip -br link show "$IFB_IN" 2>/dev/null
-  else
-    echo "   ❌ $IFB_IN не найден"
+  # Рев-57: часть устройств отсутствует ПО ЗАМЫСЛУ (MIX-режим не создаёт _in/_out,
+  # SEPARATE — _mix). Раньше чекер писал на них ❌, и верный конфиг выглядел
+  # сломанным. Определяем, какие устройства вообще требует текущий конфиг.
+  _need_mix=0; _need_out=0; _need_in=0
+  if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
+    for _le in "${SUBNETS_LIMITS[@]}"; do
+      case "$(parse_entry "$_le")" in
+        *"|mix")      _need_mix=1 ;;
+        *"|separate") _need_out=1; _need_in=1 ;;
+      esac
+    done
   fi
-  if ip link show "$IFB_OUT" &>/dev/null; then
-    echo "   ✅ $IFB_OUT активен"
-    ip -br link show "$IFB_OUT" 2>/dev/null
-  else
-    echo "   ❌ $IFB_OUT не найден"
-  fi
-  if ip link show "$IFB_MIX" &>/dev/null; then
-    echo "   ✅ $IFB_MIX активен"
-    ip -br link show "$IFB_MIX" 2>/dev/null
-  else
-    echo "   ❌ $IFB_MIX не найден"
-  fi
+  for _pair in "IN:$_need_in" "OUT:$_need_out" "MIX:$_need_mix"; do
+    _slot="${_pair%%:*}"; _need="${_pair##*:}"
+    eval "_dev=\$IFB_${_slot}"
+    if ip link show "$_dev" &>/dev/null; then
+      echo "   ✅ $_dev активен"
+      ip -br link show "$_dev" 2>/dev/null
+    elif [ "$_need" = "0" ]; then
+      echo "   ℹ️  $_dev не используется (нет правил этого типа в SUBNETS_LIMITS)"
+    else
+      echo "   ❌ $_dev не найден, хотя конфиг его требует"
+    fi
+  done
   echo ""
   
   # Проверка tc фильтров на TUN (перенаправление на IFB)
@@ -2053,11 +2059,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   ip6tables -L FORWARD -n -v 2>/dev/null | grep -E "$TUN.*$IFACE|$IFACE.*$TUN" || echo "   (нет правил)"
   echo ""
 
-  echo "   LAN_ALLOW правила (разрешения между клиентами):"
+  echo "   LAN_ALLOW правила (обмен между клиентами, -i/-o $TUN):"
   echo "   IPv4:"
-  iptables -L FORWARD -n -v 2>/dev/null | grep -E "ACCEPT.*$TUN.*$TUN" | head -10 || echo "   (нет правил)"
+  # Рев-57: точный шаблон. Прежний "ACCEPT.*$TUN.*$TUN" матчил и WARP-правила
+  # ($TUN -> ${TUN}warpN) — из-за этого под этим заголовком печатались они.
+  iptables -L FORWARD -n -v 2>/dev/null | grep -E "ACCEPT.* $TUN +$TUN " | head -10 || echo "   (нет правил)"
   echo "   IPv6:"
-  ip6tables -L FORWARD -n -v 2>/dev/null | grep -E "ACCEPT.*$TUN.*$TUN" | head -10 || echo "   (нет правил)"
+  ip6tables -L FORWARD -n -v 2>/dev/null | grep -E "ACCEPT.* $TUN +$TUN " | head -10 || echo "   (нет правил)"
   echo ""
 
   echo "   Broadcast/Multicast mark правила:"
@@ -6349,6 +6357,12 @@ fi
     local _major="$2"
     local _subnets="$3"
 
+    # Рев-57: часть устройств отсутствует по замыслу — в SEPARATE-режиме нет
+    # ifb_<tun>_mix, в MIX — нет _out/_in. Раньше блок всё равно пытался вешать
+    # на них root-фильтры, и в лог шли «Cannot find device» + «Ошибка root
+    # filter» ×4 при полностью верном конфиге (читается как сбой). Пропускаем.
+    [ -e "/sys/class/net/$_ifb" ] || return 0
+
     if [ -z "$_subnets" ]; then
       return
     fi
@@ -6524,25 +6538,33 @@ fi
       # Per-subnet mirred на TUN: перенаправляем трафик ТОЛЬКО этих подсетей на нужные IFB
       # Вместо старого catch-all (match u32 0 0), который забирал весь трафик
       for _mirred_sub in "${SUBNET_ARRAY[@]}"; do
+        # Рев-57: у u32 на одном parent'е явный pref может держать ТОЛЬКО одна
+        # семья протоколов — вторая с тем же pref падает «Filter with specified
+        # priority/protocol not found», и правило заворота молча не встаёт.
+        # Проверено на стенде (dual-stack -i): с prio 100 для обеих семей
+        # IPv6-фильтры не создавались, IPv6-трафик шёл мимо ifb, а up.sh
+        # честно писал «применены ЧАСТИЧНО». Поэтому prio разный по протоколу.
         if [[ "$_mirred_sub" == *:* ]]; then
             _mirred_proto="ipv6"
             _mirred_match="ip6"
+            _mirred_prio=101
         else
             _mirred_proto="ip"
             _mirred_match="ip"
+            _mirred_prio=100
         fi
         if [ "$_rule_type" = "mix" ]; then
-            # MIX: оба направления на IFB_MIX (prio 100 — раньше catch-all 49152,
+            # MIX: оба направления на IFB_MIX (раньше catch-all 49152,
             # фикс аудита: иначе catch-all затенял per-subnet в MIX+SEPARATE)
-            tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio 100 u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || _tc_fail
-            tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio 100 u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || _tc_fail
+            tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio $_mirred_prio u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || _tc_fail
+            tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio $_mirred_prio u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_MIX" || _tc_fail
         else
             # Separate: OUT на parent 1: (egress=download=dst), IN на parent ffff: (ingress=upload=src)
             if [ "$_create_down" = "1" ]; then
-                tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio 100 u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_OUT" || _tc_fail
+                tc filter add dev "$TUN" parent 1: protocol $_mirred_proto prio $_mirred_prio u32 match $_mirred_match dst "$_mirred_sub" action mirred egress redirect dev "$IFB_OUT" || _tc_fail
             fi
             if [ "$_create_up" = "1" ]; then
-                tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio 100 u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_IN" || _tc_fail
+                tc filter add dev "$TUN" parent ffff: protocol $_mirred_proto prio $_mirred_prio u32 match $_mirred_match src "$_mirred_sub" action mirred egress redirect dev "$IFB_IN" || _tc_fail
             fi
         fi
   done
@@ -10885,16 +10907,16 @@ def generate_all_params(version: str, for_client: bool = False, for_server: bool
             logger.warning("⚠  I-строка %s длиной %d обрезана до %d (крайняя мера)", _ik, len(_s), _keep)
             result[_ik] = _s[:_keep]
 
-    # Рев-50 (проверено на стенде): Cloudflare WARP — ЧИСТЫЙ WireGuard, и мусорные
-    # пакеты перед рукопожатием (Jc > 0) он дропает: с Jc = 100 рукопожатия нет
-    # («0 B received, 6.04 KiB sent», пинг 0 из 3), с Jc = 0 — рукопожатие и пинг есть.
-    # Поэтому для WARP Jc = 0 — но ТОЛЬКО там, где Jc вообще поддерживается
-    # (для версии WG параметра нет, и добавлять его нельзя).
-    if for_warp and result.get("Jc") is not None:
-        if result["Jc"] != "0":
-            logger.info("ℹ️  WARP: Jc=%s → 0 (Cloudflare дропает рукопожатие с мусором перед ним)",
-                        result["Jc"])
-        result["Jc"] = "0"
+    # Здесь раньше (Рев-50) Jc для WARP принудительно обнулялся со ссылкой на
+    # замер «Cloudflare дропает рукопожатие с мусором перед ним». На живых
+    # серверах замер не подтвердился: WARP-интерфейс с jc ≈ 85..120 рукопожатие
+    # проходит (в `awg` видно latest handshake, приходит ответ ~92 B), а
+    # обнуление приходилось править руками — генератор затирал рабочее значение.
+    # Поэтому WARP получает такую же обфускацию, как остальные конфиги; если
+    # конкретный endpoint всё-таки отвергает junk, Jc правится в готовом
+    # конфиге и больше не перезаписывается. Проволочные параметры 3.x (S1/S2,
+    # H1-H4, S3/S4, паддинг, ключ заголовка) для WARP по-прежнему не
+    # генерируются — эта часть Рев-50 остаётся в силе.
 
     return result
 
