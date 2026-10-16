@@ -1643,6 +1643,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     }
   }
 
+  # Рев-58: сколько в WARP_LIST РЕАЛЬНЫХ интерфейсов. Конфиг без WARP не пуст:
+  # генератор кладёт туда запись-заглушку со списком подсетей (исключения из
+  # WARP), из-за чего доктор считал ${#WARP_LIST[@]} = 1 и печатал ❌ про
+  # отсутствие fwmark-правил и цепочки Random WARP там, где WARP вообще не
+  # настраивался.
+  _warp_real=0
+  for _we in "${WARP_LIST[@]:-}"; do
+    case "$_we" in
+      ""|none|none=*|none[[:space:]]*) ;;
+      *) _warp_real=$(( _warp_real + 1 )) ;;
+    esac
+  done
+
   # --- Вычисление BROADCAST_ADDR (только из IPv4, как в up.sh) ---
   BROADCAST_ADDR=""
   if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
@@ -1712,9 +1725,23 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 
   echo "   Random WARP ($RANDOM_WARP_CHAIN):"
   echo "   IPv4:"
-  iptables -t mangle -L "$RANDOM_WARP_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  if ! iptables -t mangle -L "$RANDOM_WARP_CHAIN" -n -v 2>/dev/null; then
+    if [ "$_warp_real" -eq 0 ]; then
+      echo "   ℹ️  цепочки нет: WARP не настраивался (в WARP_LIST нет интерфейсов)"
+    else
+      echo "   ❌ Цепочка не найдена"
+    fi
+  fi
   echo "   IPv6:"
-  _chain6 mangle "$RANDOM_WARP_CHAIN"
+  if ! ip6tables -t mangle -L "$RANDOM_WARP_CHAIN" -n -v 2>/dev/null; then
+    if [ "$_warp_real" -eq 0 ]; then
+      echo "   ℹ️  цепочки нет: WARP не настраивался"
+    elif [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+      echo "   ❌ Цепочка не найдена"
+    else
+      echo "   ℹ️  цепочки нет: в конфиге нет IPv6"
+    fi
+  fi
   echo ""
 
   # --- 2.1. Общие правила PREROUTING и FORWARD ---
@@ -1794,12 +1821,19 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   _need_mix=0; _need_out=0; _need_in=0
   if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
     for _le in "${SUBNETS_LIMITS[@]}"; do
-      case "$(parse_entry "$_le")" in
+      _pe="$(parse_entry "$_le")"
+      _pr="${_pe#*|}"; _pr="${_pr%%|*}"
+      # Рев-58: нулевая скорость = «лимита нет» — так же считает up.sh (IFB не
+      # создаётся). Раньше доктор видел тип «mix» и требовал ifb_*_mix: чистый
+      # конфиг с -l 0 (SUBNETS_LIMITS вида "10.x.y.0/24:0") выглядел сломанным.
+      [ "$_pr" = "0" ] && continue
+      case "$_pe" in
         *"|mix")      _need_mix=1 ;;
         *"|separate") _need_out=1; _need_in=1 ;;
       esac
     done
   fi
+  _limits_any=$(( _need_mix + _need_out + _need_in ))
   for _pair in "IN:$_need_in" "OUT:$_need_out" "MIX:$_need_mix"; do
     _slot="${_pair%%:*}"; _need="${_pair##*:}"
     eval "_dev=\$IFB_${_slot}"
@@ -1838,6 +1872,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   if [ "$ipv4_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ipv4_filter_count IPv4 фильтров"
     tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
+  elif [ "$_limits_any" -eq 0 ]; then
+    echo "   ℹ️  лимитов скорости нет в конфиге — фильтров нет по замыслу"
   else
     echo "   ❌ IPv4 фильтры не найдены"
   fi
@@ -1847,6 +1883,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   if [ "$ipv6_filter_count" -gt 0 ]; then
     echo "   ✅ Найдено $ipv6_filter_count IPv6 фильтров"
     tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
+  elif [ "$_limits_any" -eq 0 ]; then
+    echo "   ℹ️  лимитов скорости нет в конфиге — фильтров нет по замыслу"
+  elif [ -z "$LOCAL_SUBNETS_IPV6" ]; then
+    echo "   ℹ️  в конфиге нет IPv6 — IPv6-фильтров нет по замыслу"
   else
     echo "   ❌ IPv6 фильтры не найдены"
   fi
@@ -1936,10 +1976,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ✅ IPv4:"
     echo "$_ip4_rules" | while IFS= read -r _rline; do echo "        $_rline"; done
   else
-    if [ ${#WARP_LIST[@]} -gt 0 ]; then
+    if [ "$_warp_real" -gt 0 ]; then
       echo "   ❌ IPv4: WARP fwmark-правила не созданы"
     else
-      echo "   ℹ️  IPv4: WARP не настроен (WARP_LIST пуст)"
+      echo "   ℹ️  IPv4: WARP не настроен (в WARP_LIST нет интерфейсов)"
     fi
   fi
   _ip6_rules=$(ip -6 rule show 2>/dev/null | grep -E "fwmark|mark" || true)
@@ -1947,19 +1987,22 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "   ✅ IPv6:"
     echo "$_ip6_rules" | while IFS= read -r _rline; do echo "        $_rline"; done
   else
-    if [ ${#WARP_LIST[@]} -gt 0 ]; then
+    if [ "$_warp_real" -gt 0 ]; then
       echo "   ❌ IPv6: WARP fwmark-правила не созданы"
     else
-      echo "   ℹ️  IPv6: WARP не настроен (WARP_LIST пуст)"
+      echo "   ℹ️  IPv6: WARP не настроен (в WARP_LIST нет интерфейсов)"
     fi
   fi
   echo ""
 
   # --- 5. WARP интерфейсы ---
   echo "🌀 WARP интерфейсы:"
-  if [ ${#WARP_LIST[@]} -gt 0 ]; then
+  if [ "$_warp_real" -gt 0 ]; then
     for entry in "${WARP_LIST[@]}"; do
-      echo "   • $entry"
+      case "$entry" in
+        none|none=*|"") echo "   • $entry   (заглушка: интерфейсов нет, только исключения из WARP)" ;;
+        *) echo "   • $entry" ;;
+      esac
     done
   else
     echo "   (нет WARP)"
@@ -5236,6 +5279,13 @@ if [ "${#TRAFFIC_QUOTAS[@]}" -gt 0 ]; then
             _ptu="${_pthr#*|}"; _ptu="${_ptu%%|*}"; _ptd="${_pthr##*|}"
             [ "${_pthr%%|*}" = "1" ] && [ "$_ptu" -gt 0 ] && iptables -A "QUOTA_${TUN_SAFE}_${_suf}_SRC" -m set --match-set "$_est" src -j RETURN
             [ "${_pthr%%|*}" = "1" ] && [ "$_ptd" -gt 0 ] && iptables -A "QUOTA_${TUN_SAFE}_${_suf}_DST" -m set --match-set "$_est" dst -j RETURN
+            # Хвост сброса ПО НАБОРУ (а не только общий в конце цепочки): даёт
+            # точный счётчик исчерпания на клиента (см. snapshot_drop — по нему
+            # вооружается послеквотный throttle; общий хвост цепочки смешивал бы
+            # клиентов одного периода). Поведение то же: сюда попадает лишь то,
+            # что не прошло живую квоту и не обойдено вооружённым throttle.
+            iptables -A "QUOTA_${TUN_SAFE}_${_suf}_SRC" -m set --match-set "$_est" src -j DROP
+            iptables -A "QUOTA_${TUN_SAFE}_${_suf}_DST" -m set --match-set "$_est" dst -j DROP
             ;;
           *_V6)
             ip6tables -A "QUOTA_${TUN_SAFE}_${_suf}_SRC" -m set --match-set "$_est" src -m quota --quota "$_qu" -j RETURN
@@ -5244,6 +5294,8 @@ if [ "${#TRAFFIC_QUOTAS[@]}" -gt 0 ]; then
             _ptu="${_pthr#*|}"; _ptu="${_ptu%%|*}"; _ptd="${_pthr##*|}"
             [ "${_pthr%%|*}" = "1" ] && [ "$_ptu" -gt 0 ] && ip6tables -A "QUOTA_${TUN_SAFE}_${_suf}_SRC" -m set --match-set "$_est" src -j RETURN
             [ "${_pthr%%|*}" = "1" ] && [ "$_ptd" -gt 0 ] && ip6tables -A "QUOTA_${TUN_SAFE}_${_suf}_DST" -m set --match-set "$_est" dst -j RETURN
+            ip6tables -A "QUOTA_${TUN_SAFE}_${_suf}_SRC" -m set --match-set "$_est" src -j DROP
+            ip6tables -A "QUOTA_${TUN_SAFE}_${_suf}_DST" -m set --match-set "$_est" dst -j DROP
             ;;
         esac
       else
@@ -5431,6 +5483,14 @@ if [ "${#TRAFFIC_QUOTAS[@]}" -gt 0 ]; then
       _prest="${_prest#* }"; _ptm="${_prest%% *}"
       _prest="${_prest#* }"; _ptu="${_prest%% *}"
       _ptd="${_prest##* }"
+      # Рев-58: режим 1 = ОДНА скорость на ОБА направления, но в плане tdn=0.
+      # Приводим tdn к tu ЗДЕСЬ (up.sh/updater пересобираются при каждом
+      # запуске, а шаблон параметров — только на --make/-c, поэтому чинить в
+      # параметровом хелпере нельзя). Иначе DST-сторона периода считалась
+      # «нулевой» и получала строгий DROP: объявленный «оба направления»
+      # послеквотный лимит рубил скачивание насмерть (замер 16.10.2026: пинг
+      # до клиента 100% потерь при вооружённом throttle 100kbit).
+      [ "$_ptm" = "1" ] && _ptd="$_ptu"
       { [ "$_pu4" -gt 0 ] || [ "$_pd4" -gt 0 ]; } && _qv4=1
       { [ "$_pu6" -gt 0 ] || [ "$_pd6" -gt 0 ]; } && _qv6=1
       _PL["$_ple"]="$_pm|$_pu4|$_pd4|$_pu6|$_pd6|$_ptm|$_ptu|$_ptd"
@@ -5744,6 +5804,9 @@ while IFS='|' read -r _qname _qips; do
     _prest="${_prest#* }"; _ptm="${_prest%% *}"
     _prest="${_prest#* }"; _ptu="${_prest%% *}"
     _ptd="${_prest##* }"
+    # Рев-58: режим 1 = ОДНА скорость на ОБА направления (в плане tdn=0) —
+    # см. подробный комментарий в up.sh. Здесь чиним ту же карту для cron.
+    [ "$_ptm" = "1" ] && _ptd="$_ptu"
     { [ "$_pu4" -gt 0 ] || [ "$_pd4" -gt 0 ]; } && _qv4=1
     { [ "$_pu6" -gt 0 ] || [ "$_pd6" -gt 0 ]; } && _qv6=1
     _PL["$_ple"]="$_pm|$_pu4|$_pd4|$_pu6|$_pd6|$_ptm|$_ptu|$_ptd"
@@ -5906,6 +5969,45 @@ rebuild() {
 }
 # Слепок израсходованности клиента приходит из параметров (source выше):
 # snapshot_spent set период НАПРАВЛЕНИЕ (SRC|DST|ALL)
+snapshot_drop() {
+  # Байты, СБРОШЕННЫЕ хвостом квоты (аргументы как у snapshot_spent).
+  # Единственное надёжное доказательство исчерпания периода: счётчик самого
+  # правила `-m quota` останавливается ЧУТЬ НИЖЕ лимита (ядро не матчит пакет,
+  # который не влезает в остаток), поэтому «spent >= limit» недостижимо.
+  # Замер 16.10.2026 (agent3): лимит 204800, счётчик квоты 204204, хвост сбросил
+  # 129 пакетов/184212 Б — клиент оставался за строгим DROP, а объявленный
+  # «послеквотный» throttle молчал (см. ниже).
+  # ГЛАВНОЕ: функция определена ЗДЕСЬ (в самом updater'е), а не в шаблоне
+  # параметров: <tun>.sh перегенерируется только на --make/-c, поэтому старая
+  # его ревизия не имела бы этого хелпера и cron падал бы с «команда не
+  # найдена» (проверено на стенде 16.10.2026 — «-r» пересобирает up/down, но
+  # params оставляет прежними).
+  # ALL: DROP стоит в пер-клиентской цепочке (точный счётчик на клиента и
+  # период). SEP: хвост ставится ПО НАБОРУ (см. quota_build_period), иначе
+  # счётчик был бы общим для всех клиентов периода.
+  local _est="$1" _suf="$2" _dir="$3" _b=0 _allc _ank
+  case "$_est" in
+    *_V4)
+      if [ "$_dir" = "ALL" ]; then
+        _allc=$(quota_all_name "$_est" "$_suf")
+        _b=$(iptables -L "$_allc" -n -v -x 2>/dev/null | awk '$0 ~ /DROP/ {print $2; exit}')
+      else
+        _ank="dst"; [ "$_dir" = "SRC" ] && _ank="src"
+        _b=$(iptables -L "QUOTA_${TUN_SAFE}_${_suf}_${_dir}" -n -v -x 2>/dev/null | awk -v s="$_est $_ank" 'index($0,s) && /DROP/ {print $2; exit}')
+      fi
+      ;;
+    *_V6)
+      if [ "$_dir" = "ALL" ]; then
+        _allc=$(quota_all_name "$_est" "$_suf")
+        _b=$(ip6tables -L "$_allc" -n -v -x 2>/dev/null | awk '$0 ~ /DROP/ {print $2; exit}')
+      else
+        _ank="dst"; [ "$_dir" = "SRC" ] && _ank="src"
+        _b=$(ip6tables -L "QUOTA_${TUN_SAFE}_${_suf}_${_dir}" -n -v -x 2>/dev/null | awk -v s="$_est $_ank" 'index($0,s) && /DROP/ {print $2; exit}')
+      fi
+      ;;
+  esac
+  echo "${_b:-0}"
+}
 # --- Журнал квот в cron: слепки + сбросы (ledger, как в up) ---
 LEDGER_FILE="$QUOTA_DIR/${TUN_SAFE}.ledger"
 declare -A LEDGER
@@ -5978,6 +6080,19 @@ for _p in "${!QUOTA_PAIR[@]}"; do
         _delta=$(( _snp - _oldsnp )); [ "$_delta" -lt 0 ] && _delta=0
         _lspent=$(( _oldsp + _delta ))
         _lsnap="$now"
+        # Исчерпание периода = счётчик квоты у самой границы ИЛИ хвост уже
+        # сбрасывает трафик (snapshot_drop). Без второго условия послеквотный
+        # throttle не вооружался НИКОГДА: счётчик правила `-m quota` физически
+        # не доходит до лимита — ядро не матчит пакет, который не влезает в
+        # остаток (замер 16.10.2026: лимит 204800, счётчик 204204, хвост
+        # сбросил 129 пакетов — клиент оставался за строгим DROP, объявленный
+        # «послеквотный» лимит молчал). Поднятый до лимита spent даёт остаток 0
+        # в журнале, поэтому пересборка ниже ставит `--quota 0` (не матчит) и
+        # вооружённый обход хвостового DROP.
+        if [ "$_qtm" -ge 1 ] && [ "$_lspent" -lt "$_lim" ]; then
+          _ldrop=$(snapshot_drop "$_set" "$_p" "$_dir")
+          [ "${_ldrop:-0}" -gt 0 ] && _lspent="$_lim"
+        fi
         # Throttle (НАЛОЖЕНИЕ): сбор min-скорости исчерпанных направлений;
         # применяется после цикла
         if [ "$_qtm" -ge 1 ] && [ "$_lspent" -ge "$_lim" ]; then
@@ -6022,7 +6137,14 @@ done
 # им один pref, и off() одного набора сносил фильтры другого (вооружённые
 # хвосты без tc = послеквотный безлимит).
 mkdir -p "${QUOTA_DIR}" 2>/dev/null || true
-awk -F'|' 'NF==3 {print $0 "|" (5+NR)} NF>3 {print}' "${QUOTA_DIR}/${TUN_SAFE}.thr" > "${QUOTA_DIR}/${TUN_SAFE}.thr.mig" 2>/dev/null && mv -f "${QUOTA_DIR}/${TUN_SAFE}.thr.mig" "${QUOTA_DIR}/${TUN_SAFE}.thr"
+# Рев-58: миграцию делаем только когда .thr уже есть. Иначе awk падал на
+# отсутствующем файле (ненулевой код возврата), «&&» не срабатывал, и в
+# .data/quota/ после КАЖДОГО прохода оставался пустой <tun>.thr.mig — мусор
+# копился по всем туннелям (замечено при финальной проверке стенда 16.10.2026).
+if [ -f "${QUOTA_DIR}/${TUN_SAFE}.thr" ]; then
+  awk -F'|' 'NF==3 {print $0 "|" (5+NR)} NF>3 {print}' "${QUOTA_DIR}/${TUN_SAFE}.thr" > "${QUOTA_DIR}/${TUN_SAFE}.thr.mig" 2>/dev/null && mv -f "${QUOTA_DIR}/${TUN_SAFE}.thr.mig" "${QUOTA_DIR}/${TUN_SAFE}.thr"
+fi
+rm -f "${QUOTA_DIR}/${TUN_SAFE}.thr.mig" 2>/dev/null || true
 true
 # Зачистка устаревших throttle-записей (наборы вне текущих квот — конфиг
 # изменён между проходами; cron не должен держать чужие классы/фильтры).
@@ -13770,13 +13892,27 @@ def _read_endpoint_proto() -> tuple[str, str]:
                 if domain and proto:
                     break
             if not domain:
-                m = re.search(r'(?:^|[\s;])domain=([^\s;]+)', _ep_text)
+                m = re.search(r'(?:^|[\s;,])domain=([^\s;,]+)', _ep_text)
                 if m:
                     domain = m.group(1)
             if not proto:
-                m = re.search(r'(?:^|[\s;])proto=([^\s;]+)', _ep_text)
+                m = re.search(r'(?:^|[\s;,])proto=([^\s;,]+)', _ep_text)
                 if m:
                     proto = m.group(1)
+            # Рев-56: значения проверяем. Прежде строка «domain=X,proto=Y» без
+            # хоста (поддерживаемый легаси-формат) разбиралась как
+            # domain="X,proto=Y", а proto терялся: SNI уезжал в конфиг с запятой
+            # (невалидный SNI — имитация выглядит подделкой), имитация молча
+            # выбиралась по домену вместо запрошенного протокола. Теперь запятая
+            # — тоже разделитель, а мусорные значения отбрасываются с явным
+            # предупреждением (тихих подмен больше нет).
+            if proto and proto not in ("dtls", "quic", "stun"):
+                logger.warning("⚠  %s: неизвестный proto=%r — игнорирую (допустимо: dtls, quic, stun)",
+                               g_endpoint_config_fn, proto)
+                proto = ""
+            if domain and not re.fullmatch(r'[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?', domain):
+                logger.warning("⚠  %s: недопустимый domain=%r — игнорирую", g_endpoint_config_fn, domain)
+                domain = ""
         except Exception as e:
             logger.warning("Ошибка чтения %s: %s", g_endpoint_config_fn, e)
     return domain, proto
