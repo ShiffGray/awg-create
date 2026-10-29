@@ -100,7 +100,7 @@ install_go() {
 install_python_deps() {
     log_info "$MSG_INSTALL_PYDEPS"
     apt-get update -qq
-    apt-get install -y -qq python3 python3-pip ipset python3-qrcode python3-pil \
+    apt-get install -y -qq python3 python3-pip python3-qrcode python3-pil \
         python3-requests python3-cryptography python3-socks python3-aioquic tor cron
     # tor — для --proxy tor (обход rate-limit Cloudflare через SOCKS);
     # смена выходного IP: systemctl restart tor@default. python3-socks —
@@ -134,17 +134,30 @@ fetch_awgcreate() {
 # ─── Проверка ──────────────────────────────────────
 verify() {
     log_info "$MSG_VERIFY"
-    if command -v awg &>/dev/null && command -v ipset &>/dev/null && [ -f awgcreate.py ]; then
-        log_success "$MSG_ALL_OK"
-        echo
-        printf "%s:\n" "$MSG_NEXT_STEPS"
-        echo "  cd ~/awg"
-        echo "  python3 awgcreate.py --make awg0 -i 10.1.0.1/24 -p 51820"
-        echo "  awg-quick up awg0"
-    else
-        log_error "$MSG_SOMETHING_WRONG"
+    # Проверяем ВЕСЬ рантайм: без ip/tc/python3 инструмент падает уже на --make/up,
+    # причём с невнятной ошибкой. Сетевые пакеты ставит AmneziaWG.sh, python — мы.
+    _missing=""
+    for _c in awg awg-quick python3 go iptables ip6tables ipset ip tc; do
+        command -v "$_c" >/dev/null 2>&1 || _missing="$_missing $_c"
+    done
+    [ -f awgcreate.py ] || _missing="$_missing awgcreate.py"
+    if [ -n "$_missing" ]; then
+        log_error "$MSG_MISSING_BINS" "$_missing"
         exit 1
     fi
+    # Загруженный файл должен быть валидным Python (защита от битой/HTML-загрузки)
+    if ! python3 -c "import ast; ast.parse(open('awgcreate.py', encoding='utf-8').read())" 2>/dev/null; then
+        log_error "$MSG_BAD_TOOL"
+        exit 1
+    fi
+    # Модуль ifb нужен для лимитов; его грузит AmneziaWG.sh — предупреждаем, но не падаем
+    lsmod 2>/dev/null | grep -q '^ifb ' || log_warning "$MSG_IFB_WARN"
+    log_success "$MSG_ALL_OK"
+    echo
+    printf "%s:\n" "$MSG_NEXT_STEPS"
+    echo "  cd ~/awg"
+    echo "  python3 awgcreate.py --make awg0 -i 10.1.0.1/24 -p 51820"
+    echo "  awg-quick up awg0"
 }
 
 # ─── Главная ──────────────────────────────────────
@@ -199,6 +212,9 @@ init_lang() {
         MSG_ALL_OK="Всё установлено!"
         MSG_NEXT_STEPS="Следующие шаги"
         MSG_SOMETHING_WRONG="Что-то пошло не так!"
+        MSG_MISSING_BINS="Не хватает обязательных компонентов:%s"
+        MSG_BAD_TOOL="awgcreate.py не является валидным Python-файлом (битая загрузка?)"
+        MSG_IFB_WARN="Модуль ifb не загружен — лимиты скорости могут не работать (перезагрузись или: modprobe ifb)"
     else
         MSG_ROOT_REQUIRED="Root required (sudo)"
         MSG_INSTALL_AMNEZIAWG="Installing AmneziaWG (kernel mode)..."
@@ -220,6 +236,9 @@ init_lang() {
         MSG_ALL_OK="Everything installed!"
         MSG_NEXT_STEPS="Next steps"
         MSG_SOMETHING_WRONG="Something went wrong!"
+        MSG_MISSING_BINS="Missing required components:%s"
+        MSG_BAD_TOOL="awgcreate.py is not valid Python (broken download?)"
+        MSG_IFB_WARN="ifb module not loaded — speed limits may not work (reboot or: modprobe ifb)"
     fi
 }
 

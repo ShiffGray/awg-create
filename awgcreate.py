@@ -2282,6 +2282,15 @@ PARAMS_FILE="$SCRIPT_DIR/${SCRIPT_NAME}.sh"
 # Читаем параметры
 if [ -f "$PARAMS_FILE" ]; then
   source "$PARAMS_FILE"
+  
+# Рев-69: params-файл должен быть цел. Иначе раньше создавалась мусорная цепочка
+# INPUT_ (пустое TUN_SAFE) и правила в ней, которые down уже не снимал.
+for _req_var in TUN PORT; do
+  if [ -z "${!_req_var:-}" ]; then
+    echo "❌ params-файл повреждён или пуст: не задана переменная $_req_var — правила не создаются" >&2
+    exit 1
+  fi
+done
 else
   echo "❌ Ошибка: файл параметров не найден: $PARAMS_FILE"
   exit 1

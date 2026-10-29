@@ -204,12 +204,20 @@ install_deps() {
 
     apt-get update -qq
 
+    # iproute2 (ip/tc/ss) — шейпер tc+ifb, policy-routing WARP, маршруты;
+    # procps (pgrep/pkill/ps) — проверки процессов; util-linux (flock) — блокировки
+    # в скриптах квот; tar — распаковка архивов. Ставим здесь, т.к. это системный
+    # сетевой слой, а не python/go-обвязка.
     apt-get install -y -qq \
         gnupg \
         curl \
         ca-certificates \
         iptables \
         ipset \
+        iproute2 \
+        procps \
+        util-linux \
+        tar \
         coreutils \
         kmod \
         git \
