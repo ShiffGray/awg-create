@@ -3735,15 +3735,15 @@ if [ "$WARP_ACTIVE" -eq 1 ]; then
   # --- Настройка FORWARD и NAT для трафика через WARP ---
   # IPv4 правила (свои для каждого туннеля!)
   for warp in "${!ALL_WARP_INTERFACES[@]}"; do
-    iptables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-    iptables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     iptables -t nat -C POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
   done
 
   # IPv6 правила (свои для каждого туннеля!)
   for warp in "${!ALL_WARP_INTERFACES[@]}"; do
-    ip6tables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
-    ip6tables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    ip6tables -C FORWARD -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || ip6tables -I FORWARD 1 -i "$TUN" -o "$warp" -j ACCEPT 2>/dev/null || true
+    ip6tables -C FORWARD -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -I FORWARD 1 -i "$warp" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     ip6tables -t nat -C POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -o "$warp" -j MASQUERADE 2>/dev/null || true
   done
 fi
@@ -3760,11 +3760,17 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   # что цепочка входит для ВСЕГО входящего трафика: правило без порт-условия внутри неё
   # отфильтровало бы трафик сервера (вплоть до потери SSH). DDoS-правила порт-специфичны,
   # поэтому привязка к порту сохраняет защиту полностью и убирает скрытую мину.
-  iptables -t filter -C INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -A INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-66: ставим ПЕРЕД сторонними цепочками фильтрации (`-I INPUT`), иначе те отбивают пакеты раньше,
+  # чем они доходят до наших правил, и VPN-порт «не открывается» при включённой внешней фильтрации.
+  iptables -t filter -C INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -I INPUT 1 -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-66: фолбэк-ACCEPT сразу за цепочкой — открывает порт, если DDoS-профиля на него нет
+  # (цепочка пуста и возвращает управление). С DDoS-профилем до этой строки не доходит:
+  # сверхлимитные пакеты гасит терминальный DROP внутри цепочки.
+  iptables -t filter -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -t filter -I INPUT 2 -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
   # Рев-54: вторая подвеска — по интерфейсу туннеля, чтобы ICMP-ACCEPT для подсети VPN
   # остался достижим (иначе он работает только при политике INPUT=ACCEPT). Трафик eth0,
   # не относящийся к порту туннеля, в цепочку НЕ попадает — мина устранена.
-  iptables -t filter -C INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -A INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
+  iptables -t filter -C INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || iptables -t filter -I INPUT 1 -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
 fi
 # Рев-38: цепочка для IPv6 создаётся ЗДЕСЬ — ДО применения DDoS. Раньше она
 # создавалась ниже (после DDoS-блока), поэтому `ip6tables -A "$INPUT_CHAIN" ...`
@@ -3774,10 +3780,11 @@ fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -t filter -N "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -F "$INPUT_CHAIN" 2>/dev/null || true
-  # Рев-54: то же для IPv6 — подвеска по UDP-порту туннеля (см. комментарий выше).
-  ip6tables -t filter -C INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -A INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-54/66: то же для IPv6 — вставка в начало (до сторонних цепочек) + фолбэк-ACCEPT (см. IPv4 выше).
+  ip6tables -t filter -C INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -I INPUT 1 -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  ip6tables -t filter -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || ip6tables -t filter -I INPUT 2 -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
   # Рев-54: вторая подвеска по интерфейсу туннеля (см. комментарий для IPv4 выше).
-  ip6tables -t filter -C INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -A INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
+  ip6tables -t filter -C INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || ip6tables -t filter -I INPUT 1 -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
 fi
 # --- DDoS защита основного порта ---
 # Рев-31: одно рукопожатие AmneziaWG — это ВЗРЫВ пакетов: Jc мусорных
@@ -3838,8 +3845,8 @@ if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
   iptables -t filter -C "$INPUT_CHAIN" -s "$LOCAL_SUBNETS_IPV4" -p icmp -j ACCEPT 2>/dev/null || iptables -t filter -A "$INPUT_CHAIN" -s "$LOCAL_SUBNETS_IPV4" -p icmp -j ACCEPT 2>/dev/null || true
 fi
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
-  iptables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
-  iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  iptables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
+  iptables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   # Рев-44: правило общее для всех туннелей на этом интерфейсе, поэтому счётчик
   # считает ТУННЕЛИ (маркер на туннель), а не факты добавления правила:
   #   * повторный up того же туннеля не раздувает ref (раньше up+up+down оставлял
@@ -3869,8 +3876,8 @@ if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
   ip6tables -t filter -C "$INPUT_CHAIN" -s "$LOCAL_SUBNETS_IPV6" -p icmpv6 -j ACCEPT 2>/dev/null || ip6tables -t filter -A "$INPUT_CHAIN" -s "$LOCAL_SUBNETS_IPV6" -p icmpv6 -j ACCEPT 2>/dev/null || true
 fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-  ip6tables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
-  ip6tables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  ip6tables -C FORWARD -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || ip6tables -I FORWARD 1 -i "$TUN" -o "$IFACE" -j ACCEPT 2>/dev/null || true
+  ip6tables -C FORWARD -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -I FORWARD 1 -i "$IFACE" -o "$TUN" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   # Рев-44: то же для IPv6 — маркер на туннель (см. IPv4-блок выше).
   ip6tables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || \
     ip6tables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
@@ -3911,6 +3918,21 @@ fi
 
 # --- Проброс портов через отдельные цепочки (DNAT + SNAT + ACCEPT) ---
 # ВАЖНО: Должно быть ДО LAN_ALLOW + DROP чтобы проброс портов работал для всех клиентов!
+# === Рев-68: внешняя фильтрация не должна мешать работе туннеля =====================================
+# сторонние цепочки фильтрации вставляются в НАЧАЛО INPUT/FORWARD и иначе отклоняют трафик
+# раньше наших правил. Всё, что нужно туннелю (клиенты → интернет/LAN/WARP, проброс портов, ICMP),
+# разрешено правилами инструмента — поэтому пускаем трафик интерфейса туннеля до сторонних цепочек.
+# Изоляция клиентов (DROP) стоит выше широких ACCEPT — иначе она обходилась бы.
+# nat/mangle/policy-routing внешняя фильтрация не затрагивает — MASQUERADE/WARP/DNAT работают как раньше.
+for _fw_cmd in "iptables" "ip6tables"; do
+  $_fw_cmd -t filter -C INPUT   -i "$TUN" -j ACCEPT 2>/dev/null || $_fw_cmd -t filter -I INPUT 1   -i "$TUN" -j ACCEPT 2>/dev/null || true
+  $_fw_cmd -t filter -C FORWARD -i "$TUN" -j ACCEPT 2>/dev/null || $_fw_cmd -t filter -I FORWARD 2 -i "$TUN" -j ACCEPT 2>/dev/null || true
+  $_fw_cmd -t filter -C FORWARD -o "$TUN" -j ACCEPT 2>/dev/null || $_fw_cmd -t filter -I FORWARD 2 -o "$TUN" -j ACCEPT 2>/dev/null || true
+done
+# =====================================================================================
+# Рев-67: подвеска и разрешающие правила FORWARD ставятся в НАЧАЛО (-I FORWARD 1), чтобы
+# работать и при включённой внешней фильтрации (он вставляет свои цепочки в начало INPUT/FORWARD и иначе
+# отклонял бы трафик раньше). DROP-правила (изоляция клиентов) остаются в конце.
 echo "🔌 Проброс портов (цепочки: $PF_CHAIN_NAT, $PF_CHAIN_FILTER, $PF_CHAIN_SNAT)"
 # Создаём цепочки в ОБЕИХ таблицах (iptables и ip6tables)
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
@@ -3942,11 +3964,11 @@ fi
 # FORWARD и POSTROUTING для текущего туннеля
 # ВАЖНО: Проверяем что ссылка ещё не добавлена (защита от дубликатов!)
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
-  iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+  iptables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || iptables -t filter -I FORWARD 1 -j "$PF_CHAIN_FILTER" 2>/dev/null || true
   iptables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-  ip6tables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || ip6tables -t filter -A FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || true
+  ip6tables -t filter -C FORWARD -j "$PF_CHAIN_FILTER" 2>/dev/null || ip6tables -t filter -I FORWARD 1 -j "$PF_CHAIN_FILTER" 2>/dev/null || true
   ip6tables -t nat -C POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || ip6tables -t nat -A POSTROUTING -j "$PF_CHAIN_SNAT" 2>/dev/null || true
 fi
 
@@ -3957,10 +3979,10 @@ fi
 
 # СНАЧАЛА запрещаем ВСЁ межклиентское общение (DROP в КОНЕЦ цепи)
 if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
-  iptables -A FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
+  iptables -I FORWARD 1 -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 fi
 if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
-  ip6tables -A FORWARD -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
+  ip6tables -I FORWARD 1 -i "$TUN" -o "$TUN" -j DROP 2>/dev/null || true
 fi
 
 
@@ -8010,9 +8032,18 @@ fi
 if [ -n "$TUN" ]; then
   # Рев-54: снимаем подвеску по порту И старую глобальную (если правила применены
   # прежней версией — иначе мина осталась бы на сервере после перегенерации).
+  # Рев-54/66: снимаем все варианты подвесок (новая вставка + старый -A) и фолбэк-ACCEPT.
   iptables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  iptables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  iptables -t filter -D INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+  iptables -t filter -D INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+  iptables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   iptables -t filter -D INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-68: снимаем разрешения по интерфейсу туннеля
+  iptables -t filter -D INPUT -i "$TUN" -j ACCEPT 2>/dev/null || true
+  iptables -t filter -D FORWARD -i "$TUN" -j ACCEPT 2>/dev/null || true
+  iptables -t filter -D FORWARD -o "$TUN" -j ACCEPT 2>/dev/null || true
   # Рев-55: три -D выше требуют ТОЧНОЙ спецификации правила, поэтому прыжок
   # вида `-A INPUT -p udp --dport <порт> -j INPUT_<tun>` не снимается, когда
   # $PORT неизвестен (копию параметров в .data/temp удалил предыдущий down,
@@ -8030,9 +8061,18 @@ fi
 # без params-файла туннель мёртв, а DNAT-правила оставались живыми
 if [ -n "$TUN" ]; then
   # Рев-54: то же для IPv6.
+  # Рев-54/66: то же для IPv6.
   ip6tables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  ip6tables -t filter -D INPUT -p udp --dport "$PORT" -j "$INPUT_CHAIN" 2>/dev/null || true
+  ip6tables -t filter -D INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+  ip6tables -t filter -D INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+  ip6tables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -D INPUT -i "$TUN" -j "$INPUT_CHAIN" 2>/dev/null || true
   ip6tables -t filter -D INPUT -j "$INPUT_CHAIN" 2>/dev/null || true
+  # Рев-68: то же для IPv6
+  ip6tables -t filter -D INPUT -i "$TUN" -j ACCEPT 2>/dev/null || true
+  ip6tables -t filter -D FORWARD -i "$TUN" -j ACCEPT 2>/dev/null || true
+  ip6tables -t filter -D FORWARD -o "$TUN" -j ACCEPT 2>/dev/null || true
   # Рев-55: то же для IPv6 — снапшот по имени цепочки (см. комментарий выше).
   ip6tables-save 2>/dev/null | grep -E -- "-j ${INPUT_CHAIN}( |\$)" | while read -r _line; do
     ( set -f; ip6tables -t filter -D ${_line#-A } 2>/dev/null || true )
