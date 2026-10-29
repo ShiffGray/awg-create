@@ -680,11 +680,14 @@ try:
         sys.exit(1)
     # Рев-39: порог 65536 был слишком мягким — /112 (ровно 65536 адресов) проходил
     # и up.sh создавал 65536 tc-классов: на 1 vCPU сервер фактически зависал и
-    # переставал отвечать по SSH (проверено на стенде 10.10.2026). Per-IP режим
-    # имеет смысл для небольших подсетей; крупные должны лимитироваться /32-/128.
-    if num_ips > 4096:
-        print(f"# {subnet}: слишком много адресов ({num_ips}) — per-IP лимиты строятся максимум для 4096 адресов "
-              f"(минимум /20 для IPv4, /116 для IPv6). Сузьте подсеть или задайте лимит на конкретный адрес (/32, /128).",
+    # переставал отвечать по SSH (проверено на стенде 10.10.2026).
+    # Рев-64: 4096 → 8192. Раньше одна u32-таблица (4096 селекторов, два на
+    # адрес) резала реальный шейпинг вдвое; теперь фильтры раскладываются по
+    # pref-группам, а tc-команды идут одним batch. Замер на 1 vCPU/1 ГБ:
+    # 8192 адреса = 8192 класса, 16378 фильтров, up 32 с, ✅, машина жива.
+    if num_ips > 8192:
+        print(f"# {subnet}: слишком много адресов ({num_ips}) — per-IP лимиты строятся максимум для 8192 адресов "
+              f"(минимум /19 для IPv4, /115 для IPv6). Сузьте подсеть или задайте лимит на конкретный адрес (/32, /128).",
               file=sys.stderr)
         sys.exit(1)
     for ip in net:
@@ -1355,12 +1358,22 @@ quota_throttle_on() {
       done
       [ -n "$_ux" ] && echo "$_set|U|$_ux|$_tp" >> "${_qd}/${TUN_SAFE}.thr" 2>/dev/null
       [ -n "$_dx" ] && echo "$_set|D|$_dx|$_tp" >> "${_qd}/${TUN_SAFE}.thr" 2>/dev/null
-      # Проверка фактического вооружения по сторонам (см. combined-ветку)
+      # Проверка фактического вооружения по сторонам (см. combined-ветку).
+      # Рев-58: только `if` — прежняя форма `{ cond; } && { echo …; return 1; }`
+      # при УДАЧНОЙ проверке давала статус 1, функция «проваливалась», и
+      # вызывающий снимал вооружение (клиент оставался за строгим DROP).
       _fc1=$(tc filter show dev "$_ifc" parent 1: 2>/dev/null | grep -cE "pref $_tp ")
       _fcf=$(tc filter show dev "$_ifc" parent ffff: 2>/dev/null | grep -cE "pref $_tp ")
-      { [ -n "$_dx" ] && [ "$_fc1" -le 0 ]; } && { echo "⚠️ quota_throttle_on: download-фильтры не встали (pref $_tp)" >&2; return 1; }
-      { [ -n "$_ux" ] && [ "$_fcf" -le 0 ]; } && { echo "⚠️ quota_throttle_on: upload-фильтры не встали (pref $_tp)" >&2; return 1; }
+      if [ -n "$_dx" ] && [ "$_fc1" -le 0 ]; then
+        echo "⚠️ quota_throttle_on: download-фильтры не встали (pref $_tp)" >&2
+        return 1
+      fi
+      if [ -n "$_ux" ] && [ "$_fcf" -le 0 ]; then
+        echo "⚠️ quota_throttle_on: upload-фильтры не встали (pref $_tp)" >&2
+        return 1
+      fi
     fi
+    return 0
 }
 
 quota_throttle_off() {
@@ -1630,6 +1643,20 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   # --- Парсинг LOCAL_SUBNETS на IPv4 и IPv6 (точно как в up.sh) ---
   parse_local_subnets
 
+  # Рев-60: симметрично _chain6 — отсутствие IPv4-цепочки при конфиге БЕЗ IPv4
+  # (IPv6-only интерфейс) не ошибка. Живой прогон 2026-10-22: v6-only конфиг
+  # давал 5 ❌ («Цепочка не найдена» для INPUT/HAIRPIN/NAT/FILTER/SNAT), хотя
+  # это ровно те цепочки, которых при таком конфиге и не должно быть.
+  _chain4() {
+    iptables -t "$1" -L "$2" -n -v 2>/dev/null || {
+      if [ -n "$LOCAL_SUBNETS_IPV4" ]; then
+        echo "   ❌ Цепочка не найдена"
+      else
+        echo "   ℹ️  цепочки нет: в конфиге нет IPv4 (только IPv6)"
+      fi
+    }
+  }
+
   # Рев-57: отсутствие IPv6-цепочки при конфиге БЕЗ IPv6 — не ошибка: цепочки
   # создаются по подсетям конфига. Раньше чекер писал ❌ и верный односкековый
   # интерфейс выглядел сломанным. ❌ оставляем только когда IPv6 в конфиге есть.
@@ -1666,7 +1693,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "📥 INPUT цепочка ($INPUT_CHAIN):"
   echo "   Порт: $PORT/UDP"
   echo "   IPv4 правила:"
-  iptables -t filter -L "$INPUT_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  iptables -t filter -L "$INPUT_CHAIN" -n -v 2>/dev/null || _chain4 filter "$INPUT_CHAIN"
   echo "   IPv6 правила:"
   _chain6 filter "$INPUT_CHAIN"
   echo ""
@@ -1697,28 +1724,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   echo "🔄 FORWARD цепочки:"
   echo "   Hairpin NAT ($HAIRPIN_CHAIN):"
   echo "   IPv4:"
-  iptables -t nat -L "$HAIRPIN_CHAIN" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  iptables -t nat -L "$HAIRPIN_CHAIN" -n -v 2>/dev/null || _chain4 nat "$HAIRPIN_CHAIN"
   echo "   IPv6:"
   _chain6 nat "$HAIRPIN_CHAIN"
   echo ""
 
   echo "   Проброс портов (NAT: $PF_CHAIN_NAT):"
   echo "   IPv4:"
-  iptables -t nat -L "$PF_CHAIN_NAT" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  iptables -t nat -L "$PF_CHAIN_NAT" -n -v 2>/dev/null || _chain4 nat "$PF_CHAIN_NAT"
   echo "   IPv6:"
   _chain6 nat "$PF_CHAIN_NAT"
   echo ""
 
   echo "   Проброс портов (FILTER: $PF_CHAIN_FILTER):"
   echo "   IPv4:"
-  iptables -t filter -L "$PF_CHAIN_FILTER" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  iptables -t filter -L "$PF_CHAIN_FILTER" -n -v 2>/dev/null || _chain4 filter "$PF_CHAIN_FILTER"
   echo "   IPv6:"
   _chain6 filter "$PF_CHAIN_FILTER"
   echo ""
 
   echo "   Проброс портов (SNAT: $PF_CHAIN_SNAT):"
   echo "   IPv4:"
-  iptables -t nat -L "$PF_CHAIN_SNAT" -n -v 2>/dev/null || echo "   ❌ Цепочка не найдена"
+  iptables -t nat -L "$PF_CHAIN_SNAT" -n -v 2>/dev/null || _chain4 nat "$PF_CHAIN_SNAT"
   echo "   IPv6:"
   _chain6 nat "$PF_CHAIN_SNAT"
   echo ""
@@ -1829,7 +1856,17 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
       [ "$_pr" = "0" ] && continue
       case "$_pe" in
         *"|mix")      _need_mix=1 ;;
-        *"|separate") _need_out=1; _need_in=1 ;;
+        *"|separate")
+          # Рев-61: направления в SEP независимы — up.sh создаёт IFB_OUT только
+          # при _dn != 0, а IFB_IN при _up != 0 (фикс аудита-T4). Доктор считал
+          # «separate» двусторонним, поэтому конфиг «только upload» (0:100)
+          # получал ложные ❌ про ifb_*_out и «IPv4 фильтры не найдены».
+          _sep_dn="${_pr%%:*}"; _sep_up="${_pr##*:}"
+          case "$_sep_dn" in 0|0m|0M|0mb|0Mb|0mbit|0Mbit|0k|0K|0kb|0Kb|0kbit|0Kbit) _sep_dn="0" ;; esac
+          case "$_sep_up" in 0|0m|0M|0mb|0Mb|0mbit|0Mbit|0k|0K|0kb|0Kb|0kbit|0Kbit) _sep_up="0" ;; esac
+          [ "$_sep_dn" != "0" ] && _need_out=1
+          [ "$_sep_up" != "0" ] && _need_in=1
+          ;;
       esac
     done
   fi
@@ -1852,13 +1889,21 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
 
   # Проверка фильтров на root 1: (маршрутизация в мосты)
   echo "   🔍 Фильтры на root 1: (маршрутизация в мосты):"
-  for _ifb_check in "$IFB_MIX" "$IFB_OUT" "$IFB_IN"; do
+  # Рев-61: проверяем только устройства, которые НУЖНЫ текущему конфигу. Раньше
+  # хватало существующего устройства (остаток прошлой конфигурации, правило,
+  # пропущенное up.sh) — и доктор писал ❌ там, где строкой выше честно стояло
+  # ℹ️ «не используется».
+  for _pair in "MIX:$_need_mix:$IFB_MIX" "OUT:$_need_out:$IFB_OUT" "IN:$_need_in:$IFB_IN"; do
+    _slot="${_pair%%:*}"; _rest="${_pair#*:}"
+    _need="${_rest%%:*}"; _ifb_check="${_rest#*:}"
     if ip link show "$_ifb_check" &>/dev/null; then
       root_filter_count=$(tc filter show dev "$_ifb_check" parent 1: 2>/dev/null | grep -c "flowid")
       root_filter_count=${root_filter_count:-0}
       if [ "$root_filter_count" -gt 0 ]; then
         echo "   ✅ $_ifb_check: найдено $root_filter_count фильтров на root 1:"
         tc filter show dev "$_ifb_check" parent 1: 2>/dev/null | grep -E "match|flowid" | head -10
+      elif [ "$_need" != "1" ]; then
+        echo "   ℹ️  $_ifb_check: устройство есть, но в текущем конфиге не используется"
       else
         echo "   ❌ $_ifb_check: фильтры на root 1: НЕ созданы!"
       fi
@@ -1866,23 +1911,29 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
   done
   echo ""
   echo "   🔍 Фильтры перенаправления (на $TUN):"
+  # Рев-61: mirred-фильтры живут на РАЗНЫХ родителях по направлению: download —
+  # parent 1: (egress), upload — parent ffff: (ingress). Конфиг «только upload»
+  # (SEP 0:100) не имеет фильтров на parent 1:, и старый счётчик давал ложный
+  # ❌ «IPv4 фильтры не найдены» при живом шейпинге.
   echo "   IPv4 фильтры:"
-  ipv4_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -c "mirred")
-  ipv4_filter_count=${ipv4_filter_count:-0}
-  if [ "$ipv4_filter_count" -gt 0 ]; then
-    echo "   ✅ Найдено $ipv4_filter_count IPv4 фильтров"
-    tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
+  _f4e=$(tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -c "mirred"); _f4e=${_f4e:-0}
+  _f4i=$(tc -s filter show dev "$TUN" parent ffff: protocol ip 2>/dev/null | grep -c "mirred"); _f4i=${_f4i:-0}
+  if [ $(( _f4e + _f4i )) -gt 0 ]; then
+    echo "   ✅ IPv4: egress=$_f4e ingress=$_f4i"
+    tc -s filter show dev "$TUN" parent 1: protocol ip 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -4
+    tc -s filter show dev "$TUN" parent ffff: protocol ip 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -4
   elif [ "$_limits_any" -eq 0 ]; then
     echo "   ℹ️  лимитов скорости нет в конфиге — фильтров нет по замыслу"
   else
     echo "   ❌ IPv4 фильтры не найдены"
   fi
   echo "   IPv6 фильтры:"
-  ipv6_filter_count=$(tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -c "mirred")
-  ipv6_filter_count=${ipv6_filter_count:-0}
-  if [ "$ipv6_filter_count" -gt 0 ]; then
-    echo "   ✅ Найдено $ipv6_filter_count IPv6 фильтров"
-    tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -6
+  _f6e=$(tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -c "mirred"); _f6e=${_f6e:-0}
+  _f6i=$(tc -s filter show dev "$TUN" parent ffff: protocol ipv6 2>/dev/null | grep -c "mirred"); _f6i=${_f6i:-0}
+  if [ $(( _f6e + _f6i )) -gt 0 ]; then
+    echo "   ✅ IPv6: egress=$_f6e ingress=$_f6i"
+    tc -s filter show dev "$TUN" parent 1: protocol ipv6 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -4
+    tc -s filter show dev "$TUN" parent ffff: protocol ipv6 2>/dev/null | grep -E "mirred|Sent|rule hit" | head -4
   elif [ "$_limits_any" -eq 0 ]; then
     echo "   ℹ️  лимитов скорости нет в конфиге — фильтров нет по замыслу"
   elif [ -z "$LOCAL_SUBNETS_IPV6" ]; then
@@ -1988,7 +2039,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] || [[ -n "$AWG_CHECK_MODE" ]]; then
     echo "$_ip6_rules" | while IFS= read -r _rline; do echo "        $_rline"; done
   else
     if [ "$_warp_real" -gt 0 ]; then
-      echo "   ❌ IPv6: WARP fwmark-правила не созданы"
+      # Рев-61: на v4-only сервере с выключенным в ядре IPv6 up.sh добавляет
+      # v6-правило через «|| true» — правила не будет, и ❌ врал бы. Смотрим
+      # на конфиг, как в ветке Random WARP v6.
+      if [ -n "$LOCAL_SUBNETS_IPV6" ]; then
+        echo "   ❌ IPv6: WARP fwmark-правила не созданы"
+      else
+        echo "   ℹ️  IPv6: в конфиге нет IPv6 — fwmark-правила не нужны"
+      fi
     else
       echo "   ℹ️  IPv6: WARP не настроен (в WARP_LIST нет интерфейсов)"
     fi
@@ -2765,13 +2823,20 @@ parse_ddos_entry() {
   # Битое поле сбрасываем в «0» — соответствующий лимит просто не применяется.
   for _qn in DDOS_RATE DDOS_EST_RATE DDOS_EST_BURST DDOS_CONNLIMIT DDOS_NEW_RATE \
              DDOS_NEW_BURST \
-             DDOS_EST_PACKETS DDOS_LENGTH_MIN DDOS_LENGTH_MAX DDOS_BW \
+             DDOS_EST_PACKETS DDOS_LENGTH_MIN DDOS_LENGTH_MAX \
              DDOS_BAN_HITS DDOS_BAN_SEC DDOS_REPLY_EST_RATE DDOS_REPLY_EST_BURST \
-             DDOS_REPLY_LENGTH_MIN DDOS_REPLY_LENGTH_MAX DDOS_REPLY_BW; do
+             DDOS_REPLY_LENGTH_MIN DDOS_REPLY_LENGTH_MAX; do
     eval "_qv=\${$_qn}"
     case "$_qv" in
       ''|*[!0-9]*) eval "$_qn=0" ;;
     esac
+  done
+  # Полоса (~bw) — НЕ число: всегда «<число><единица>» (ddos_bw_str знает только
+  # mbit|kbit|mb|kb|gb|gbit, а парсер дописывает mbit). В общем числовом цикле
+  # выше любое валидное значение сбрасывалось в 0 и ~bw не работал ВООБЩЕ.
+  for _qn in DDOS_BW DDOS_REPLY_BW; do
+    eval "_qv=\${$_qn}"
+    printf '%s\n' "$_qv" | grep -qE '^[0-9]+(mbit|kbit|mb|kb|gb|gbit)$' || eval "$_qn=0"
   done
   # DDOS_IFACE — только простые символы (попадает в eval в --iface-опции)
   case "$DDOS_IFACE" in
@@ -2930,12 +2995,20 @@ ddos_add_established() {
   local _port_h=$(printf '%s' "$_port_id" | md5sum | cut -c1-6)
   local _hashname_est="EST_${_chain_h}_${_proto}_${_port_h}"
   local _hashname_pre="PRE_${_chain_h}_${_proto}_${_port_h}"
+  local _hashname_bw="BW_${_chain_h}_${_proto}_${_port_h}"
   local _next_packets=0
   # _ddos_exec, _addr_args, _iface_opt — определены в ddos_apply_rules (вызывающей функции), доступны здесь
 
   # Length_max: пакеты длиннее — DROP (если указан)
   if [ -n "$DDOS_LENGTH_MAX" ] && [ "$DDOS_LENGTH_MAX" != "0" ]; then
     _ddos_exec "-m length --length $((DDOS_LENGTH_MAX + 1)): -j DROP"
+  fi
+
+  # Полоса (~bw) для ESTABLISHED. Ставим здесь — ДО безусловного EST-ACCEPT,
+  # иначе правило недостижимо (Rev-63: ~bw не применялся вообще ни при каком
+  # конфиге, т.к. ниже established принимался без ограничения).
+  if [ -n "$DDOS_BW" ] && [ "$DDOS_BW" != "0" ]; then
+    _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -m hashlimit --hashlimit-name $_hashname_bw --hashlimit-mode srcip,srcport --hashlimit-upto $(ddos_bw_str "$DDOS_BW") -j ACCEPT"
   fi
 
   if [ -n "$DDOS_EST_PACKETS" ] && [ "$DDOS_EST_PACKETS" != "0" ] && [ -n "$DDOS_RATE" ] && [ "$DDOS_RATE" != "0" ]; then
@@ -2954,8 +3027,16 @@ ddos_add_established() {
       _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -m hashlimit --hashlimit-name $_hashname_est --hashlimit-mode srcip,srcport --hashlimit-upto $(ddos_rate_str "$DDOS_EST_RATE" "$DDOS_EST_RATE_UNIT") --hashlimit-burst ${DDOS_EST_BURST:-5} -j ACCEPT"
     fi
   else
-    # ESTABLISHED без лимита (только если est_rate=0 и нет est_packets, иначе rate выше уже всё ловит)
-    if [ "${DDOS_EST_PACKETS:-0}" = "0" ]; then
+    # ESTABLISHED без лимита (только если est_rate=0 и нет est_packets, иначе rate выше уже всё ловит).
+    # При заданном ~bw безусловный ACCEPT нельзя: он затеняет правило полосы.
+    # Так же нельзя и при заданных reply-лимитах (`=>`, `=_`, `=~`): этот ACCEPT
+    # стоит ДО reply-блока и делал его мёртвым — счётчики reply-правил годами
+    # оставались нулевыми (проверено живьём 2026-10-24: 763 пакета ушли в ACCEPT,
+    # у reply-правил 0). Тогда established обрабатывает reply-блок.
+    if [ "${DDOS_EST_PACKETS:-0}" = "0" ] \
+       && { [ -z "$DDOS_BW" ] || [ "$DDOS_BW" = "0" ]; } \
+       && [ "${DDOS_REPLY_EST_RATE:-0}" = "0" ] && [ "${DDOS_REPLY_BW:-0}" = "0" ] \
+       && [ "${DDOS_REPLY_LENGTH_MIN:-0}" = "0" ] && [ "${DDOS_REPLY_LENGTH_MAX:-0}" = "0" ]; then
       _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
     fi
   fi
@@ -2998,7 +3079,6 @@ ddos_apply_rules() {
   local _port_h=$(printf '%s' "${DDOS_PORT_RAW:-$_dport}" | md5sum | cut -c1-6)
   local _hashname="D_${_proto}_${_ip_h}_${_port_h}"
   local _hashname_new="DN_${_proto}_${_ip_h}_${_port_h}"
-  local _hashname_bw="BW_${_proto}_${_ip_h}_${_port_h}"
   local _hashname_ban="BAN_${_proto}_${_ip_h}_${_port_h}"
   local _iface_opt=""
   [ -n "$DDOS_IFACE" ] && _iface_opt="-i $DDOS_IFACE"
@@ -3044,10 +3124,6 @@ ddos_apply_rules() {
   # DROP стояли первыми и делали правила >est_rate / ^est_packets / ~bw
   # недостижимыми; теперь established сначала проходит EST и BW-лимиты).
   ddos_add_established "$_cmd" "$_chain" "$_proto" "$_dip" "$_dport" "$_subnet"
-  # Bandwidth (byte rate limit для ESTABLISHED)
-  if [ -n "$DDOS_BW" ] && [ "$DDOS_BW" != "0" ]; then
-    _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -m hashlimit --hashlimit-name $_hashname_bw --hashlimit-mode srcip,srcport --hashlimit-upto $(ddos_bw_str "$DDOS_BW") -j ACCEPT"
-  fi
   # REPLY трафик (сервер→клиент): если нет отдельной конфигурации — ACCEPT без лимита
   # ВНИМАНИЕ: `${VAR:-0}` — путь основного порта идёт через parse_ddos_entry,
   # где REPLY-переменные пустые (не "0"); пустая строка ≠ "0" ломала
@@ -3085,8 +3161,16 @@ ddos_apply_rules() {
     if [ -n "$DDOS_REPLY_BW" ] && [ "$DDOS_REPLY_BW" != "0" ]; then
       _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -m connbytes --connbytes-dir reply --connbytes-mode packets --connbytes 1: -m hashlimit --hashlimit-name REPBW_${_proto}_${_ip_h}_${_port_h} --hashlimit-mode srcip,srcport --hashlimit-upto $(ddos_bw_str "$DDOS_REPLY_BW") -j ACCEPT"
     fi
-    # REPLY DROP для превысивших
-    _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -m connbytes --connbytes-dir reply --connbytes-mode packets --connbytes 1: -j DROP"
+    # Превысившие reply-лимиты. DROP нужен, только если задан rate/bw — те
+    # ACCEPT'ы выше пропускают в пределах лимита, а хвост обязан дропаться.
+    # Если заданы ТОЛЬКО length-правила, терминального DROP быть не должно:
+    # после length-DROP'ов нужен ACCEPT, иначе весь established-трафик умрёт.
+    if { [ -n "$DDOS_REPLY_EST_RATE" ] && [ "$DDOS_REPLY_EST_RATE" != "0" ]; } \
+       || { [ -n "$DDOS_REPLY_BW" ] && [ "$DDOS_REPLY_BW" != "0" ]; }; then
+      _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -m connbytes --connbytes-dir reply --connbytes-mode packets --connbytes 1: -j DROP"
+    else
+      _ddos_exec "-m conntrack --ctstate ESTABLISHED,RELATED -m connbytes --connbytes-dir reply --connbytes-mode packets --connbytes 1: -j ACCEPT"
+    fi
   fi
   # Бан (recent) — если IP превысил лимит нарушений, блокируем новые соединения
   if [ -n "$DDOS_BAN_HITS" ] && [ "$DDOS_BAN_HITS" != "0" ]; then
@@ -4919,20 +5003,22 @@ for rule in "${PORT_FORWARDING_RULES[@]}"; do
           echo "Ошибка: диапазоны портов должны быть одинаковой длины для правила '$rule'"
           continue 3
         fi
+        # Рев-65: цепочки PF чистятся каждым up, поэтому `-C`-гварды в цикле
+        # избыточны (они удваивали число вызовов iptables). Предупреждаем о цене
+        # больших диапазонов: ~90 мс на порт.
+        if [ $((RANGE_LEN + 1)) -gt 256 ]; then
+          echo "⚠️  диапазон $PF_PORT_EXT = $((RANGE_LEN + 1)) портов → столько же правил, up может занять минуты; для больших диапазонов лучше несколько узких правил" >&2
+        fi
         for ((i=0; i<=RANGE_LEN; i++)); do
           EXT_PORT=$((PF_PORT_EXT_START + i))
           INT_PORT=$((PF_PORT_INT_START + i))
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              # Рев-46: гвард -C — повторный up не плодит дубли правил
-              $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT" 2>/dev/null || \
-                $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
               # ВАЖНО: Добавляем префикс ipv4:/ipv6 для уникальности между протоколами
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${EXT_PORT}:${INT_PORT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-# Рев-46: гвард -C — повторный up не плодит дубли правил
-$IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
   $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
@@ -4941,15 +5027,11 @@ $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
             done
           else
             # доступ всем — без -s / -d
-            # Рев-46: гвард -C — повторный up не плодит дубли правил
-            $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT" 2>/dev/null || \
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$EXT_PORT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$INT_PORT"
             # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (глобально!)
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${EXT_PORT}:${INT_PORT}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              # Рев-46: гвард -C — повторный up не плодит дубли правил
-              $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
+              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT_PORT" -m conntrack --ctorigdstport "$EXT_PORT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$EXT_PORT" "$INT_PORT" ""
@@ -4973,32 +5055,31 @@ $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
     if [[ "$PF_PORT_EXT" == *"-"* ]] && [[ "$PF_PORT_INT" != *"-"* ]]; then
         PF_PORT_START="${PF_PORT_EXT%-*}"
         PF_PORT_END="${PF_PORT_EXT#*-}"
+        # Рев-65: цепочки PF чистятся при каждом up (см. create_pf_chains:
+        # -N || true + -F), поэтому проверка `-C` перед каждым `-A` в цикле
+        # диапазона избыточна и удваивала число вызовов iptables: 1001 порт
+        # стоил 88 с. Дубли внутри одного прогона и так исключены.
+        if [ $((PF_PORT_END - PF_PORT_START + 1)) -gt 256 ]; then
+          echo "⚠️  диапазон $PF_PORT_EXT = $((PF_PORT_END - PF_PORT_START + 1)) портов → столько же правил, up может занять минуты; для больших диапазонов лучше несколько узких правил" >&2
+        fi
         for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              # Рев-46: гвард -C — повторный up не плодит дубли правил
-              $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT" 2>/dev/null || \
-                $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:INT_PORT:PROTO (используем внутренний порт!)
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PORT_INT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                # Рев-46: гвард -C — повторный up не плодит дубли правил
-                $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
-                  $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PORT_NUM" "$PF_PORT_INT" "$ALLOWED_SUBNET"
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PF_PORT_INT" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
-            # Рев-46: гвард -C — повторный up не плодит дубли правил
-            $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT" 2>/dev/null || \
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PORT_NUM" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PF_PORT_INT"
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PORT_NUM}:${PF_PORT_INT}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                # Рев-46: гвард -C — повторный up не плодит дубли правил
-                $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
-                  $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PF_PORT_INT" -m conntrack --ctorigdstport "$PORT_NUM" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PORT_NUM" "$PF_PORT_INT" ""
@@ -5022,32 +5103,28 @@ $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$INT
     if [[ "$PF_PORT_INT" == *"-"* ]] && [[ "$PF_PORT_EXT" != *"-"* ]]; then
         PF_PORT_START="${PF_PORT_INT%-*}"
         PF_PORT_END="${PF_PORT_INT#*-}"
+        # Рев-65: см. внешний диапазон — цепочки чистятся каждым up, `-C` избыточен
+        if [ $((PF_PORT_END - PF_PORT_START + 1)) -gt 256 ]; then
+          echo "⚠️  диапазон $PF_PORT_INT = $((PF_PORT_END - PF_PORT_START + 1)) портов → столько же правил, up может занять минуты; для больших диапазонов лучше несколько узких правил" >&2
+        fi
         for ((PORT_NUM=PF_PORT_START; PORT_NUM<=PF_PORT_END; PORT_NUM++)); do
           if [ ${#FILTERED_SUBNETS[@]} -gt 0 ]; then
             for ALLOWED_SUBNET in "${FILTERED_SUBNETS[@]}"; do
-              # Рев-46: гвард -C — повторный up не плодит дубли правил
-              $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM" 2>/dev/null || \
-                $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -s "$ALLOWED_SUBNET" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
               # SNAT добавляем только один раз для комбинации CLIENT_IP:PORT_NUM:PROTO
               snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PORT_NUM}:${PF_PROTO}"
               if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-                # Рев-46: гвард -C — повторный up не плодит дубли правил
-                $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
-                  $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
+                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
                 GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
               fi
               pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PORT_NUM" "$ALLOWED_SUBNET"
               $IPT_CMD -t filter -A "$PF_CHAIN_FILTER" -p "$PF_PROTO" -s "$CLIENT_IP" --sport "$PORT_NUM" -d "$ALLOWED_SUBNET" -m state --state RELATED,ESTABLISHED -j ACCEPT
             done
           else
-            # Рев-46: гвард -C — повторный up не плодит дубли правил
-            $IPT_CMD -t nat -C "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM" 2>/dev/null || \
-              $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
+            $IPT_CMD -t nat -A "$PF_CHAIN_NAT" -p "$PF_PROTO" $IFACE_OPT --dport "$PF_PORT_EXT" -j DNAT --to-destination "$CLIENT_IP_DNAT:$PORT_NUM"
             snat_key="${SNAT_IP_PREFIX}${CLIENT_IP}:${PF_PORT_EXT}:${PORT_NUM}:${PF_PROTO}"
             if [ "$(echo "$SNAT_FLAG" | tr '[:lower:]' '[:upper:]')" = "SNAT" ] && [ -n "$SERVER_IP" ] && [ -z "${GLOBAL_SNAT_RULES_ADDED[$snat_key]}" ]; then
-              # Рев-46: гвард -C — повторный up не плодит дубли правил
-              $IPT_CMD -t nat -C "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP" 2>/dev/null || \
-                $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
+              $IPT_CMD -t nat -A "$PF_CHAIN_SNAT" -d "$CLIENT_IP" -p "$PF_PROTO" --dport "$PORT_NUM" -m conntrack --ctorigdstport "$PF_PORT_EXT" -j SNAT --to-source "$SERVER_IP"
               GLOBAL_SNAT_RULES_ADDED[$snat_key]=1
             fi
             pf_accept_or_ddos "$IPT_CMD" "$PF_PROTO" "$CLIENT_IP" "$PF_PORT_EXT" "$PORT_NUM" ""
@@ -6302,6 +6379,38 @@ fi
 # Если лимит = 0 для подсети — эта подсеть пропускается (лимит отключен)
 # Формат: "subnet:rate" или "subnet:rate_in:rate_out" или "subnet" (без лимита)
 # ВАЖНО: валидация через validate_subnet_mask() которая уже есть в скрипте!
+
+# Приведение лимита к Мбитам: «512kbit» → 0.512, «10gbit» → 10000,
+# «100mbit»/«100m» → 100, голое число — уже Мбиты (как в README: -l <Mbit>).
+# Раньше суффикс просто отбрасывался, и «512kbit» молча означал 512 Мбит (×1024).
+lim_to_mbit() {
+  local _v="$1" _n _out
+  _n="${_v//[!0-9.]/}"
+  [ -n "$_n" ] || { echo "0"; return; }
+  case "$_v" in
+    *[kK]bit|*[kK]) _out=$(awk -v n="$_n" 'BEGIN{printf "%.3f", n/1000}') ;;
+    *[gG]bit|*[gG]) _out=$(awk -v n="$_n" 'BEGIN{printf "%.3f", n*1000}') ;;
+    *) _out="$_n" ;;
+  esac
+  case "$_out" in 0|0.0|0.00|0.000) echo "0"; return ;; esac
+  echo "$_out"
+}
+
+# Группировка u32-фильтров по pref. Одна таблица u32 держит 4096 селекторов, а
+# на адрес нужно два (dst+src), поэтому адреса раскладываются по нескольким
+# pref — по 1000 слотов на группу. Классы, ставки и соответствие «слот → класс»
+# не меняются, меняется только номер таблицы (pref). IPv6 начинается с 1001,
+# чтобы семейства не делили pref на одном parent (Рев-57).
+fprio() {  # $1 = номер слота (1..), $2 = 4|6
+  local _n="${1:-1}" _f="${2:-4}"
+  [ -z "$_n" ] && _n=1
+  if [ "$_f" = "6" ]; then
+    echo $(( 1001 + (_n - 1) / 1000 ))
+  else
+    echo $(( 1 + (_n - 1) / 1000 ))
+  fi
+}
+
 if [ ${#SUBNETS_LIMITS[@]} -gt 0 ]; then
 
   # Валидация подсетей через validate_subnet_mask()
@@ -6336,17 +6445,17 @@ fi
   for entry in "${SUBNETS_LIMITS[@]}"; do
     _rate=$(parse_entry "$entry" | cut -d'|' -f2)
     if [ -n "$_rate" ] && [ "$_rate" != "0" ]; then
-      # Нормализация единиц: «100mbit/10gbit/512kbit» → «100m» → «100»
-      # (фикс стенда-парсеров: суффиксы *bit не активировали лимит молча)
-      _rate="${_rate//bit/}"
-      _rate="${_rate//[kmgtpKMGTP:]/}"
-      # Нормализация 0-токена с суффиксом ('0mbit'→'0' — выкл; фикс регресса:
-      # иначе all-disabled конфиг строил IFB+BRIDGE и резал весь туннель) и
-      # допуск дробных ставок ('0.5m' — раньше молча «лимиты отключены»)
-      case "$_rate" in
-        ''|*[!0-9.]*) ;;
-        *) [ "$_rate" != "0" ] && { HAS_ACTIVE_LIMIT=1; break; } ;;
-      esac
+      # Обе стороны SEP проверяем отдельно: «0:10m» — лимит есть (вверх),
+      # хотя вниз отключён.
+      _rate_d=$(lim_to_mbit "${_rate%%:*}")
+      _rate_u="0"
+      case "$_rate" in *:*) _rate_u=$(lim_to_mbit "${_rate#*:}") ;; esac
+      for _r in "$_rate_d" "$_rate_u"; do
+        case "$_r" in
+          ''|*[!0-9.]*) ;;
+          *) [ "$_r" != "0" ] && { HAS_ACTIVE_LIMIT=1; break 2; } ;;
+        esac
+      done
     fi
   done
 
@@ -6371,6 +6480,33 @@ fi
   # когда не встало ни одно правило — «Cannot find device» × N и exit 0).
   TC_FAIL_COUNT=0
   _tc_fail() { TC_FAIL_COUNT=$((TC_FAIL_COUNT + 1)); echo "⚠️ tc filter" >&2; }
+
+  # Все tc-команды правил собираются в два batch-файла и применяются одним
+  # процессом: ~4 вызова tc на адрес — это десятки тысяч процессов на крупной
+  # подсети и 40-50 с старта. Семантика сбоев сохранена: ошибки классов/qdisc
+  # игнорируются (как прежний `|| true`), ошибки фильтров считаются в
+  # TC_FAIL_COUNT — адрес без фильтра попал бы в дефолтный класс и обошёл лимит.
+  _TC_BATCH_C="$(mktemp "${TMPDIR:-/tmp}/awgtc_c.XXXXXX")"
+  _TC_BATCH_F="$(mktemp "${TMPDIR:-/tmp}/awgtc_f.XXXXXX")"
+  _tc_b_cls() { printf '%s\n' "$*" >> "$_TC_BATCH_C"; }
+  _tc_b_flt() { printf '%s\n' "$*" >> "$_TC_BATCH_F"; }
+  _tc_b_flush() {
+    if [ -s "$_TC_BATCH_C" ]; then
+      tc -force -batch "$_TC_BATCH_C" >/dev/null 2>&1
+      : > "$_TC_BATCH_C"
+    fi
+    if [ -s "$_TC_BATCH_F" ]; then
+      local _bo _bn
+      _bo=$(tc -force -batch "$_TC_BATCH_F" 2>&1)
+      _bn=$(printf '%s\n' "$_bo" | grep -c 'Command failed')
+      if [ "$_bn" -gt 0 ]; then
+        TC_FAIL_COUNT=$((TC_FAIL_COUNT + _bn))
+        printf '%s\n' "$_bo" | grep -B1 'Command failed' | grep -v 'Command failed' | head -3 >&2
+      fi
+      : > "$_TC_BATCH_F"
+    fi
+    return 0
+  }
 
   # Структурная проверка: без устройства не применится ни класс, ни фильтр —
   # сообщаем причину одной строкой вместо каскада «Cannot find device».
@@ -6636,11 +6772,11 @@ fi
       case "$_orig_down" in 0|0m|0M|0mb|0Mb|0mbit|0Mbit|0k|0K|0kb|0Kb|0kbit|0Kbit) _orig_down="0" ;; esac
       case "$_orig_up" in 0|0m|0M|0mb|0Mb|0mbit|0Mbit|0k|0K|0kb|0Kb|0kbit|0Kbit) _orig_up="0" ;; esac
 
-      # Нормализация единиц для tc (фикс стенда-парсеров: «5m/100mbit/10gbit»
-      # склеивались с приклеиваемым «mbit» → «5mmbit» → tc «Illegal rate», лимит
-      # молча не работал). Голое число = мегабиты. Оставляем только цифры.
-      LIM_DOWN="$(echo "$LIM_DOWN" | sed -E 's/[a-zA-Z]+$//')"
-      LIM_UP="$(echo "$LIM_UP" | sed -E 's/[a-zA-Z]+$//')"
+      # Приведение единиц к мегабитам для tc: «5m/100mbit/10gbit/512kbit» →
+      # «5»/«100»/«10000»/«0.512». Голое число = мегабиты (README: -l <Mbit>).
+      # kbit/gbit конвертируются, а не отбрасываются (раньше «512kbit» = 512 Мбит).
+      LIM_DOWN="$(lim_to_mbit "$LIM_DOWN")"
+      LIM_UP="$(lim_to_mbit "$LIM_UP")"
 
       # Если оба лимита = 0, пропускаем всю группу
       if [ "$_orig_down" = "0" ] && [ "$_orig_up" = "0" ]; then
@@ -6752,7 +6888,13 @@ fi
       create_tc_hierarchy_for "$IFB_MIX" "$_mix_major" "$SUBNETS_PART"
 
       # Одна подсеть = 1 класс на КАЖДЫЙ IP (без маскирования!)
-      IPS=$(list_subnet_ips "$SUBNET")
+      # Причина отказа печатается в stderr (в лог up.sh); здесь дублируем
+      # заметной строкой — иначе слишком крупная подсеть давала 0 классов
+      # и лимит молча не работал (Rev-63).
+      if ! IPS=$(list_subnet_ips "$SUBNET"); then
+        echo "⚠️  Лимит для $SUBNET НЕ применён: подсеть крупнее 8192 адресов (per-IP режим). Сузьте подсеть или задайте лимит на /32 (/128)" >&2
+        IPS=""
+      fi
 
       # Принудительный перенос на новую иерархию для separate режима (ОДИН раз на правило)
       if [ "$_rule_type" != "mix" ]; then
@@ -6802,15 +6944,16 @@ fi
               _major="${_mix_major}:"
 
               if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                  tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                  _tc_b_cls "class add dev $IFB_MIX parent $_major classid $_classid htb rate ${LIM_DOWN}mbit ceil ${LIM_DOWN}mbit quantum $QUANT"
+                  _fp4=$(fprio "$_mix_client_num" 4); _fp6=$(fprio "$_mix_client_num" 6)
                   if [ "$IP_VERSION" = "ipv6" ]; then
-                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || _tc_fail
-                      tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $ip flowid $_classid || _tc_fail
+                      _tc_b_flt "filter add dev $IFB_MIX protocol ipv6 parent ${_mix_major}: prio $_fp6 u32 match ip6 dst $ip flowid $_classid"
+                      _tc_b_flt "filter add dev $IFB_MIX protocol ipv6 parent ${_mix_major}: prio $_fp6 u32 match ip6 src $ip flowid $_classid"
                   else
-                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $ip flowid $_classid || _tc_fail
-                      tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $ip flowid $_classid || _tc_fail
+                      _tc_b_flt "filter add dev $IFB_MIX protocol ip parent ${_mix_major}: prio $_fp4 u32 match ip dst $ip flowid $_classid"
+                      _tc_b_flt "filter add dev $IFB_MIX protocol ip parent ${_mix_major}: prio $_fp4 u32 match ip src $ip flowid $_classid"
                   fi
-                  tc qdisc add dev "$IFB_MIX" parent $_classid fq_codel 2>/dev/null || true
+                  _tc_b_cls "qdisc add dev $IFB_MIX parent $_classid fq_codel"
               fi
           else
               _out_client_num=$((_out_client_num + 1))
@@ -6823,14 +6966,15 @@ fi
               _major="${_out_major}:"
 
               if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                  tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                  _tc_b_cls "class add dev $IFB_OUT parent $_major classid $_classid htb rate ${LIM_DOWN}mbit ceil ${LIM_DOWN}mbit quantum $QUANT"
+                  _fp4=$(fprio "$_out_client_num" 4); _fp6=$(fprio "$_out_client_num" 6)
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # OUT на parent 1: (egress) = download = dst клиента
-                      tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $ip flowid $_classid || _tc_fail
+                      _tc_b_flt "filter add dev $IFB_OUT protocol ipv6 parent ${_out_major}: prio $_fp6 u32 match ip6 dst $ip flowid $_classid"
                   else
-                      tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $ip flowid $_classid || _tc_fail
+                      _tc_b_flt "filter add dev $IFB_OUT protocol ip parent ${_out_major}: prio $_fp4 u32 match ip dst $ip flowid $_classid"
                   fi
-                  tc qdisc add dev "$IFB_OUT" parent $_classid fq_codel 2>/dev/null || true
+                  _tc_b_cls "qdisc add dev $IFB_OUT parent $_classid fq_codel"
               fi
 
               _in_client_num=$((_in_client_num + 1))
@@ -6843,17 +6987,19 @@ fi
               _major="${_in_major}:"
 
               if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
-                  tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
+                  _tc_b_cls "class add dev $IFB_IN parent $_major classid $_classid htb rate ${LIM_UP}mbit ceil ${LIM_UP}mbit quantum $QUANT"
+                  _fp4=$(fprio "$_in_client_num" 4); _fp6=$(fprio "$_in_client_num" 6)
                   if [ "$IP_VERSION" = "ipv6" ]; then
                       # IN на parent ffff: (ingress) = upload = src клиента
-                      tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $ip flowid $_classid || _tc_fail
+                      _tc_b_flt "filter add dev $IFB_IN protocol ipv6 parent ${_in_major}: prio $_fp6 u32 match ip6 src $ip flowid $_classid"
                   else
-                      tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $ip flowid $_classid || _tc_fail
+                      _tc_b_flt "filter add dev $IFB_IN protocol ip parent ${_in_major}: prio $_fp4 u32 match ip src $ip flowid $_classid"
                   fi
-                  tc qdisc add dev "$IFB_IN" parent $_classid fq_codel 2>/dev/null || true
+                  _tc_b_cls "qdisc add dev $IFB_IN parent $_classid fq_codel"
               fi
           fi
       done
+      _tc_b_flush
       # Глобальный аккумулятор (single-ветка; фикс аудита: раньше учитывалась
       # только ratio-ветка — warning не срабатывал на per-address правилах)
       if [ "$_rule_type" = "mix" ]; then
@@ -7020,7 +7166,7 @@ fi
                     _major="${_mix_major}:"
 
                     if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                        tc class add dev "$IFB_MIX" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                        _tc_b_cls "class add dev $IFB_MIX parent $_major classid $_classid htb rate ${LIM_DOWN}mbit ceil ${LIM_DOWN}mbit quantum $QUANT"
                     fi
                 else
                     _out_client_num=$((_out_client_num + 1))
@@ -7033,7 +7179,7 @@ fi
                     _major="${_out_major}:"
 
                     if [ "$_create_down" = "1" ] && [ "$_orig_down" != "0" ]; then
-                        tc class add dev "$IFB_OUT" parent $_major classid $_classid htb rate "${LIM_DOWN}"mbit ceil "${LIM_DOWN}"mbit quantum "$QUANT" 2>/dev/null || true
+                        _tc_b_cls "class add dev $IFB_OUT parent $_major classid $_classid htb rate ${LIM_DOWN}mbit ceil ${LIM_DOWN}mbit quantum $QUANT"
                     fi
 
                     _in_client_num=$((_in_client_num + 1))
@@ -7046,7 +7192,7 @@ fi
                     _major="${_in_major}:"
 
                     if [ "$_create_up" = "1" ] && [ "$_orig_up" != "0" ]; then
-                        tc class add dev "$IFB_IN" parent $_major classid $_classid htb rate "${LIM_UP}"mbit ceil "${LIM_UP}"mbit quantum "$QUANT" 2>/dev/null || true
+                        _tc_b_cls "class add dev $IFB_IN parent $_major classid $_classid htb rate ${LIM_UP}mbit ceil ${LIM_UP}mbit quantum $QUANT"
                     fi
                 fi
 
@@ -7072,29 +7218,32 @@ fi
                   if [ -n "$BLOCK_BASE" ]; then
                       if [ "$_rule_type" = "mix" ]; then
                           if [ "$_create_down" = "1" ]; then
+                              _fp4=$(fprio "$_mix_client_num" 4); _fp6=$(fprio "$_mix_client_num" 6)
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || _tc_fail
-                                  tc filter add dev "$IFB_MIX" protocol ipv6 parent ${_mix_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || _tc_fail
+                                  _tc_b_flt "filter add dev $IFB_MIX protocol ipv6 parent ${_mix_major}: prio $_fp6 u32 match ip6 dst $BLOCK_BASE flowid $_classid"
+                                  _tc_b_flt "filter add dev $IFB_MIX protocol ipv6 parent ${_mix_major}: prio $_fp6 u32 match ip6 src $BLOCK_BASE flowid $_classid"
                               else
-                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || _tc_fail
-                                  tc filter add dev "$IFB_MIX" protocol ip parent ${_mix_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || _tc_fail
+                                  _tc_b_flt "filter add dev $IFB_MIX protocol ip parent ${_mix_major}: prio $_fp4 u32 match ip dst $BLOCK_BASE flowid $_classid"
+                                  _tc_b_flt "filter add dev $IFB_MIX protocol ip parent ${_mix_major}: prio $_fp4 u32 match ip src $BLOCK_BASE flowid $_classid"
                               fi
                           fi
                       else
                           if [ "$_create_down" = "1" ]; then
                               # OUT на parent 1: (egress) = download = dst клиента
+                              _fp4=$(fprio "$_out_client_num" 4); _fp6=$(fprio "$_out_client_num" 6)
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_OUT" protocol ipv6 parent ${_out_major}: prio 2 u32 match ip6 dst $BLOCK_BASE flowid $_classid || _tc_fail
+                                  _tc_b_flt "filter add dev $IFB_OUT protocol ipv6 parent ${_out_major}: prio $_fp6 u32 match ip6 dst $BLOCK_BASE flowid $_classid"
                               else
-                                  tc filter add dev "$IFB_OUT" protocol ip parent ${_out_major}: prio 1 u32 match ip dst $BLOCK_BASE flowid $_classid || _tc_fail
+                                  _tc_b_flt "filter add dev $IFB_OUT protocol ip parent ${_out_major}: prio $_fp4 u32 match ip dst $BLOCK_BASE flowid $_classid"
                               fi
                           fi
                           if [ "$_create_up" = "1" ]; then
                               # IN на parent ffff: (ingress) = upload = src клиента
+                              _fp4=$(fprio "$_in_client_num" 4); _fp6=$(fprio "$_in_client_num" 6)
                               if [ "$ip_type" = "ipv6" ]; then
-                                  tc filter add dev "$IFB_IN" protocol ipv6 parent ${_in_major}: prio 2 u32 match ip6 src $BLOCK_BASE flowid $_classid || _tc_fail
+                                  _tc_b_flt "filter add dev $IFB_IN protocol ipv6 parent ${_in_major}: prio $_fp6 u32 match ip6 src $BLOCK_BASE flowid $_classid"
                               else
-                                  tc filter add dev "$IFB_IN" protocol ip parent ${_in_major}: prio 1 u32 match ip src $BLOCK_BASE flowid $_classid || _tc_fail
+                                  _tc_b_flt "filter add dev $IFB_IN protocol ip parent ${_in_major}: prio $_fp4 u32 match ip src $BLOCK_BASE flowid $_classid"
                               fi
                           fi
                       fi
@@ -7105,17 +7254,18 @@ fi
 
               if [ "$_rule_type" = "mix" ]; then
                   if [ "$_create_down" = "1" ]; then
-                      tc qdisc add dev "$IFB_MIX" parent $_classid fq_codel 2>/dev/null || true
+                      _tc_b_cls "qdisc add dev $IFB_MIX parent $_classid fq_codel"
                   fi
               else
                   if [ "$_create_down" = "1" ]; then
-                      tc qdisc add dev "$IFB_OUT" parent $_classid fq_codel 2>/dev/null || true
+                      _tc_b_cls "qdisc add dev $IFB_OUT parent $_classid fq_codel"
                   fi
                   if [ "$_create_up" = "1" ]; then
-                      tc qdisc add dev "$IFB_IN" parent $_classid fq_codel 2>/dev/null || true
+                      _tc_b_cls "qdisc add dev $IFB_IN parent $_classid fq_codel"
                   fi
               fi
           done
+          _tc_b_flush
           if [ "$_rule_type" = "mix" ]; then
               echo "⚡ $SUBNETS_PART -> ${_orig_down} mbit (MIX) (${_total_classes} классов)"
           else
@@ -7140,6 +7290,7 @@ fi
     else
       echo "✅ Лимиты скорости настроены"
     fi
+    rm -f "${_TC_BATCH_C:-}" "${_TC_BATCH_F:-}" 2>/dev/null
   fi
 fi
 
@@ -8231,7 +8382,8 @@ rm -f "$SCRIPT_DIR/.data/mark_base_${TUN_SAFE}" 2>/dev/null || true
 echo "————————————————————————————————"
 if [ "$DOWNLOG" = "1" ]; then
   echo "📄 Лог сохранён: $LOG_FILE"
-fi'''
+fi
+'''
 
 # Исходник единого сайдкара имитации awg-imitat (режимы utls|dtls; прежде —
 # отдельные awg-utls и awg-dtls). Один go.mod, одна сборка. Форматы вывода
@@ -8926,10 +9078,15 @@ func main() {
 	seed := flag.String("seed", "", "seed для детерминированного session_id (режим utls)")
 	flag.Parse()
 	switch *mode {
+	case "utls":
+		runUTLS(*sni, *seed)
 	case "dtls":
 		runDTLS(*sni, *seed)
 	default:
-		runUTLS(*sni, *seed)
+		// Рев-62: раньше сюда уходил любой неизвестный режим и молча работал как
+		// utls — опечатка в -mode тихо меняла тип имитации. Теперь явная ошибка.
+		fmt.Fprintf(os.Stderr, "awg-imitat: неизвестный -mode %q (нужно utls или dtls)\n", *mode)
+		os.Exit(2)
 	}
 }
 '''
@@ -12951,9 +13108,10 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
     params_script = params_script.replace("<SERVER_TUN>", tun_name)
     params_script = params_script.replace("<SERVER_ADDR>", server_addr)
     params_script = params_script.replace("<RATE_LIMIT>", f"{opt.limit}")
-    # Рев-39: если задан лимит скорости, а подсеть туннеля слишком большая —
-    # up.sh строил бы класс на КАЖДЫЙ адрес (для /112 это 65536 классов: сервер
-    # зависает). Отказываем сразу с понятным текстом вместо зависания на старте.
+    # Рев-39/Рев-64: если задан лимит скорости, а подсеть туннеля слишком
+    # большая — up.sh строил бы класс на КАЖДЫЙ адрес (для /112 это 65536
+    # классов). Порог 8192 совпадает с list_subnet_ips в up.sh и с замером:
+    # 8192 адреса на 1 vCPU/1 ГБ = 8192 класса, 16378 фильтров, up 32 с, ✅.
     if opt.limit:
         try:
             _net = ipaddress.ip_network(server_addr, strict=False)
@@ -12962,7 +13120,7 @@ def _create_scripts(up_path: pathlib.Path, down_path: pathlib.Path, params_path:
                     f'Лимит скорости ({opt.limit} Мбит) для подсети {server_addr} '
                     f'({_net.num_addresses} адресов) невозможен: инструмент строит '
                     f'класс на каждый адрес, это подвесит сервер. Возьмите подсеть '
-                    f'до 8192 адресов (/20 для IPv4, /116 для IPv6) или задайте '
+                    f'до 8192 адресов (/19 для IPv4, /115 для IPv6) или задайте '
                     f'лимит на конкретный адрес (/32, /128).')
         except ValueError:
             pass  # server_addr может быть списком/нестандартным — пропускаем
@@ -14374,7 +14532,13 @@ def handle_update(opt) -> None:
         psk = gen_preshared_key()
         cfg.set_param(actual_name, '_PrivateKey', priv_key, force=True, offset=2)
         cfg.set_param(actual_name, 'PublicKey', pub_key)
-        cfg.set_param(actual_name, 'PresharedKey', psk)
+        # Рев-62: PSK обновляем только если строка уже есть. У пира из старой
+        # ревизии (или после ручной правки) её может не быть — set_param бросал
+        # «Параметр не найден: PresharedKey», и `-u` падал вместо сброса ключей.
+        # Добавлять PSK насильно не нужно: `-c` корректно опускает отсутствующую
+        # строку, а навязывание изменило бы конфиг клиента без просьбы.
+        if 'PresharedKey' in cfg.peer[actual_name]:
+            cfg.set_param(actual_name, 'PresharedKey', psk)
         gentime = datetime.datetime.now(datetime.timezone.utc).isoformat()
         cfg.set_param(actual_name, '_GenKeyTime', gentime, force=True, offset=2)
         new_pk = _generate_persistent_keepalive(srv_proto)
@@ -14388,6 +14552,23 @@ def handle_update(opt) -> None:
     # источник для повторной генерации).
     _backup_file(srv_path, suffix=".bak-update")
     _atomic_rmw(srv_path, _make_update)
+
+    # Рев-60: ключи в серверном конфиге обновлены, но клиентский .conf оставался
+    # со СТАРЫМ приватником — клиент молча переставал подключаться (живой прогон
+    # 2026-10-22: в серверном конфиге NewPK, в клиентском прежний PrivateKey).
+    # README обещает «пересоздать данные подключения», поэтому перегенерируем
+    # конфиг ЭТОГО клиента (без уборки чужих артефактов).
+    try:
+        opt.confgen = True
+        opt.qrcode = False
+        opt.zip = False
+        opt.only = getattr(opt, "update", "") or ""
+        opt._no_sweep = True
+        handle_confgen(opt)
+        logger.info('📄 Конфиг клиента "%s" перегенерирован с новыми ключами', opt.update)
+    except Exception as e:
+        logger.warning('⚠  Ключи сброшены, но конфиг клиента "%s" не перегенерирован: %s — '
+                       'выполните `-c -o %s` вручную', opt.update, e, opt.update)
 
 
 def handle_delete(opt) -> None:
@@ -14410,9 +14591,11 @@ def handle_delete(opt) -> None:
     _backup_file(srv_path, suffix=".bak-delete")
     _atomic_rmw(srv_path, _make_delete)
 
-    # Рев-47: артефакты удалённого клиента (конфиги/QR/архивы с его приватным
-    # ключом) убираем в .bak — иначе `bob.zip` с приватником остаётся навсегда и
-    # неотличим от свежих архивов, а последующий `-z` его сохраняет.
+    # Рев-59: артефакты удалённого клиента (conf/png/zip) просто удаляем.
+    # Бекапить их незачем: приватник и PSK этого клиента сохранены в серверном
+    # `.bak-delete` (создан выше), поэтому клиента можно вернуть через `-c`.
+    # Рев-47 складывал их в `.bak` — это давало мусор `bob.conf.bak`/`bob.zip.bak`,
+    # причём `bob.zip` с приватником оставался «видимым» архивом.
     _removed_artifacts = 0
     _failed_artifacts = 0
     _art_suffixes = _client_artifact_suffixes()
@@ -14423,21 +14606,17 @@ def handle_delete(opt) -> None:
         if not _client_artifact_matches(_f.name, p_name, _art_suffixes):
             continue
         try:
-            # os.replace перезаписывает существующий .bak атомарно — отдельный
-            # unlink создавал окно, в котором старый бэкап уже удалён, а новый
-            # ещё не создан (рев-47).
-            _bak = _f.with_name(_f.name + '.bak')
-            os.replace(_f, _bak)
+            _f.unlink()
             _removed_artifacts += 1
         except Exception as e:
             _failed_artifacts += 1
-            logger.debug('Не удалось убрать артефакт %s в .bak: %s', _f.name, e)
+            logger.debug('Не удалось удалить артефакт %s: %s', _f.name, e)
     if _removed_artifacts:
-        logger.info('🧹 Артефакты клиента "%s" убраны в .bak: %d', p_name, _removed_artifacts)
+        logger.info('🧹 Артефакты клиента "%s" удалены: %d', p_name, _removed_artifacts)
     if _failed_artifacts:
         # Содержимое этих файлов включает приватный ключ удалённого клиента —
         # молча оставить их на месте нельзя (считалось бы, что клиент удалён).
-        logger.warning('⚠  Не удалось убрать артефакты клиента "%s": %d файл(ов) остались '
+        logger.warning('⚠  Не удалось удалить артефакты клиента "%s": %d файл(ов) остались '
                        '(в них приватный ключ — уберите вручную)', p_name, _failed_artifacts)
 
 
@@ -14619,12 +14798,15 @@ def handle_confgen(opt) -> set[str]:
     # клиентские .conf и QR .png терялись безвозвратно).
     # (фикс аудита-D2: раньше удаление было первым, сбой генерации оставлял
     # пустой conf/ — конфиги с PrivateKey терялись безвозвратно).
-    for ext in ("conf", "png"):
-        for fn in glob.glob(str(g_conf_dir.joinpath(f"*.{ext}"))):
-            if ext == "conf" and fn.endswith(g_main_config_fn.name):
-                continue
-            with contextlib.suppress(Exception):
-                os.remove(fn)
+    # Рев-60: из `-u` (перегенерация конфига ОДНОГО клиента) эту чистку не
+    # запускаем — иначе `-u c1` удаляет свежие конфиги остальных клиентов.
+    if not getattr(opt, "_no_sweep", False):
+        for ext in ("conf", "png"):
+            for fn in glob.glob(str(g_conf_dir.joinpath(f"*.{ext}"))):
+                if ext == "conf" and fn.endswith(g_main_config_fn.name):
+                    continue
+                with contextlib.suppress(Exception):
+                    os.remove(fn)
 
     for peer_name, peer in peers:
         if 'Name' not in peer or 'PrivateKey' not in peer:
@@ -15053,25 +15235,25 @@ def clean_confdir_types(keep_conf: bool = False, keep_qr: bool = False, keep_zip
             elif f.endswith('.zip'):
                 keep_files.add(f)
     
-    # Рев-45: НЕ удаляем безвозвратно — переименовываем в `.bak`. Раньше `-c`
-    # сносил все *.png/*.zip, `-z` — все клиентские *.conf/*.png, включая файлы
-    # чужих клиентов, которых инструмент не создавал и восстановить не мог.
-    _moved = 0
+    # Рев-59: клиентские артефакты (conf/png/zip) НЕ бекапим — они полностью
+    # восстанавливаются из серверного конфига (`-c` берёт оттуда приватник и
+    # PSK). Рев-45 складывал их в `.bak`, и каталог конфигов зарастал мусором
+    # вида `bob.conf.bak`/`bob.png.bak`, который никому не нужен.
+    _removed = 0
     _failed = 0
     for f in os.listdir(g_conf_dir):
-        if f not in keep_files and f.endswith(('.conf', '.png', '.zip')):
-            src = g_conf_dir.joinpath(f)
-            dst = g_conf_dir.joinpath(f + '.bak')
-            try:
-                os.replace(src, dst)      # перезаписывает .bak атомарно (рев-47)
-                _moved += 1
-            except Exception as e:
-                _failed += 1
-                logger.debug('Не удалось убрать %s в .bak: %s', f, e)
-    if _moved:
-        logger.info('🧹 Убрано в .bak: %d файл(ов) в %s', _moved, g_conf_dir)
+        if f in keep_files or not f.endswith(('.conf', '.png', '.zip')):
+            continue
+        try:
+            g_conf_dir.joinpath(f).unlink()
+            _removed += 1
+        except Exception as e:
+            _failed += 1
+            logger.debug('Не удалось удалить %s: %s', f, e)
+    if _removed:
+        logger.info('🧹 Удалено устаревших артефактов: %d в %s', _removed, g_conf_dir)
     if _failed:
-        logger.warning('⚠  Не удалось убрать в .bak: %d файл(ов) в %s (остались на месте)',
+        logger.warning('⚠  Не удалось удалить: %d файл(ов) в %s (остались на месте)',
                        _failed, g_conf_dir)
 
 
@@ -15475,18 +15657,21 @@ def main() -> None:
         if only_list:
             allowed_names = clients_for_zip if clients_for_zip else only_list
 
-        clean_confdir_types(
-            # Ожидаемое поведение: клиентские .conf используются для QR/ZIP и
-            # затем УДАЛЯЮТСЯ (остаются только png/zip); .conf остаются лишь
-            # при -c. Серверный конфиг защищён отдельно (clean исключает его
-            # по имени). Безопасность: clean выполняется только ПОСЛЕ успешной
-            # генерации QR/zip — при сбое исключение прерывает поток раньше,
-            # и свежие .conf сохраняются (не теряются с PrivateKey).
-            keep_conf=want_conf,
-            keep_qr=want_qr,
-            keep_zip=want_zip,
-            allowed_names=allowed_names
-        )
+        # Рев-60: при перегенерации из `-u` уборку чужих артефактов не запускаем —
+        # иначе `-u c1` снёс бы свежие конфиги остальных клиентов.
+        if not getattr(opt, "_no_sweep", False):
+            clean_confdir_types(
+                # Ожидаемое поведение: клиентские .conf используются для QR/ZIP и
+                # затем УДАЛЯЮТСЯ (остаются только png/zip); .conf остаются лишь
+                # при -c. Серверный конфиг защищён отдельно (clean исключает его
+                # по имени). Безопасность: clean выполняется только ПОСЛЕ успешной
+                # генерации QR/zip — при сбое исключение прерывает поток раньше,
+                # и свежие .conf сохраняются (не теряются с PrivateKey).
+                keep_conf=want_conf,
+                keep_qr=want_qr,
+                keep_zip=want_zip,
+                allowed_names=allowed_names
+            )
     logger.info('✅ Готово')
 
 
