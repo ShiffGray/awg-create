@@ -15167,20 +15167,51 @@ def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None,
             suffixes = list(ips_dict.keys())
         except Exception: pass
 
+    # Рев-72: метки из _endpoint.config входят в ИМЯ файла ({client}{ip_list}{label}),
+    # поэтому их обязательно учитывать при отборе файлов в архив.
+    labels: list[str] = []
+    try:
+        if g_endpoint_config_fn.exists():
+            for _ep in parse_endpoints_config(g_endpoint_config_fn.read_text('utf-8'), '0'):
+                _lbl = str(_ep.get('label') or '').strip()
+                if _lbl and _lbl not in labels:
+                    labels.append(_lbl)
+    except Exception:  # noqa: BLE001 — метки не должны ронять упаковку
+        labels = []
+
     # Суффиксы AllowedIPs (All/DsYt/...) имеют смысл только для клиентского
     # каталога conf/. Для других каталогов (например WARP/ в автономном
     # режиме) имена файлов вида "warp0.conf" не содержат суффиксов — иначе
     # архив получался бы пустым при существующем _allowedips.config.
-    if suffixes and base_dir == g_conf_dir:
-        suffixes.sort(key=len, reverse=True)
-        suffixes_pattern = "|".join([re.escape(s) for s in suffixes])
-        # Фикс 16.09.2026: якорный матч без жадного '.*' — иначе клиент «bob»
-        # забирал чужие файлы вида bobAllAll.conf (с PrivateKey) в свой архив.
-        pattern_str = rf'^{re.escape(client_name)}({suffixes_pattern})\.(conf|png)$'
+    _cn = re.escape(client_name)
+    _alts: list[str] = []
+    if base_dir == g_conf_dir:
+        _sfx = ""
+        if suffixes:
+            suffixes.sort(key=len, reverse=True)
+            _sfx = "|".join(re.escape(_s) for _s in suffixes)
+        _lbl = ""
+        if labels:
+            _lbl = "|".join(re.escape(_l) for _l in sorted(labels, key=len, reverse=True))
+        # имя файла = клиент + имя AllowedIPs + метка endpoint (в любых сочетаниях)
+        if _sfx and _lbl:
+            _alts.append(rf'^{_cn}(?:{_sfx})(?:{_lbl})\.(conf|png)$')
+        if _sfx:
+            _alts.append(rf'^{_cn}(?:{_sfx})\.(conf|png)$')
+        if _lbl:
+            _alts.append(rf'^{_cn}(?:{_lbl})\.(conf|png)$')
+        _alts.append(rf'^{_cn}\.(conf|png)$')
+        if not suffixes:
+            # Рев-70/71: нет _allowedips.config — фолбэк по префиксу, но без цифры
+            # сразу после имени (клиент «2» не должен забрать файлы клиента «20»).
+            logger.warning("⚠  %s: не найден/пуст _allowedips.config — суффиксы AllowedIPs "
+                           "неизвестны, собираю архив по префиксу имени клиента", zip_filename.name)
+            _alts.append(rf'^{_cn}(?![0-9]).{{1,64}}\.(conf|png)$')
     else:
         # Точное имя файла (имя + расширение), без префиксного матча: иначе
         # «warp1.zip» забирал бы warp10..warp19.conf (фикс аудита-T7).
-        pattern_str = rf'^{re.escape(client_name)}\.(conf|png)$'
+        _alts.append(rf'^{_cn}\.(conf|png)$')
+    pattern_str = "|".join(_alts)
 
     pattern_file = re.compile(pattern_str)
     
@@ -15208,6 +15239,17 @@ def zip_client_files(client_name: str, base_dir: pathlib.Path | None = None,
                     zipf.write(str(full_path), arcname=arcname)
                 except Exception as e:
                     logger.warning("⚠  Не удалось добавить %s в %s: %s", full_path, zip_filename, e)
+
+    # Рев-70: пустой архив — это всегда ошибка конфигурации, а не норма.
+    try:
+        with zipfile.ZipFile(str(zip_filename)) as _zf:
+            _names = _zf.namelist()
+        if not _names:
+            logger.warning("⚠  ZIP пустой: %s — не найдено файлов клиента %r в %s "
+                           "(проверьте _allowedips.config и что конфиги сгенерированы)",
+                           zip_filename.name, client_name, base_dir)
+    except Exception:  # noqa: BLE001 — диагностика не должна ронять упаковку
+        pass
 
     # Zip содержит приватные ключи — только владелец
     _chmod_owner_only(zip_filename, "ZIP-архив")
